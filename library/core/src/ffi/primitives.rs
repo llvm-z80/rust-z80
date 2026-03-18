@@ -173,7 +173,7 @@ pub type c_ssize_t = isize;
 
 mod c_int_definition {
     crate::cfg_select! {
-        any(target_arch = "avr", target_arch = "msp430") => {
+        any(target_arch = "avr", target_arch = "msp430", target_arch = "z80", target_arch = "sm83") => {
             pub(super) type c_int = i16;
             pub(super) type c_uint = u16;
         }

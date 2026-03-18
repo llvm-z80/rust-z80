@@ -399,6 +399,8 @@ fn update_target_reliable_float_cfg(sess: &Session, cfg: &mut TargetConfig) {
     };
 
     cfg.has_reliable_f128 = match (target_arch, target_os) {
+        // Z80/SM83 backend does not support f128
+        (Arch::Z80 | Arch::Sm83, _) => false,
         // Unsupported https://github.com/llvm/llvm-project/issues/121122
         (Arch::AmdGpu, _) => false,
         // Unsupported <https://github.com/llvm/llvm-project/issues/94434>
