@@ -21,7 +21,7 @@ pub(crate) fn target() -> Target {
             linker: Some("ld.lld".into()),
             max_atomic_width: Some(0),
             atomic_cas: false,
-            panic_strategy: PanicStrategy::Abort,
+            panic_strategy: PanicStrategy::ImmediateAbort,
             relocation_model: RelocModel::Static,
             default_codegen_units: Some(1),
             trap_unreachable: false,
