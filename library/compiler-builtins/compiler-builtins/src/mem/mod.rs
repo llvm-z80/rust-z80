@@ -8,6 +8,8 @@
     all(not(feature = "no-asm"), target_arch = "x86_64"),
     path = "x86_64.rs"
 )]
+// Z80/SM83: simple byte loops — word-at-a-time has no benefit on 8-bit CPUs
+#[cfg_attr(any(target_arch = "z80", target_arch = "sm83"), path = "z80.rs")]
 mod impls;
 
 intrinsics! {

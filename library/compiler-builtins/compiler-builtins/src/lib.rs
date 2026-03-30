@@ -67,6 +67,9 @@ pub mod aarch64_outline_atomics;
 #[cfg(target_arch = "avr")]
 pub mod avr;
 
+#[cfg(any(target_arch = "z80", target_arch = "sm83"))]
+pub mod z80;
+
 #[cfg(target_arch = "hexagon")]
 pub mod hexagon;
 
