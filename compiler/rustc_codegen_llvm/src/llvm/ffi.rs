@@ -465,6 +465,8 @@ pub(crate) struct SanitizerOptions {
     pub sanitize_hwaddress_recover: bool,
     pub sanitize_kernel_address: bool,
     pub sanitize_kernel_address_recover: bool,
+    pub sanitize_kernel_hwaddress: bool,
+    pub sanitize_kernel_hwaddress_recover: bool,
 }
 
 /// LLVMRustRelocModel
@@ -2046,6 +2048,7 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetFastMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAlgebraicMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAllowReassoc(Instr: &Value);
+    pub(crate) fn LLVMRustSetNoSignedZeros(Instr: &Value);
 
     // Miscellaneous instructions
     pub(crate) fn LLVMRustBuildMemCpy<'a>(

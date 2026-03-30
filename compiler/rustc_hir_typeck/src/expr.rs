@@ -34,8 +34,7 @@ use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_session::parse::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::source_map::Spanned;
-use rustc_span::{Ident, Span, Symbol, kw, sym};
+use rustc_span::{Ident, Span, Spanned, Symbol, kw, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt};
 use tracing::{debug, instrument, trace};
@@ -1661,14 +1660,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
     ) -> Ty<'tcx> {
         let element_ty = if !args.is_empty() {
-            // This shouldn't happen unless there's another error
-            // (e.g., never patterns in inappropriate contexts).
-            if self.diverges.get() != Diverges::Maybe {
-                self.dcx()
-                    .struct_span_err(expr.span, "unexpected divergence state in checking array")
-                    .delay_as_bug();
-            }
-
             let coerce_to = expected
                 .to_option(self)
                 .and_then(|uty| {
@@ -1880,7 +1871,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if !ocx.try_evaluate_obligations().is_empty() {
                     return Err(TypeError::Mismatch);
                 }
-                Ok(self.resolve_vars_if_possible(adt_ty))
+                Ok(adt_ty)
             })
             .ok()
         });
