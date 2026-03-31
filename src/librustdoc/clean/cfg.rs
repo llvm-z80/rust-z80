@@ -572,7 +572,9 @@ fn human_readable_target_arch(os: Symbol) -> Option<&'static str> {
         Wasm32 | Wasm64 => "WebAssembly",
         X86 => "x86",
         X86_64 => "x86-64",
+        Sm83 => "SM83",
         Xtensa => "Xtensa",
+        Z80 => "Z80",
         // tidy-alphabetical-end
         Other(_) => return None,
     })
