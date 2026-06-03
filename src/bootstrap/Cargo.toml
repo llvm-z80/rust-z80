@@ -32,7 +32,7 @@ test = false
 # Most of the time updating these dependencies requires modifications to the
 # bootstrap codebase(e.g., https://github.com/rust-lang/rust/issues/124565);
 # otherwise, some targets will fail. That's why these dependencies are explicitly pinned.
-cc = { git = "https://github.com/llvm-z80/cc-rs.git", branch = "main" }
+cc = "1.2.56"
 cmake = "=0.1.54"
 
 build_helper = { path = "../build_helper" }
@@ -94,3 +94,8 @@ debug = 0
 [profile.dev.package]
 # Only use debuginfo=1 to further reduce compile times.
 bootstrap.debug = 1
+
+# Use the SM83-aware cc fork for every cc in this workspace, so bootstrap's own
+# cc and the cc pulled transitively (cmake, lzma-sys) resolve to one source.
+[patch.crates-io]
+cc = { git = "https://github.com/llvm-z80/cc-rs.git", branch = "main" }
