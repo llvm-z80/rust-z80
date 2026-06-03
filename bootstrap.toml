@@ -1,0 +1,24 @@
+[llvm]
+download-ci-llvm = false
+targets = "X86;Z80"
+experimental-targets = "Z80"
+
+[rust]
+deny-warnings = false
+lld = true
+
+[build]
+target = ["x86_64-unknown-linux-gnu", "z80-unknown-none-elf", "sm83-nintendo-none-elf"]
+extended = true
+tools = ["cargo", "rust-analyzer-proc-macro-srv"]
+docs = false
+
+[target.z80-unknown-none-elf]
+optimized-compiler-builtins = false
+
+[target.sm83-nintendo-none-elf]
+optimized-compiler-builtins = false
+
+[install]
+prefix = "install"
+sysconfdir = "install/etc"

@@ -34,7 +34,7 @@ Session.vim
 !/tests/run-make/thumb-none-qemu/example/.cargo
 
 ## Configuration
-/bootstrap.toml
+# bootstrap.toml is tracked: this fork ships a fixed in-tree build config.
 /config.toml
 /Makefile
 config.mk
@@ -49,6 +49,7 @@ no_llvm_build
 /mingw-build/
 /build
 /build-rust-analyzer
+/install
 /dist/
 /unicode-downloads
 /target
