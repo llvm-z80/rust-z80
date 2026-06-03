@@ -355,7 +355,7 @@ symbols! {
         abi_msp430_interrupt,
         abi_ptx,
         abi_riscv_interrupt,
-        abi_sdcccall0,
+        abi_sdcccall_0,
         abi_sysv64,
         abi_thiscall,
         abi_unadjusted,

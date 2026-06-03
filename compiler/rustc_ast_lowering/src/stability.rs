@@ -133,7 +133,7 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
         }),
         ExternAbi::SdccCall0 => Err(UnstableAbi {
             abi,
-            feature: sym::abi_sdcccall0,
+            feature: sym::abi_sdcccall_0,
             explain: GateReason::Experimental,
         }),
         ExternAbi::Z80Interrupt => Err(UnstableAbi {

@@ -350,7 +350,7 @@ declare_features! (
     /// Allows `extern "riscv-interrupt-m" fn()` and `extern "riscv-interrupt-s" fn()`.
     (unstable, abi_riscv_interrupt, "1.73.0", Some(111889)),
     /// Allows `extern "sdcccall-0" fn()`.
-    (unstable, abi_sdcccall0, "CURRENT_RUSTC_VERSION", None),
+    (unstable, abi_sdcccall_0, "CURRENT_RUSTC_VERSION", None),
     /// Allows `extern "x86-interrupt" fn()`.
     (unstable, abi_x86_interrupt, "1.17.0", Some(40180)),
     /// Allows `extern "z80-interrupt" fn()`.
