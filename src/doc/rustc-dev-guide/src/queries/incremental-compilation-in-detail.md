@@ -264,7 +264,7 @@ the `LocalId`s within it are still the same.
 
 
 
-### Checking query results for changes: `HashStable` and `Fingerprint`s
+### Checking query results for changes: `StableHash` and `Fingerprint`s
 
 In order to do red-green-marking we often need to check if the result of a
 query has changed compared to the result it had during the previous compilation session.
@@ -285,7 +285,7 @@ We call this hash value "the `Fingerprint` of the query result".
 The hashing is (and has to be) done "in a stable way".
 This means that whenever something is hashed that might change in between compilation
 sessions (e.g. a `DefId`), we instead hash its stable equivalent
-(e.g. the corresponding `DefPath`). That's what the whole `HashStable`
+(e.g. the corresponding `DefPath`). That's what the whole `StableHash`
 infrastructure is for.
 This way `Fingerprint`s computed in two different compilation sessions are still comparable.
 
@@ -479,11 +479,11 @@ respect to incremental compilation:
       and the projection queries act as a "firewall", shielding their dependents
       from the unconditionally red `no_hash` node.
 
- - `cache_on_disk_if` - This attribute is what determines which query results
-   are persisted in the incremental compilation query result cache.
-   The attribute takes an expression that allows per query invocation decisions.
-   For example, it makes no sense to store values from upstream
-   crates in the cache because they are already available in the upstream crate's metadata.
+ - `cache_on_disk` - The query's return values are cached to disk, and can be
+   loaded by subsequent sessions if the corresponding dep node is green.
+   If the `separate_provide_extern` modifier is also present, values will only
+   be cached to disk for "local" keys, because values for external crates should
+   be loadable from crate metadata instead.
 
 [mod]: ../query.html#adding-a-new-kind-of-query
 

@@ -50,6 +50,7 @@ rm tests/ui/c-variadic/copy.rs # same
 rm tests/ui/sanitizer/kcfi-c-variadic.rs # same
 rm tests/ui/c-variadic/same-program-multiple-abis-x86_64.rs # variadics for calling conventions other than C unsupported
 rm tests/ui/delegation/fn-header.rs
+rm tests/ui/c-variadic/roundtrip.rs
 
 # inline assembly features
 rm tests/ui/asm/x86_64/issue-96797.rs # const and sym inline asm operands don't work entirely correctly
@@ -144,6 +145,7 @@ rm tests/ui/consts/issue-33537.rs # same
 rm tests/ui/consts/const-mut-refs-crate.rs # same
 rm tests/ui/abi/large-byval-align.rs # exceeds implementation limit of Cranelift
 rm -r tests/run-make/short-ice # ICE backtrace begin/end marker mismatch
+rm -r tests/run-make/naked-dead-code-elimination # function not eliminated
 
 # doesn't work due to the way the rustc test suite is invoked.
 # should work when using ./x.py test the way it is intended
@@ -198,5 +200,5 @@ index 073116933bd..c3e4578204d 100644
 EOF
 
 echo "[TEST] rustc test suite"
-./x.py test --stage 0 --test-args=--no-capture tests/{codegen-units,run-make,run-make-cargo,ui,incremental}
+./x.py test --stage 0 --no-capture --verbose-run-make-subprocess-output=false tests/{codegen-units,run-make,run-make-cargo,ui,incremental}
 popd

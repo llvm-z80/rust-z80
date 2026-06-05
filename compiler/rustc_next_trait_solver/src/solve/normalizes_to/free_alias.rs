@@ -4,10 +4,11 @@
 //! Since a free alias is never ambiguous, this just computes the `type_of` of
 //! the alias and registers the where-clauses of the type alias.
 
-use rustc_type_ir::{self as ty, Interner};
+use rustc_type_ir::solve::QueryResultOrRerunNonErased;
+use rustc_type_ir::{self as ty, Interner, Unnormalized};
 
 use crate::delegate::SolverDelegate;
-use crate::solve::{Certainty, EvalCtxt, Goal, GoalSource, QueryResult};
+use crate::solve::{Certainty, EvalCtxt, Goal, GoalSource};
 
 impl<D, I> EvalCtxt<'_, D>
 where
@@ -17,22 +18,35 @@ where
     pub(super) fn normalize_free_alias(
         &mut self,
         goal: Goal<I, ty::NormalizesTo<I>>,
-    ) -> QueryResult<I> {
+    ) -> QueryResultOrRerunNonErased<I> {
         let cx = self.cx();
         let free_alias = goal.predicate.alias;
 
         // Check where clauses
         self.add_goals(
             GoalSource::Misc,
-            cx.predicates_of(free_alias.def_id)
+            cx.predicates_of(free_alias.def_id())
                 .iter_instantiated(cx, free_alias.args)
+                .map(Unnormalized::skip_norm_wip)
                 .map(|pred| goal.with(cx, pred)),
         );
 
-        let actual = if free_alias.kind(cx).is_type() {
-            cx.type_of(free_alias.def_id).instantiate(cx, free_alias.args).into()
-        } else {
-            cx.const_of_item(free_alias.def_id).instantiate(cx, free_alias.args).into()
+        let actual = match free_alias.kind {
+            ty::AliasTermKind::FreeTy { def_id } => {
+                cx.type_of(def_id.into()).instantiate(cx, free_alias.args).skip_norm_wip().into()
+            }
+            ty::AliasTermKind::FreeConst { def_id } if cx.is_type_const(def_id.into()) => cx
+                .const_of_item(def_id.into())
+                .instantiate(cx, free_alias.args)
+                .skip_norm_wip()
+                .into(),
+            ty::AliasTermKind::FreeConst { .. } => {
+                return self.evaluate_const_and_instantiate_normalizes_to_term(
+                    goal,
+                    free_alias.expect_ct(),
+                );
+            }
+            kind => panic!("expected free alias, found {kind:?}"),
         };
 
         self.instantiate_normalizes_to_term(goal, actual);

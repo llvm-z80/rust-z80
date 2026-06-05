@@ -18,9 +18,7 @@ use hir_expand::{
 };
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{
-        self, CandidateId, MethodError, MethodResolutionContext, MethodResolutionUnstableFeatures,
-    },
+    method_resolution::{self, CandidateId, MethodError, MethodResolutionContext},
     next_solver::{DbInterner, TypingMode, infer::DbInternerInferExt},
 };
 use intern::Symbol;
@@ -38,7 +36,11 @@ pub enum AttrsOwner {
     Field(FieldId),
     LifetimeParam(LifetimeParamId),
     TypeOrConstParam(TypeOrConstParamId),
-    /// Things that do not have attributes. Used for builtin derives.
+    /// Things that do not have attributes.
+    ///
+    /// Used for:
+    /// - builtin derives
+    /// - builtin types (as those do not have attributes)
     Dummy,
 }
 
@@ -83,6 +85,19 @@ impl AttrsWithOwner {
     #[inline]
     pub fn is_unstable(&self) -> bool {
         self.attrs.contains(AttrFlags::IS_UNSTABLE)
+    }
+
+    /// Currently, it could be that `is_unstable() == true` but `unstable_feature == None`
+    /// (due to unstable features not being retrieved for fields etc.).
+    #[inline]
+    pub fn unstable_feature(&self, db: &dyn HirDatabase) -> Option<Symbol> {
+        match self.owner {
+            AttrsOwner::AttrDef(owner) => self.attrs.unstable_feature(db, owner),
+            AttrsOwner::Field(_)
+            | AttrsOwner::LifetimeParam(_)
+            | AttrsOwner::TypeOrConstParam(_)
+            | AttrsOwner::Dummy => None,
+        }
     }
 
     #[inline]
@@ -481,15 +496,16 @@ fn resolve_impl_trait_item<'db>(
     // FIXME: resolve type aliases (which are not yielded by iterate_path_candidates)
     let interner = DbInterner::new_with(db, environment.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-    let unstable_features =
-        MethodResolutionUnstableFeatures::from_def_map(resolver.top_level_def_map());
+    let features = resolver.top_level_def_map().features();
     let ctx = MethodResolutionContext {
         infcx: &infcx,
         resolver: &resolver,
         param_env: environment.param_env,
         traits_in_scope: &traits_in_scope,
         edition: krate.edition(db),
-        unstable_features: &unstable_features,
+        features,
+        call_span: hir_ty::Span::Dummy,
+        receiver_span: hir_ty::Span::Dummy,
     };
     let resolution = ctx.probe_for_name(method_resolution::Mode::Path, name.clone(), ty.ty);
     let resolution = match resolution {

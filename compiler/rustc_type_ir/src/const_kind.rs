@@ -2,9 +2,9 @@ use std::fmt;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableHash_NoContext};
 use rustc_type_ir_macros::{
     GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
 };
@@ -16,7 +16,7 @@ use crate::{self as ty, BoundVarIndexKind, Interner};
 #[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub enum ConstKind<I: Interner> {
     /// A const generic parameter.
@@ -72,19 +72,65 @@ impl<I: Interner> fmt::Debug for ConstKind<I> {
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
+    derive(Decodable_NoContext, Encodable_NoContext, StableHash_NoContext)
 )]
 pub struct UnevaluatedConst<I: Interner> {
-    pub def: I::UnevaluatedConstId,
+    #[type_foldable(identity)]
+    #[type_visitable(ignore)]
+    pub kind: UnevaluatedConstKind<I>,
     pub args: I::GenericArgs,
+
+    /// This field exists to prevent the creation of `UnevaluatedConst` without using [`UnevaluatedConst::new`].
+    #[derive_where(skip(Debug))]
+    pub(crate) _use_unevaluated_const_new_instead: (),
 }
 
 impl<I: Interner> Eq for UnevaluatedConst<I> {}
 
 impl<I: Interner> UnevaluatedConst<I> {
     #[inline]
-    pub fn new(def: I::UnevaluatedConstId, args: I::GenericArgs) -> UnevaluatedConst<I> {
-        UnevaluatedConst { def, args }
+    pub fn new(
+        interner: I,
+        kind: UnevaluatedConstKind<I>,
+        args: I::GenericArgs,
+    ) -> UnevaluatedConst<I> {
+        interner.debug_assert_args_compatible(kind.def_id(), args);
+        UnevaluatedConst { kind, args, _use_unevaluated_const_new_instead: () }
+    }
+}
+
+/// UnevaluatedConstKind is extremely similar to AliasTyKind, and likely should be reasoned about
+/// and handled in very similar ways. The documentation for AliasTyKind/etc. may be helpful when
+/// learning about UnevaluatedConstKind.
+#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub enum UnevaluatedConstKind<I: Interner> {
+    /// A projection `<Type as Trait>::AssocConst`
+    Projection { def_id: I::TraitAssocConstId },
+    /// An associated constant in an inherent `impl`
+    Inherent { def_id: I::InherentAssocConstId },
+    /// A free constant, outside an impl block.
+    Free { def_id: I::FreeConstAliasId },
+    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`.
+    Anon { def_id: I::UnevaluatedConstId },
+}
+
+impl<I: Interner> UnevaluatedConstKind<I> {
+    pub fn new_from_def_id(interner: I, def_id: I::DefId) -> Self {
+        interner.unevaluated_const_kind_from_def_id(def_id)
+    }
+
+    pub fn def_id(self) -> I::DefId {
+        match self {
+            UnevaluatedConstKind::Projection { def_id } => def_id.into(),
+            UnevaluatedConstKind::Inherent { def_id } => def_id.into(),
+            UnevaluatedConstKind::Free { def_id } => def_id.into(),
+            UnevaluatedConstKind::Anon { def_id } => def_id.into(),
+        }
     }
 }
 
@@ -117,13 +163,13 @@ impl fmt::Debug for InferConst {
 }
 
 #[cfg(feature = "nightly")]
-impl<CTX> HashStable<CTX> for InferConst {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+impl StableHash for InferConst {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         match self {
             InferConst::Var(_) => {
                 panic!("const variables should not be hashed: {self:?}")
             }
-            InferConst::Fresh(i) => i.hash_stable(hcx, hasher),
+            InferConst::Fresh(i) => i.stable_hash(hcx, hasher),
         }
     }
 }
@@ -141,10 +187,10 @@ impl<CTX> HashStable<CTX> for InferConst {
 /// `ValTree` does not have this problem with representation, as it only contains integers or
 /// lists of (nested) `ty::Const`s (which may indirectly contain more `ValTree`s).
 #[derive_where(Clone, Copy, Debug, Hash, Eq, PartialEq; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
+    derive(Decodable_NoContext, Encodable_NoContext, StableHash_NoContext)
 )]
 pub enum ValTreeKind<I: Interner> {
     /// integers, `bool`, `char` are represented as scalars.
@@ -201,18 +247,15 @@ impl<I: Interner> ValTreeKind<I> {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum AnonConstKind {
     /// `feature(generic_const_exprs)` anon consts are allowed to use arbitrary generic parameters in scope
     GCE,
     /// stable `min_const_generics` anon consts are not allowed to use any generic parameters
     MCG,
-    /// `feature(opaque_generic_const_args)` anon consts are allowed to use arbitrary
+    /// `feature(generic_const_args)` anon consts are allowed to use arbitrary
     /// generic parameters in scope, but only if they syntactically reference them.
-    OGCA,
+    GCA,
     /// anon consts used as the length of a repeat expr are syntactically allowed to use generic parameters
     /// but must not depend on the actual instantiation. See #76200 for more information
     RepeatExprCount,

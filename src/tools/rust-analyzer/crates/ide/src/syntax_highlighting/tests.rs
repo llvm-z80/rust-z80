@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use expect_test::{ExpectFile, expect_file};
-use ide_db::{MiniCore, SymbolKind};
+use ide_db::{SymbolKind, ra_fixture::RaFixtureConfig};
 use span::Edition;
 use test_utils::{AssertLinear, bench, bench_fixture, skip_slow_tests};
 
@@ -17,7 +17,7 @@ const HL_CONFIG: HighlightConfig<'_> = HighlightConfig {
     inject_doc_comment: true,
     macro_bang: true,
     syntactic_name_ref_highlighting: false,
-    minicore: MiniCore::default(),
+    ra_fixture: RaFixtureConfig::default(),
 };
 
 #[test]
@@ -39,10 +39,18 @@ fn attributes() {
 // This is another normal comment
 #[derive(Copy, Unresolved)]
 // The reason for these being here is to test AttrIds
+#[default]
 enum Foo {
     #[default]
-    Bar
+    Bar {
+        #[default]
+        field: i32
+    }
 }
+
+#[derive(Default)]
+#[default]
+struct Bar(#[default] i32);
 "#,
         expect_file!["./test_data/highlight_attributes.html"],
         false,
@@ -1348,7 +1356,7 @@ fn benchmark_syntax_highlighting_parser() {
             })
             .count()
     };
-    assert_eq!(hash, 1606);
+    assert_eq!(hash, 1644);
 }
 
 #[test]

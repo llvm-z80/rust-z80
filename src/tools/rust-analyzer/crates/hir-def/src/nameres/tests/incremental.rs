@@ -1,6 +1,6 @@
 use base_db::{
     CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, RootQueryDb, SourceDatabase,
+    DependencyBuilder, Env, SourceDatabase, all_crates,
 };
 use expect_test::{Expect, expect};
 use intern::Symbol;
@@ -56,11 +56,11 @@ pub const BAZ: u32 = 0;
     "#,
     );
 
-    for &krate in db.all_crates().iter() {
+    for &krate in all_crates(&db).iter() {
         crate_def_map(&db, krate);
     }
 
-    let all_crates_before = db.all_crates();
+    let all_crates_before = all_crates(&db);
 
     {
         // Add dependencies: c -> b, b -> a.
@@ -100,15 +100,15 @@ pub const BAZ: u32 = 0;
         new_crate_graph.set_in_db(&mut db);
     }
 
-    let all_crates_after = db.all_crates();
+    let all_crates_after = all_crates(&db);
     assert!(
-        Arc::ptr_eq(&all_crates_before, &all_crates_after),
+        std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
         "the all_crates list should not have been invalidated"
     );
     execute_assert_events(
         &db,
         || {
-            for &krate in db.all_crates().iter() {
+            for &krate in all_crates(&db).iter() {
                 crate_def_map(&db, krate);
             }
         },
@@ -167,25 +167,25 @@ fn no() {}
                 "crate_local_def_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "EnumVariants::of_",
             ]
         "#]],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "EnumVariants::of_",
             ]
         "#]],
@@ -225,32 +225,32 @@ pub struct S {}
                 "crate_local_def_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
-                "decl_macro_expander_shim",
+                "parse",
+                "real_span_map",
+                "DeclarativeMacroExpander::expander_",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "macro_arg",
             ]
         "#]],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
-                "macro_arg_shim",
-                "parse_macro_expansion_shim",
+                "real_span_map",
+                "macro_arg",
+                "parse_macro_expansion",
                 "ast_id_map",
                 "file_item_tree_query",
             ]
@@ -283,40 +283,40 @@ fn f() { foo }
                 "crate_local_def_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "crate_local_def_map",
                 "proc_macros_for_crate_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "expand_proc_macro_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "expand_proc_macro",
+                "macro_arg",
                 "proc_macro_span_shim",
             ]
         "#]],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
-                "macro_arg_shim",
-                "expand_proc_macro_shim",
-                "parse_macro_expansion_shim",
+                "real_span_map",
+                "macro_arg",
+                "expand_proc_macro",
+                "parse_macro_expansion",
                 "ast_id_map",
                 "file_item_tree_query",
             ]
@@ -407,53 +407,53 @@ pub struct S {}
                 "crate_local_def_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "crate_local_def_map",
                 "proc_macros_for_crate_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
-                "decl_macro_expander_shim",
+                "parse",
+                "real_span_map",
+                "DeclarativeMacroExpander::expander_",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
-                "decl_macro_expander_shim",
+                "parse_macro_expansion",
+                "macro_arg",
+                "DeclarativeMacroExpander::expander_",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "macro_arg",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "expand_proc_macro_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "expand_proc_macro",
+                "macro_arg",
                 "proc_macro_span_shim",
             ]
         "#]],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
-                "macro_arg_shim",
-                "decl_macro_expander_shim",
-                "macro_arg_shim",
-                "macro_arg_shim",
+                "real_span_map",
+                "macro_arg",
+                "DeclarativeMacroExpander::expander_",
+                "macro_arg",
+                "macro_arg",
             ]
         "#]],
     );
@@ -518,36 +518,36 @@ m!(Z);
                 [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
             assert_eq!(module_data.scope.resolutions().count(), 4);
         },
-        &[("file_item_tree_query", 6), ("parse_macro_expansion_shim", 3)],
+        &[("file_item_tree_query", 6), ("parse_macro_expansion", 3)],
         expect![[r#"
             [
                 "crate_local_def_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
-                "decl_macro_expander_shim",
+                "parse",
+                "real_span_map",
+                "DeclarativeMacroExpander::expander_",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
                 "macro_def_shim",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "macro_arg",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "macro_arg",
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_macro_expansion_shim",
-                "macro_arg_shim",
+                "parse_macro_expansion",
+                "macro_arg",
             ]
         "#]],
     );
@@ -568,16 +568,16 @@ m!(Z);
                 [crate_def_map.modules_for_file(&db, pos.file_id.file_id(&db)).next().unwrap()];
             assert_eq!(module_data.scope.resolutions().count(), 4);
         },
-        &[("file_item_tree_query", 1), ("parse_macro_expansion_shim", 0)],
+        &[("file_item_tree_query", 1), ("parse_macro_expansion", 0)],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
-                "macro_arg_shim",
-                "macro_arg_shim",
-                "macro_arg_shim",
+                "real_span_map",
+                "macro_arg",
+                "macro_arg",
+                "macro_arg",
             ]
         "#]],
     );
@@ -611,8 +611,8 @@ pub type Ty = ();
             [
                 "file_item_tree_query",
                 "ast_id_map",
-                "parse_shim",
-                "real_span_map_shim",
+                "parse",
+                "real_span_map",
             ]
         "#]],
     );
@@ -629,10 +629,10 @@ pub type Ty = ();
         &[("file_item_tree_query", 1), ("parse", 1)],
         expect![[r#"
             [
-                "parse_shim",
+                "parse",
                 "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
             ]
         "#]],
     );

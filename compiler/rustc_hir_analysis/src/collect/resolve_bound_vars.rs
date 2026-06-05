@@ -14,7 +14,8 @@ use rustc_ast::visit::walk_list;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::definitions::{DefPathData, DisambiguatorState};
+use rustc_hir::def_id::LocalDefIdMap;
+use rustc_hir::definitions::{DefPathData, PerParentDisambiguatorsMap};
 use rustc_hir::intravisit::{self, InferKind, Visitor, VisitorExt};
 use rustc_hir::{
     self as hir, AmbigArg, GenericArg, GenericParam, GenericParamKind, HirId, LifetimeKind, Node,
@@ -23,13 +24,14 @@ use rustc_macros::extension;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::resolve_bound_vars::*;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitor};
+use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitor, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::{Ident, Span, sym};
 use tracing::{debug, debug_span, instrument};
 
 use crate::errors;
+use crate::hir::definitions::PerParentDisambiguatorState;
 
 #[extension(trait RegionExt)]
 impl ResolvedArg {
@@ -64,7 +66,7 @@ impl ResolvedArg {
 struct BoundVarContext<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     rbv: &'a mut ResolveBoundVars<'tcx>,
-    disambiguator: &'a mut DisambiguatorState,
+    disambiguators: &'a mut LocalDefIdMap<PerParentDisambiguatorState>,
     scope: ScopeRef<'a, 'tcx>,
     opaque_capture_errors: RefCell<Option<OpaqueHigherRankedLifetimeCaptureErrors>>,
 }
@@ -259,7 +261,7 @@ fn resolve_bound_vars(tcx: TyCtxt<'_>, local_def_id: hir::OwnerId) -> ResolveBou
         tcx,
         rbv: &mut rbv,
         scope: &Scope::Root { opt_parent_item: None },
-        disambiguator: &mut DisambiguatorState::new(),
+        disambiguators: &mut Default::default(),
         opaque_capture_errors: RefCell::new(None),
     };
     match tcx.hir_owner_node(local_def_id) {
@@ -645,7 +647,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
             | hir::ItemKind::Enum(_, generics, _)
             | hir::ItemKind::Struct(_, generics, _)
             | hir::ItemKind::Union(_, generics, _)
-            | hir::ItemKind::Trait(_, _, _, _, generics, ..)
+            | hir::ItemKind::Trait { generics, .. }
             | hir::ItemKind::TraitAlias(_, _, generics, ..)
             | hir::ItemKind::Impl(hir::Impl { generics, .. }) => {
                 // These kinds of items have only early-bound lifetime parameters.
@@ -1104,12 +1106,12 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
     where
         F: for<'b> FnOnce(&mut BoundVarContext<'b, 'tcx>),
     {
-        let BoundVarContext { tcx, rbv, disambiguator, .. } = self;
+        let BoundVarContext { tcx, rbv, disambiguators, .. } = self;
         let nested_errors = RefCell::new(self.opaque_capture_errors.borrow_mut().take());
         let mut this = BoundVarContext {
             tcx: *tcx,
             rbv,
-            disambiguator,
+            disambiguators,
             scope: &wrap_scope,
             opaque_capture_errors: nested_errors,
         };
@@ -1270,7 +1272,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                         && !self.tcx.asyncness(lifetime_ref.hir_id.owner.def_id).is_async()
                         && !self.tcx.features().anonymous_lifetime_in_impl_trait()
                     {
-                        let mut diag: rustc_errors::Diag<'_> = rustc_session::parse::feature_err(
+                        let mut diag: rustc_errors::Diag<'_> = rustc_session::errors::feature_err(
                             &self.tcx.sess,
                             sym::anonymous_lifetime_in_impl_trait,
                             lifetime_ref.ident.span,
@@ -1523,7 +1525,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                     None,
                     DefKind::LifetimeParam,
                     Some(DefPathData::OpaqueLifetime(ident.name)),
-                    &mut self.disambiguator,
+                    self.disambiguators.get_or_create(opaque_def_id),
                 );
                 feed.def_span(ident.span);
                 feed.def_ident_span(Some(ident.span));
@@ -1691,7 +1693,9 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
         // which requires object lifetime defaults.
         let type_def_id = match res {
             Res::Def(DefKind::AssocTy, def_id) if depth == 1 => Some(self.tcx.parent(def_id)),
-            Res::Def(DefKind::Variant, def_id) if depth == 0 => Some(self.tcx.parent(def_id)),
+            Res::Def(DefKind::Variant, def_id) if depth == 0 || depth == 1 => {
+                Some(self.tcx.parent(def_id))
+            }
             Res::Def(
                 DefKind::Struct
                 | DefKind::Union
@@ -1883,7 +1887,11 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                             .map(|param| generic_param_def_as_bound_arg(param)),
                     );
                     bound_vars.extend(
-                        self.tcx.fn_sig(assoc_fn.def_id).instantiate_identity().bound_vars(),
+                        self.tcx
+                            .fn_sig(assoc_fn.def_id)
+                            .instantiate_identity()
+                            .skip_norm_wip()
+                            .bound_vars(),
                     );
                     bound_vars
                 } else {
@@ -1967,21 +1975,24 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                 break Some((bound_vars.into_iter().collect(), assoc_item));
             }
             let predicates = tcx.explicit_supertraits_containing_assoc_item((def_id, assoc_ident));
-            let obligations = predicates.iter_identity_copied().filter_map(|(pred, _)| {
-                let bound_predicate = pred.kind();
-                match bound_predicate.skip_binder() {
-                    ty::ClauseKind::Trait(data) => {
-                        // The order here needs to match what we would get from
-                        // `rustc_middle::ty::predicate::Clause::instantiate_supertrait`
-                        let pred_bound_vars = bound_predicate.bound_vars();
-                        let mut all_bound_vars = bound_vars.clone();
-                        all_bound_vars.extend(pred_bound_vars.iter());
-                        let super_def_id = data.trait_ref.def_id;
-                        Some((super_def_id, all_bound_vars))
+            let obligations = predicates
+                .iter_identity_copied()
+                .map(Unnormalized::skip_norm_wip)
+                .filter_map(|(pred, _)| {
+                    let bound_predicate = pred.kind();
+                    match bound_predicate.skip_binder() {
+                        ty::ClauseKind::Trait(data) => {
+                            // The order here needs to match what we would get from
+                            // `rustc_middle::ty::predicate::Clause::instantiate_supertrait`
+                            let pred_bound_vars = bound_predicate.bound_vars();
+                            let mut all_bound_vars = bound_vars.clone();
+                            all_bound_vars.extend(pred_bound_vars.iter());
+                            let super_def_id = data.trait_ref.def_id;
+                            Some((super_def_id, all_bound_vars))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            });
+                });
 
             let obligations = obligations.filter(|o| visited.insert(o.0));
             stack.extend(obligations);
@@ -2197,7 +2208,9 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                 .iter()
                 .map(|param| generic_param_def_as_bound_arg(param)),
         );
-        bound_vars.extend(self.tcx.fn_sig(item_def_id).instantiate_identity().bound_vars());
+        bound_vars.extend(
+            self.tcx.fn_sig(item_def_id).instantiate_identity().skip_norm_wip().bound_vars(),
+        );
 
         // SUBTLE: Stash the old bound vars onto the *item segment* before appending
         // the new bound vars. We do this because we need to know how many bound vars
@@ -2247,7 +2260,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                     // we already do that in `BoundVarContext::supertrait_hrtb_vars`.
                     if let Res::SelfTyParam { trait_: _ } = expected_res
                         && let hir::Node::Item(item) = node
-                        && let hir::ItemKind::Trait(..) = item.kind
+                        && let hir::ItemKind::Trait { .. } = item.kind
                     {
                         // Yield the trait's def id. Supertraits will be
                         // elaborated from that.
@@ -2407,7 +2420,10 @@ fn is_late_bound_map(
                 ty::Param(param_ty) => {
                     self.arg_is_constrained[param_ty.index as usize] = true;
                 }
-                ty::Alias(ty::Projection | ty::Inherent, _) => return,
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Projection { .. } | ty::Inherent { .. },
+                    ..
+                }) => return,
                 _ => (),
             }
             t.super_visit_with(self)
@@ -2450,7 +2466,9 @@ fn is_late_bound_map(
                         arg_is_constrained: vec![false; generics.own_params.len()]
                             .into_boxed_slice(),
                     };
-                    walker.visit_ty(self.tcx.type_of(*alias_def).instantiate_identity());
+                    walker.visit_ty(
+                        self.tcx.type_of(*alias_def).instantiate_identity().skip_norm_wip(),
+                    );
 
                     match segments.last() {
                         Some(hir::PathSegment { args: Some(args), .. }) => {

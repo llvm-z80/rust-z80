@@ -1,14 +1,14 @@
-use std::iter::{self, Peekable};
+use std::iter;
 
 use either::Either;
 use hir::{Adt, AsAssocItem, Crate, FindPathConfig, HasAttrs, ModuleDef, Semantics};
 use ide_db::RootDatabase;
 use ide_db::syntax_helpers::suggest_name;
-use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast};
+use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast_with_factory};
 use itertools::Itertools;
 use syntax::ast::edit::IndentLevel;
 use syntax::ast::syntax_factory::SyntaxFactory;
-use syntax::ast::{self, AstNode, MatchArmList, MatchExpr, Pat, make};
+use syntax::ast::{self, AstNode, MatchArmList, MatchExpr, Pat};
 use syntax::syntax_editor::{Position, SyntaxEditor};
 use syntax::{SyntaxKind, SyntaxNode, ToSmolStr};
 
@@ -38,7 +38,7 @@ use crate::{AssistContext, AssistId, Assists, utils};
 //     }
 // }
 // ```
-pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let match_expr = ctx.find_node_at_offset_with_descend::<ast::MatchExpr>()?;
     let match_arm_list = match_expr.match_arm_list()?;
     let arm_list_range = ctx.sema.original_range_opt(match_arm_list.syntax())?;
@@ -74,7 +74,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         .filter(|pat| !matches!(pat, Pat::WildcardPat(_)))
         .collect();
 
-    let make = SyntaxFactory::with_mappings();
+    let make = SyntaxFactory::without_mappings();
 
     let scope = ctx.sema.scope(expr.syntax())?;
     let module = scope.module();
@@ -93,8 +93,8 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
     } else {
         None
     };
-    let (mut missing_pats, is_non_exhaustive, has_hidden_variants): (
-        Peekable<Box<dyn Iterator<Item = (ast::Pat, bool)>>>,
+    let (missing_pats, is_non_exhaustive, has_hidden_variants): (
+        Vec<(ast::Pat, bool)>,
         bool,
         bool,
     ) = if let Some(enum_def) = resolve_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
@@ -117,15 +117,15 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
 
         let option_enum = FamousDefs(&ctx.sema, module.krate(ctx.db())).core_option_Option();
-        let missing_pats: Box<dyn Iterator<Item = _>> = if matches!(enum_def, ExtendedEnum::Enum { enum_: e, .. } if Some(e) == option_enum)
+        let missing_pats: Vec<_> = if matches!(enum_def, ExtendedEnum::Enum { enum_: e, .. } if Some(e) == option_enum)
         {
             // Match `Some` variant first.
             cov_mark::hit!(option_order);
-            Box::new(missing_pats.rev())
+            missing_pats.rev().collect()
         } else {
-            Box::new(missing_pats)
+            missing_pats.collect()
         };
-        (missing_pats.peekable(), is_non_exhaustive, has_hidden_variants)
+        (missing_pats, is_non_exhaustive, has_hidden_variants)
     } else if let Some(enum_defs) = resolve_tuple_of_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
         let is_non_exhaustive = enum_defs
             .iter()
@@ -169,12 +169,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
 
                 (ast::Pat::from(make.tuple_pat(patterns)), is_hidden)
             })
-            .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
-        (
-            (Box::new(missing_pats) as Box<dyn Iterator<Item = _>>).peekable(),
-            is_non_exhaustive,
-            has_hidden_variants,
-        )
+            .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat))
+            .collect();
+        (missing_pats, is_non_exhaustive, has_hidden_variants)
     } else if let Some((enum_def, len)) =
         resolve_array_of_enum_def(&ctx.sema, &expr, self_ty.as_ref())
     {
@@ -205,12 +202,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
 
                 (ast::Pat::from(make.slice_pat(patterns)), is_hidden)
             })
-            .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
-        (
-            (Box::new(missing_pats) as Box<dyn Iterator<Item = _>>).peekable(),
-            is_non_exhaustive,
-            has_hidden_variants,
-        )
+            .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat))
+            .collect();
+        (missing_pats, is_non_exhaustive, has_hidden_variants)
     } else {
         return None;
     };
@@ -218,20 +212,31 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
     let mut needs_catch_all_arm = is_non_exhaustive && !has_catch_all_arm;
 
     if !needs_catch_all_arm
-        && ((has_hidden_variants && has_catch_all_arm) || missing_pats.peek().is_none())
+        && ((has_hidden_variants && has_catch_all_arm) || missing_pats.is_empty())
     {
         return None;
     }
 
+    let visible_count = missing_pats.iter().filter(|(_, hidden)| !hidden).count();
+    let label = if visible_count == 0 {
+        "Add missing catch-all match arm `_`".to_owned()
+    } else if visible_count == 1 {
+        let pat = &missing_pats.iter().find(|(_, hidden)| !hidden).unwrap().0;
+        format!("Add missing match arm `{pat}`")
+    } else {
+        format!("Add {visible_count} missing match arms")
+    };
+
     acc.add(
         AssistId::quick_fix("add_missing_match_arms"),
-        "Fill match arms",
+        label,
         ctx.sema.original_range(match_expr.syntax()).range,
         |builder| {
             // having any hidden variants means that we need a catch-all arm
             needs_catch_all_arm |= has_hidden_variants;
 
             let mut missing_arms = missing_pats
+                .into_iter()
                 .filter(|(_, hidden)| {
                     // filter out hidden patterns because they're handled by the catch-all arm
                     !hidden
@@ -266,12 +271,12 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                 }
             };
 
-            let mut editor = builder.make_editor(&old_place);
+            let editor = builder.make_editor(&old_place);
             let mut arms_edit = ArmsEdit { match_arm_list, place: old_place, last_arm: None };
 
-            arms_edit.remove_wildcard_arms(ctx, &mut editor);
-            arms_edit.add_comma_after_last_arm(ctx, &make, &mut editor);
-            arms_edit.append_arms(&missing_arms, &make, &mut editor);
+            arms_edit.remove_wildcard_arms(ctx, &editor);
+            arms_edit.add_comma_after_last_arm(ctx, &make, &editor);
+            arms_edit.append_arms(&missing_arms, &make, &editor);
 
             if let Some(cap) = ctx.config.snippet_cap {
                 if let Some(it) = missing_arms
@@ -292,14 +297,13 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                 }
             }
 
-            editor.add_mappings(make.take());
             builder.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
 fn cursor_at_trivial_match_arm_list(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     match_expr: &MatchExpr,
     match_arm_list: &MatchArmList,
 ) -> Option<()> {
@@ -353,7 +357,7 @@ struct ArmsEdit {
 }
 
 impl ArmsEdit {
-    fn remove_wildcard_arms(&mut self, ctx: &AssistContext<'_>, editor: &mut SyntaxEditor) {
+    fn remove_wildcard_arms(&mut self, ctx: &AssistContext<'_, '_>, editor: &SyntaxEditor) {
         for arm in self.match_arm_list.arms() {
             if !matches!(arm.pat(), Some(Pat::WildcardPat(_))) {
                 self.last_arm = Some(arm);
@@ -382,7 +386,7 @@ impl ArmsEdit {
         }
     }
 
-    fn append_arms(&self, arms: &[ast::MatchArm], make: &SyntaxFactory, editor: &mut SyntaxEditor) {
+    fn append_arms(&self, arms: &[ast::MatchArm], make: &SyntaxFactory, editor: &SyntaxEditor) {
         let Some(mut before) = self.place.last_token() else {
             stdx::never!("match arm list not contain any token");
             return;
@@ -413,9 +417,9 @@ impl ArmsEdit {
 
     fn add_comma_after_last_arm(
         &self,
-        ctx: &AssistContext<'_>,
+        ctx: &AssistContext<'_, '_>,
         make: &SyntaxFactory,
-        editor: &mut SyntaxEditor,
+        editor: &SyntaxEditor,
     ) {
         if let Some(last_arm) = &self.last_arm
             && last_arm.comma_token().is_none()
@@ -428,7 +432,7 @@ impl ArmsEdit {
 
     fn cover_edit_range(
         &self,
-        ctx: &AssistContext<'_>,
+        ctx: &AssistContext<'_, '_>,
         node: &impl AstNode,
     ) -> Option<std::ops::RangeInclusive<syntax::SyntaxElement>> {
         let range = ctx.sema.original_range_opt(node.syntax())?;
@@ -577,7 +581,7 @@ fn resolve_array_of_enum_def(
 }
 
 fn build_pat(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     make: &SyntaxFactory,
     module: hir::Module,
     var: ExtendedVariant,
@@ -588,17 +592,21 @@ fn build_pat(
         ExtendedVariant::Variant { variant: var, use_self } => {
             let edition = module.krate(db).edition(db);
             let path = if use_self {
-                make::path_from_segments(
+                make.path_from_segments(
                     [
-                        make::path_segment(make::name_ref_self_ty()),
-                        make::path_segment(make::name_ref(
-                            &var.name(db).display(db, edition).to_smolstr(),
-                        )),
+                        make.path_segment(make.name_ref_self_ty()),
+                        make.path_segment(
+                            make.name_ref(&var.name(db).display(db, edition).to_smolstr()),
+                        ),
                     ],
                     false,
                 )
             } else {
-                mod_path_to_ast(&module.find_path(db, ModuleDef::from(var), cfg)?, edition)
+                mod_path_to_ast_with_factory(
+                    make,
+                    &module.find_path(db, ModuleDef::from(var), cfg)?,
+                    edition,
+                )
             };
             let fields = var.fields(db);
             let pat: ast::Pat = match var.kind(db) {
@@ -607,7 +615,7 @@ fn build_pat(
                     let pats = fields.into_iter().map(|f| {
                         let name = name_generator.for_type(&f.ty(db).to_type(db), db, edition);
                         match name {
-                            Some(name) => make::ext::simple_ident_pat(make.name(&name)).into(),
+                            Some(name) => make.ident_pat(false, false, make.name(&name)).into(),
                             None => make.wildcard_pat().into(),
                         }
                     });
@@ -635,7 +643,7 @@ mod tests {
     use crate::AssistConfig;
     use crate::tests::{
         TEST_CONFIG, check_assist, check_assist_not_applicable, check_assist_target,
-        check_assist_unresolved, check_assist_with_config,
+        check_assist_unresolved, check_assist_with_config, check_assist_with_label,
     };
 
     use super::add_missing_match_arms;
@@ -1828,8 +1836,10 @@ fn foo(t: Test) {
 
     #[test]
     fn lazy_computation() {
-        // Computing a single missing arm is enough to determine applicability of the assist.
-        cov_mark::check_count!(add_missing_match_arms_lazy_computation, 1);
+        // We now collect all missing arms eagerly, so we can show the count
+        // of missing arms.
+        cov_mark::check_count!(add_missing_match_arms_lazy_computation, 4);
+
         check_assist_unresolved(
             add_missing_match_arms,
             r#"
@@ -1838,6 +1848,54 @@ fn foo(tuple: (A, A)) {
     match $0tuple {};
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn label_single_missing_arm() {
+        check_assist_with_label(
+            add_missing_match_arms,
+            r#"
+enum A { One, Two }
+fn foo(a: A) {
+    match $0a {
+        A::One => {}
+    }
+}
+"#,
+            "Add missing match arm `A::Two`",
+        );
+    }
+
+    #[test]
+    fn label_multiple_missing_arms() {
+        check_assist_with_label(
+            add_missing_match_arms,
+            r#"
+enum A { One, Two, Three }
+fn foo(a: A) {
+    match $0a {}
+}
+"#,
+            "Add 3 missing match arms",
+        );
+    }
+
+    #[test]
+    fn label_catch_all_only() {
+        check_assist_with_label(
+            add_missing_match_arms,
+            r#"
+//- /main.rs crate:main deps:e
+fn foo(t: ::e::E) {
+    match $0t {
+        e::E::A => {}
+    }
+}
+//- /e.rs crate:e
+pub enum E { A, #[doc(hidden)] B, }
+"#,
+            "Add missing catch-all match arm `_`",
         );
     }
 

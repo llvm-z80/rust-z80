@@ -7,10 +7,10 @@ use rustc_middle::middle::codegen_fn_attrs::{TargetFeature, TargetFeatureKind};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
+use rustc_session::errors::feature_err;
 use rustc_session::lint::builtin::AARCH64_SOFTFLOAT_NEON;
-use rustc_session::parse::feature_err;
 use rustc_span::{Span, Symbol, edit_distance, sym};
-use rustc_target::spec::Arch;
+use rustc_target::spec::{Arch, SanitizerSet};
 use rustc_target::target_features::{RUSTC_SPECIFIC_FEATURES, Stability};
 use smallvec::SmallVec;
 
@@ -62,16 +62,15 @@ pub(crate) fn from_target_feature_attr(
                 feature: feature_str,
                 reason,
             });
-        } else if let Some(nightly_feature) = stability.requires_nightly()
+        } else if let Some(nightly_feature) = stability.requires_nightly(/* in_cfg */ false)
             && !rust_features.enabled(nightly_feature)
         {
-            feature_err(
-                &tcx.sess,
-                nightly_feature,
-                feature_span,
-                format!("the target feature `{feature}` is currently unstable"),
-            )
-            .emit();
+            let explain = if stability.is_cfg_stable_toggle_unstable() {
+                format!("the target feature `{feature}` is allowed in cfg but unstable otherwise")
+            } else {
+                format!("the target feature `{feature}` is currently unstable")
+            };
+            feature_err(&tcx.sess, nightly_feature, feature_span, explain).emit();
         } else {
             // Add this and the implied features.
             for &name in tcx.implied_target_features(feature) {
@@ -309,18 +308,32 @@ pub fn cfg_target_feature<'a, const N: usize>(
                     sess.dcx().emit_warn(unknown_feature);
                 }
                 Some((_, stability, _)) => {
-                    if let Err(reason) = stability.toggle_allowed() {
-                        sess.dcx().emit_warn(errors::ForbiddenCTargetFeature {
+                    if let Stability::Forbidden { reason, hard_error } = stability {
+                        let diag = errors::ForbiddenCTargetFeature {
                             feature: base_feature,
                             enabled: if enable { "enabled" } else { "disabled" },
                             reason,
-                        });
-                    } else if stability.requires_nightly().is_some() {
+                            future_compat_note: !hard_error,
+                        };
+
+                        if *hard_error {
+                            sess.dcx().emit_err(diag);
+                        } else {
+                            sess.dcx().emit_warn(diag);
+                        }
+                    } else if stability.requires_nightly(/* in_cfg */ false).is_some() {
                         // An unstable feature. Warn about using it. It makes little sense
                         // to hard-error here since we just warn about fully unknown
                         // features above.
-                        sess.dcx()
-                            .emit_warn(errors::UnstableCTargetFeature { feature: base_feature });
+                        let note = if stability.is_cfg_stable_toggle_unstable() {
+                            "this feature is allowed in cfg but unstable otherwise"
+                        } else {
+                            "this feature is not stably supported"
+                        };
+                        sess.dcx().emit_warn(errors::UnstableCTargetFeature {
+                            feature: base_feature,
+                            note,
+                        });
                     }
                 }
             }
@@ -346,7 +359,8 @@ pub fn cfg_target_feature<'a, const N: usize>(
                 // "forbidden" features.
                 if allow_unstable
                     || (gate.in_cfg()
-                        && (sess.is_nightly_build() || gate.requires_nightly().is_none()))
+                        && (sess.is_nightly_build()
+                            || gate.requires_nightly(/* in_cfg */ true).is_none()))
                 {
                     Some(Symbol::intern(feature))
                 } else {
@@ -387,8 +401,20 @@ pub fn target_spec_to_backend_features<'a>(
     sess: &'a Session,
     mut extend_backend_features: impl FnMut(&'a str, /* enable */ bool),
 ) {
-    // Compute implied features
     let mut rust_features = vec![];
+
+    // This check handles SM versions that defaults (by LLVM) to unsupported (by Rust) PTX ISA versions.
+    // sm_70, sm_72 and sm_75 defaults to PTX ISA versions with major version 6, while sm_80 default to 7.0
+    if sess.target.arch == Arch::Nvptx64
+        && matches!(
+            sess.opts.cg.target_cpu.as_deref(),
+            None | Some("sm_70") | Some("sm_72") | Some("sm_75")
+        )
+    {
+        rust_features.push((true, "ptx70"));
+    }
+
+    // Compute implied features
     parse_rust_feature_list(
         sess,
         &sess.target.features,
@@ -457,6 +483,15 @@ pub fn retpoline_features_by_flags(sess: &Session, features: &mut Vec<String>) {
         features.push("+retpoline-external-thunk".into());
         features.push("+retpoline-indirect-branches".into());
         features.push("+retpoline-indirect-calls".into());
+    }
+}
+
+/// Computes the backend target features to be added to account for sanitizer flags.
+pub fn sanitizer_features_by_flags(sess: &Session, features: &mut Vec<String>) {
+    // It's intentional that this is done only for non-kernel version of hwaddress. This matches
+    // clang behavior.
+    if sess.sanitizers().contains(SanitizerSet::HWADDRESS) {
+        features.push("+tagged-globals".into());
     }
 }
 

@@ -582,9 +582,9 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
             | TerminatorKind::CoroutineDrop => {
                 bug!("shouldn't exist at codegen {:?}", bb_data.terminator());
             }
-            TerminatorKind::Drop { place, target, unwind, replace: _, drop, async_fut } => {
+            TerminatorKind::Drop { place, target, unwind, replace: _, drop } => {
                 assert!(
-                    async_fut.is_none() && drop.is_none(),
+                    drop.is_none(),
                     "Async Drop must be expanded or reset to sync before codegen"
                 );
                 let drop_place = codegen_place(fx, *place);
@@ -620,7 +620,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
             let lval = codegen_place(fx, to_place_and_rval.0);
             let dest_layout = lval.layout();
             match to_place_and_rval.1 {
-                Rvalue::Use(ref operand) => {
+                Rvalue::Use(ref operand, _) => {
                     let val = codegen_operand(fx, operand);
                     lval.write_cvalue(fx, val);
                 }
@@ -628,6 +628,11 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     let place = codegen_place(fx, place);
                     let ref_ = place.place_ref(fx, lval.layout());
                     lval.write_cvalue(fx, ref_);
+                }
+                Rvalue::Reborrow(_, _, place) => {
+                    let cplace = codegen_place(fx, place);
+                    let val = cplace.to_cvalue(fx);
+                    lval.write_cvalue(fx, val)
                 }
                 Rvalue::ThreadLocalRef(def_id) => {
                     let val = crate::constant::codegen_tls_ref(fx, def_id, lval.layout());
@@ -909,7 +914,6 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
         | StatementKind::ConstEvalCounter
         | StatementKind::Nop
         | StatementKind::FakeRead(..)
-        | StatementKind::Retag { .. }
         | StatementKind::PlaceMention(..)
         | StatementKind::BackwardIncompatibleDropHint { .. }
         | StatementKind::AscribeUserType(..) => {}

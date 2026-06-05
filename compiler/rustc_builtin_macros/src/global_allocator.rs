@@ -25,18 +25,24 @@ pub(crate) fn expand(
     // Allow using `#[global_allocator]` on an item statement
     // FIXME - if we get deref patterns, use them to reduce duplication here
     let (item, ident, is_stmt, ty_span) = if let Annotatable::Item(item) = &item
-        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
+        && let ItemKind::Static(ast::StaticItem { ident, ty, .. }) = &item.kind
     {
         (item, *ident, false, ecx.with_def_site_ctxt(ty.span))
     } else if let Annotatable::Stmt(stmt) = &item
         && let StmtKind::Item(item) = &stmt.kind
-        && let ItemKind::Static(box ast::StaticItem { ident, ty, .. }) = &item.kind
+        && let ItemKind::Static(ast::StaticItem { ident, ty, .. }) = &item.kind
     {
         (item, *ident, true, ecx.with_def_site_ctxt(ty.span))
     } else {
         ecx.dcx().emit_err(errors::AllocMustStatics { span: item.span() });
         return vec![orig_item];
     };
+
+    // Forbid `#[thread_local]` attributes on the item
+    if let Some(attr) = item.attrs.iter().find(|x| x.has_name(sym::thread_local)) {
+        ecx.dcx().emit_err(errors::AllocCannotThreadLocal { span: item.span, attr: attr.span });
+        return vec![orig_item];
+    }
 
     // Generate a bunch of new items using the AllocFnFactory
     let span = ecx.with_def_site_ctxt(item.span);

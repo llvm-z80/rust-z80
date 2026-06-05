@@ -256,20 +256,7 @@ pub fn try_normalize_import(use_item: &ast::Use, style: NormalizationStyle) -> O
     Some(use_item)
 }
 
-/// Normalizes a use tree (see [`try_normalize_import`] doc).
-pub fn try_normalize_use_tree(
-    use_tree: &ast::UseTree,
-    style: NormalizationStyle,
-) -> Option<ast::UseTree> {
-    let use_tree = use_tree.clone_subtree().clone_for_update();
-    try_normalize_use_tree_mut(&use_tree, style)?;
-    Some(use_tree)
-}
-
-pub fn try_normalize_use_tree_mut(
-    use_tree: &ast::UseTree,
-    style: NormalizationStyle,
-) -> Option<()> {
+fn try_normalize_use_tree_mut(use_tree: &ast::UseTree, style: NormalizationStyle) -> Option<()> {
     if style == NormalizationStyle::One {
         let mut modified = false;
         modified |= use_tree.wrap_in_tree_list().is_some();

@@ -2,9 +2,9 @@
 
 // tidy-alphabetical-start
 #![cfg_attr(test, feature(iter_order_by))]
-#![feature(box_patterns)]
 #![feature(debug_closure_helpers)]
 #![feature(default_field_values)]
+#![feature(deref_patterns)]
 #![feature(iter_intersperse)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
@@ -253,6 +253,15 @@ pub fn parse_in<'a, T>(
 
 pub fn fake_token_stream_for_item(psess: &ParseSess, item: &ast::Item) -> TokenStream {
     let source = pprust::item_to_string(item);
+    let filename = FileName::macro_expansion_source_code(&source);
+    unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
+}
+
+pub fn fake_token_stream_for_foreign_item(
+    psess: &ParseSess,
+    item: &ast::ForeignItem,
+) -> TokenStream {
+    let source = pprust::foreign_item_to_string(item);
     let filename = FileName::macro_expansion_source_code(&source);
     unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
 }

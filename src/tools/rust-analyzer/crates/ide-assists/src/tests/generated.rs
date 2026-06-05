@@ -463,7 +463,7 @@ fn doctest_convert_closure_to_fn() {
     check_doc_test(
         "convert_closure_to_fn",
         r#####"
-//- minicore: copy
+//- minicore: copy, fn
 struct String;
 impl String {
     fn new() -> Self {}
@@ -3736,6 +3736,29 @@ fn doctest_unwrap_block() {
         "unwrap_block",
         r#####"
 fn foo() {
+    match () {
+        _ => {$0
+            bar()
+        }
+    }
+}
+"#####,
+        r#####"
+fn foo() {
+    match () {
+        _ => bar(),
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_unwrap_branch() {
+    check_doc_test(
+        "unwrap_branch",
+        r#####"
+fn foo() {
     if true {$0
         println!("foo");
     }
@@ -3852,7 +3875,7 @@ struct S {
 }
 "#####,
         r#####"
-#[cfg_attr($0, derive(Debug))]
+#[cfg_attr(${0:cfg}, derive(Debug))]
 struct S {
    field: i32
 }

@@ -18,6 +18,7 @@ use rustc_ast::{
     FnRetTy, Guard, Label, MacCall, MetaItemLit, MgcaDisambiguation, Movability, Param,
     RangeLimits, StmtKind, Ty, TyKind, UnOp, UnsafeBinderCastKind, YieldKind,
 };
+use rustc_ast_pretty::pprust;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::{Applicability, Diag, PResult, StashKey, Subdiagnostic};
 use rustc_literal_escaper::unescape_char;
@@ -352,7 +353,7 @@ impl<'a> Parser<'a> {
     fn error_found_expr_would_be_stmt(&self, lhs: &Expr) {
         self.dcx().emit_err(errors::FoundExprWouldBeStmt {
             span: self.token.span,
-            token: self.token,
+            token: pprust::token_to_string(&self.token),
             suggestion: ExprParenthesesNeeded::surrounding(lhs.span),
         });
     }
@@ -563,6 +564,12 @@ impl<'a> Parser<'a> {
             token::Ident(..) if this.token.is_keyword(kw::Box) => {
                 make_it!(this, attrs, |this, _| this.parse_expr_box(lo))
             }
+            token::Ident(..)
+                if this.token.is_keyword(kw::Move)
+                    && this.look_ahead(1, |t| *t == token::OpenParen) =>
+            {
+                make_it!(this, attrs, |this, _| this.parse_expr_move(lo))
+            }
             token::Ident(..) if this.may_recover() && this.is_mistaken_not_ident_negation() => {
                 make_it!(this, attrs, |this, _| this.recover_not_expr(lo))
             }
@@ -604,6 +611,16 @@ impl<'a> Parser<'a> {
         let sugg = errors::AddBoxNew { box_kw_and_lo, hi };
         let guar = self.dcx().emit_err(errors::BoxSyntaxRemoved { span, sugg });
         Ok((span, ExprKind::Err(guar)))
+    }
+
+    fn parse_expr_move(&mut self, move_kw: Span) -> PResult<'a, (Span, ExprKind)> {
+        self.bump();
+        self.psess.gated_spans.gate(sym::move_expr, move_kw);
+        self.expect(exp!(OpenParen))?;
+        let expr = self.parse_expr()?;
+        self.expect(exp!(CloseParen))?;
+        let span = move_kw.to(self.prev_token.span);
+        Ok((span, ExprKind::Move(expr, move_kw)))
     }
 
     fn is_mistaken_not_ident_negation(&self) -> bool {
@@ -729,7 +746,7 @@ impl<'a> Parser<'a> {
                             token::Lt => {
                                 self.dcx().emit_err(errors::ComparisonInterpretedAsGeneric {
                                     comparison: self.token.span,
-                                    r#type: path,
+                                    r#type: pprust::path_to_string(&path),
                                     args: args_span,
                                     suggestion: errors::ComparisonInterpretedAsGenericSugg {
                                         left: expr.span.shrink_to_lo(),
@@ -739,7 +756,7 @@ impl<'a> Parser<'a> {
                             }
                             token::Shl => self.dcx().emit_err(errors::ShiftInterpretedAsGeneric {
                                 shift: self.token.span,
-                                r#type: path,
+                                r#type: pprust::path_to_string(&path),
                                 args: args_span,
                                 suggestion: errors::ShiftInterpretedAsGenericSugg {
                                     left: expr.span.shrink_to_lo(),
@@ -866,7 +883,7 @@ impl<'a> Parser<'a> {
             // `raw [ const | mut ]`.
             let found_raw = self.eat_keyword(exp!(Raw));
             assert!(found_raw);
-            let mutability = self.parse_const_or_mut().unwrap();
+            let mutability = self.parse_mut_or_const().unwrap();
             (ast::BorrowKind::Raw, mutability)
         } else {
             match self.parse_pin_and_mut() {
@@ -1090,9 +1107,7 @@ impl<'a> Parser<'a> {
 
         match &*components {
             // 1e2
-            [IdentLike(i)] => {
-                DestructuredFloat::Single(Symbol::intern(i), span)
-            }
+            [IdentLike(i)] => DestructuredFloat::Single(Symbol::intern(i), span),
             // 1.
             [IdentLike(left), Punct('.')] => {
                 let (left_span, dot_span) = if can_take_span_apart() {
@@ -1109,7 +1124,8 @@ impl<'a> Parser<'a> {
             [IdentLike(left), Punct('.'), IdentLike(right)] => {
                 let (left_span, dot_span, right_span) = if can_take_span_apart() {
                     let left_span = span.with_hi(span.lo() + BytePos::from_usize(left.len()));
-                    let dot_span = span.with_lo(left_span.hi()).with_hi(left_span.hi() + BytePos(1));
+                    let dot_span =
+                        span.with_lo(left_span.hi()).with_hi(left_span.hi() + BytePos(1));
                     let right_span = span.with_lo(dot_span.hi());
                     (left_span, dot_span, right_span)
                 } else {
@@ -1304,16 +1320,17 @@ impl<'a> Parser<'a> {
                             self.span_to_snippet(close_paren).is_ok_and(|snippet| snippet == ")")
                         {
                             err.cancel();
+                            let type_str = pprust::path_to_string(&path);
                             self.dcx()
                                 .create_err(errors::ParenthesesWithStructFields {
                                     span,
                                     braces_for_struct: errors::BracesForStructLiteral {
                                         first: open_paren,
                                         second: close_paren,
-                                        r#type: path.clone(),
+                                        r#type: type_str.clone(),
                                     },
                                     no_fields_for_fn: errors::NoFieldsForFnCall {
-                                        r#type: path,
+                                        r#type: type_str,
                                         fields: fields
                                             .into_iter()
                                             .map(|field| field.span.until(field.expr.span))
@@ -3464,11 +3481,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn eat_metavar_guard(&mut self) -> Option<Box<Guard>> {
-        self.eat_metavar_seq_with_matcher(
-            |mv_kind| matches!(mv_kind, MetaVarKind::Guard),
-            |this| this.parse_match_arm_guard(),
-        )
-        .flatten()
+        self.eat_metavar_seq(MetaVarKind::Guard, |this| {
+            this.expect_match_arm_guard(ForceCollect::Yes)
+        })
     }
 
     fn parse_match_arm_guard(&mut self) -> PResult<'a, Option<Box<Guard>>> {
@@ -4040,7 +4055,7 @@ impl<'a> Parser<'a> {
                 return Err(this.dcx().create_err(errors::ExpectedStructField {
                     span: this.look_ahead(1, |t| t.span),
                     ident_span: this.token.span,
-                    token: this.look_ahead(1, |t| *t),
+                    token: pprust::token_to_string(&this.look_ahead(1, |t| *t)),
                 }));
             }
             let (ident, expr) = if is_shorthand {
@@ -4387,6 +4402,7 @@ impl MutVisitor for CondChecker<'_> {
             }
             ExprKind::Unary(_, _)
             | ExprKind::Await(_, _)
+            | ExprKind::Move(_, _)
             | ExprKind::Use(_, _)
             | ExprKind::AssignOp(_, _, _)
             | ExprKind::Range(_, _, _)

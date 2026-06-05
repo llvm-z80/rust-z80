@@ -731,12 +731,15 @@ function preLoadCss(cssUrl) {
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
-            for (const name of filtered) {
+            for (const item of filtered) {
+                const [name, isMacro] = Array.isArray(item) ? [item[0], true] : [item, false];
                 let path;
                 if (shortty === "mod") {
                     path = `${modpath}${name}/index.html`;
-                } else {
+                } else if (!isMacro) {
                     path = `${modpath}${shortty}.${name}.html`;
+                } else {
+                    path = `${modpath}macro.${name}.html`;
                 }
                 let current_page = document.location.href.toString();
                 if (current_page.endsWith("/")) {
@@ -785,7 +788,7 @@ function preLoadCss(cssUrl) {
             //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
-            block("attribute", "attributes", "Attributes");
+            block("attribute", "attribute-docs", "Attributes");
             block("attr", "attributes", "Attribute Macros");
             block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
@@ -2123,20 +2126,27 @@ function preLoadCss(cssUrl) {
         return;
     }
     but.onclick = () => {
-        // Most page titles are '<Item> in <path::to::module> - Rust', except
-        // modules (which don't have the first part) and keywords/primitives
-        // (which don't have a module path)
-        const titleElement = document.querySelector("title");
-        const title = titleElement && titleElement.textContent ?
-                      titleElement.textContent.replace(" - Rust", "") : "";
-        const [item, module] = title.split(" in ");
-        const path = [item];
-        if (module !== undefined) {
-            path.unshift(module);
-        }
+        // We get the path from the "breadcrumbs" and the actual item name.
+        let path = "";
+        // @ts-expect-error
+        const heading = document.getElementById(MAIN_ID).querySelector(".main-heading");
 
-        copyContentToClipboard(path.join("::"));
-        copyButtonAnimation(but);
+        if (heading) {
+            const breadcrumbs = heading.querySelector(".rustdoc-breadcrumbs");
+            if (breadcrumbs) {
+                // @ts-expect-error
+                path = breadcrumbs.innerText;
+                if (path.length > 0) {
+                    path += "::";
+                }
+            }
+
+            // @ts-expect-error
+            path += heading.querySelector("h1 > span").innerText;
+
+            copyContentToClipboard(path);
+            copyButtonAnimation(but);
+        }
     };
 
     /**

@@ -13,6 +13,7 @@ use ::serde::{Deserialize, Serialize};
 use rustc_ast::join_path_syms;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::thin_vec::ThinVec;
+use rustc_hir::def_id::{CrateNum, DefIndex, LOCAL_CRATE};
 use rustc_hir::find_attr;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::DefId;
@@ -22,13 +23,15 @@ use stringdex::internals as stringdex_internals;
 use tracing::instrument;
 
 use crate::clean::types::{Function, Generics, ItemId, Type, WherePredicate};
-use crate::clean::{self, utils};
+use crate::clean::{self, ExternalLocation, utils};
 use crate::config::ShouldMerge;
 use crate::error::Error;
 use crate::formats::cache::{Cache, OrphanImplItem};
 use crate::formats::item_type::ItemType;
 use crate::html::markdown::short_markdown_summary;
-use crate::html::render::{self, IndexItem, IndexItemFunctionType, RenderType, RenderTypeId};
+use crate::html::render::{
+    self, IndexItem, IndexItemFunctionType, IndexItemInfo, RenderType, RenderTypeId,
+};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct SerializedSearchIndex {
@@ -616,7 +619,8 @@ impl SerializedSearchIndex {
                          trait_parent,
                          deprecated,
                          unstable,
-                         associated_item_disambiguator,
+                         associated_item_disambiguator_or_extern_crate_url:
+                             associated_item_disambiguator,
                      }| EntryData {
                         krate: *map.get(krate).unwrap(),
                         ty: *ty,
@@ -627,7 +631,8 @@ impl SerializedSearchIndex {
                         trait_parent: trait_parent.and_then(|path_id| map.get(&path_id).copied()),
                         deprecated: *deprecated,
                         unstable: *unstable,
-                        associated_item_disambiguator: associated_item_disambiguator.clone(),
+                        associated_item_disambiguator_or_extern_crate_url:
+                            associated_item_disambiguator.clone(),
                     },
                 ),
                 self.descs[id].clone(),
@@ -898,7 +903,7 @@ struct EntryData {
     trait_parent: Option<usize>,
     deprecated: bool,
     unstable: bool,
-    associated_item_disambiguator: Option<String>,
+    associated_item_disambiguator_or_extern_crate_url: Option<String>,
 }
 
 impl Serialize for EntryData {
@@ -915,7 +920,7 @@ impl Serialize for EntryData {
         seq.serialize_element(&self.trait_parent.map(|id| id + 1).unwrap_or(0))?;
         seq.serialize_element(&if self.deprecated { 1 } else { 0 })?;
         seq.serialize_element(&if self.unstable { 1 } else { 0 })?;
-        if let Some(disambig) = &self.associated_item_disambiguator {
+        if let Some(disambig) = &self.associated_item_disambiguator_or_extern_crate_url {
             seq.serialize_element(&disambig)?;
         }
         seq.end()
@@ -961,7 +966,8 @@ impl<'de> Deserialize<'de> for EntryData {
                     trait_parent: Option::<i32>::from(trait_parent).map(|path| path as usize),
                     deprecated: deprecated != 0,
                     unstable: unstable != 0,
-                    associated_item_disambiguator,
+                    associated_item_disambiguator_or_extern_crate_url:
+                        associated_item_disambiguator,
                 })
             }
         }
@@ -1266,29 +1272,25 @@ pub(crate) fn build_index(
         &cache.orphan_impl_items
     {
         if let Some((fqp, _)) = cache.paths.get(&parent) {
-            let desc = short_markdown_summary(&item.doc_value(), &item.link_names(cache));
+            let info = IndexItemInfo::new(
+                tcx,
+                cache,
+                item,
+                Some(parent),
+                impl_generics.as_ref(),
+                item.type_(),
+            );
             search_index.push(IndexItem {
-                ty: item.type_(),
                 defid: item.item_id.as_def_id(),
                 name: item.name.unwrap(),
                 module_path: fqp[..fqp.len() - 1].to_vec(),
-                desc,
                 parent: Some(parent),
                 parent_idx: None,
                 trait_parent,
                 trait_parent_idx: None,
                 exact_module_path: None,
                 impl_id,
-                search_type: get_function_type_for_search(
-                    item,
-                    tcx,
-                    impl_generics.as_ref(),
-                    Some(parent),
-                    cache,
-                ),
-                aliases: item.attrs.get_doc_aliases(),
-                is_deprecated: item.is_deprecated(tcx),
-                is_unstable: item.is_unstable(),
+                info,
             });
         }
     }
@@ -1297,11 +1299,10 @@ pub(crate) fn build_index(
     search_index.sort_unstable_by(|k1, k2| {
         // `sort_unstable_by_key` produces lifetime errors
         // HACK(rustdoc): should not be sorting `CrateNum` or `DefIndex`, this will soon go away, too
-        let k1 =
-            (&k1.module_path, k1.name.as_str(), &k1.ty, k1.parent.map(|id| (id.index, id.krate)));
-        let k2 =
-            (&k2.module_path, k2.name.as_str(), &k2.ty, k2.parent.map(|id| (id.index, id.krate)));
-        Ord::cmp(&k1, &k2)
+        fn key(i: &IndexItem) -> (&[Symbol], &str, ItemType, Option<(DefIndex, CrateNum)>) {
+            (&i.module_path, i.name.as_str(), i.info.ty, i.parent.map(|id| (id.index, id.krate)))
+        }
+        Ord::cmp(&key(k1), &key(k2))
     });
 
     // Now, convert to an on-disk search index format
@@ -1389,7 +1390,7 @@ pub(crate) fn build_index(
                         trait_parent: None,
                         deprecated: false,
                         unstable: false,
-                        associated_item_disambiguator: None,
+                        associated_item_disambiguator_or_extern_crate_url: None,
                     }),
                     crate_doc,
                     None,
@@ -1462,7 +1463,7 @@ pub(crate) fn build_index(
                     if fqp.last() != Some(&item.name) {
                         return None;
                     }
-                    let path = if item.ty == ItemType::Macro
+                    let path = if item.info.ty == ItemType::Macro
                         && find_attr!(tcx, defid, MacroExport { .. })
                     {
                         // `#[macro_export]` always exports to the crate root.
@@ -1497,8 +1498,9 @@ pub(crate) fn build_index(
         if item.impl_id.is_some()
             && let Some(parent_idx) = item.parent_idx
         {
-            let count =
-                associated_item_duplicates.entry((parent_idx, item.ty, item.name)).or_insert(0);
+            let count = associated_item_duplicates
+                .entry((parent_idx, item.info.ty, item.name))
+                .or_insert(0);
             *count += 1;
         }
     }
@@ -1521,33 +1523,45 @@ pub(crate) fn build_index(
         let new_entry_id = serialized_index.add_entry(
             item.name,
             EntryData {
-                ty: item.ty,
+                ty: item.info.ty,
                 parent: item.parent_idx,
                 trait_parent: item.trait_parent_idx,
                 module_path,
                 exact_module_path,
-                deprecated: item.is_deprecated,
-                unstable: item.is_unstable,
-                associated_item_disambiguator: if let Some(impl_id) = item.impl_id
+                deprecated: item
+                    .info
+                    .deprecation
+                    .is_some_and(|deprecation| deprecation.is_in_effect()),
+                unstable: item.info.is_unstable,
+                associated_item_disambiguator_or_extern_crate_url: if let Some(impl_id) =
+                    item.impl_id
                     && let Some(parent_idx) = item.parent_idx
                     && associated_item_duplicates
-                        .get(&(parent_idx, item.ty, item.name))
+                        .get(&(parent_idx, item.info.ty, item.name))
                         .copied()
                         .unwrap_or(0)
                         > 1
                 {
                     Some(render::get_id_for_impl(tcx, ItemId::DefId(impl_id)))
+                } else if item.info.ty == ItemType::ExternCrate
+                    && let Some(local_def_id) = item.defid.and_then(|def_id| def_id.as_local())
+                    && let cnum = tcx.extern_mod_stmt_cnum(local_def_id).unwrap_or(LOCAL_CRATE)
+                    && let Some(ExternalLocation::Remote { url, is_absolute }) =
+                        cache.extern_locations.get(&cnum)
+                    && *is_absolute
+                {
+                    Some(format!("{}{}", url, tcx.crate_name(cnum).as_str()))
                 } else {
                     None
                 },
                 krate: crate_idx,
             },
-            item.desc.to_string(),
+            item.info.desc.to_string(),
         );
 
         // Aliases
         // -------
-        for alias in &item.aliases[..] {
+        for alias in &item.info.aliases {
             serialized_index.push_alias(alias.as_str().to_string(), new_entry_id);
         }
 
@@ -1820,7 +1834,7 @@ pub(crate) fn build_index(
                 _ => {}
             }
         }
-        if let Some(search_type) = &mut item.search_type {
+        if let Some(search_type) = &mut item.info.search_type {
             let mut used_in_function_inputs = BTreeSet::new();
             let mut used_in_function_output = BTreeSet::new();
             for item in &mut search_type.inputs {
@@ -1887,7 +1901,7 @@ pub(crate) fn build_index(
                 // The number 8 is arbitrary. We want it big, but not enormous,
                 // because the postings list has to fill in an empty array for each
                 // unoccupied size.
-                if item.ty.is_fn_like() { 0 } else { 16 };
+                if item.info.ty.is_fn_like() { 0 } else { 16 };
             serialized_index.function_data[new_entry_id] = Some(search_type.clone());
 
             #[derive(Clone, Copy)]

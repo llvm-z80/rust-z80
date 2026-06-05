@@ -21,7 +21,7 @@ use std::fmt;
 use hir_expand::{MacroDefId, name::Name};
 use intern::Symbol;
 use la_arena::Idx;
-use rustc_apfloat::ieee::{Half as f16, Quad as f128};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use syntax::ast;
 use type_ref::TypeRefId;
 
@@ -94,19 +94,19 @@ impl FloatTypeWrapper {
         Self(sym)
     }
 
-    pub fn to_f128(&self) -> f128 {
+    pub fn to_f128(&self) -> Quad {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f64(&self) -> f64 {
+    pub fn to_f64(&self) -> Double {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f32(&self) -> f32 {
+    pub fn to_f32(&self) -> Single {
         self.0.as_str().parse().unwrap_or_default()
     }
 
-    pub fn to_f16(&self) -> f16 {
+    pub fn to_f16(&self) -> Half {
         self.0.as_str().parse().unwrap_or_default()
     }
 }
@@ -214,11 +214,6 @@ pub enum Expr {
         tail: Option<ExprId>,
         label: Option<LabelId>,
     },
-    Async {
-        id: Option<BlockId>,
-        statements: Box<[Statement]>,
-        tail: Option<ExprId>,
-    },
     Const(ExprId),
     // FIXME: Fold this into Block with an unsafe flag?
     Unsafe {
@@ -264,7 +259,7 @@ pub enum Expr {
         expr: Option<ExprId>,
     },
     RecordLit {
-        path: Option<Box<Path>>,
+        path: Path,
         fields: Box<[RecordLitField]>,
         spread: RecordSpread,
     },
@@ -339,7 +334,6 @@ impl Expr {
             | Expr::Block { .. }
             | Expr::Unsafe { .. }
             | Expr::Const(_)
-            | Expr::Async { .. }
             | Expr::If { .. }
             | Expr::Literal(_)
             | Expr::Loop { .. }
@@ -530,11 +524,36 @@ pub enum InlineAsmRegOrRegClass {
     RegClass(Symbol),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CoroutineKind {
+    Async,
+    Gen,
+    AsyncGen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClosureKind {
     Closure,
-    Coroutine(Movability),
-    Async,
+    OldCoroutine(Movability),
+    Coroutine { kind: CoroutineKind, source: CoroutineSource },
+    CoroutineClosure(CoroutineKind),
+}
+
+/// In the case of a coroutine created as part of an async/gen construct,
+/// which kind of async/gen construct caused it to be created?
+///
+/// This helps error messages but is also used to drive coercions in
+/// type-checking (see #60424).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
+pub enum CoroutineSource {
+    /// An explicit `async`/`gen` block written by the user.
+    Block,
+
+    /// An explicit `async`/`gen` closure written by the user.
+    Closure,
+
+    /// The `async`/`gen` block generated as the body of an async/gen function.
+    Fn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,7 +564,7 @@ pub enum CaptureBy {
     Ref,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Movability {
     Static,
     Movable,
@@ -654,6 +673,8 @@ pub struct RecordFieldPat {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Pat {
     Missing,
+    /// A rest pattern. Not valid outside special context.
+    Rest,
     Wild,
     Tuple {
         args: Box<[PatId]>,
@@ -661,7 +682,7 @@ pub enum Pat {
     },
     Or(Box<[PatId]>),
     Record {
-        path: Option<Box<Path>>,
+        path: Path,
         args: Box<[RecordFieldPat]>,
         ellipsis: bool,
     },
@@ -675,7 +696,6 @@ pub enum Pat {
         slice: Option<PatId>,
         suffix: Box<[PatId]>,
     },
-    /// This might refer to a variable if a single segment path (specifically, on destructuring assignment).
     Path(Path),
     Lit(ExprId),
     Bind {
@@ -683,7 +703,7 @@ pub enum Pat {
         subpat: Option<PatId>,
     },
     TupleStruct {
-        path: Option<Box<Path>>,
+        path: Path,
         args: Box<[PatId]>,
         ellipsis: Option<u32>,
     },
@@ -692,6 +712,9 @@ pub enum Pat {
         mutability: Mutability,
     },
     Box {
+        inner: PatId,
+    },
+    Deref {
         inner: PatId,
     },
     ConstBlock(ExprId),
@@ -710,6 +733,7 @@ impl Pat {
             | Pat::ConstBlock(..)
             | Pat::Wild
             | Pat::Missing
+            | Pat::Rest
             | Pat::Expr(_) => {}
             Pat::Bind { subpat, .. } => {
                 subpat.iter().copied().for_each(f);
@@ -725,7 +749,7 @@ impl Pat {
             Pat::Record { args, .. } => {
                 args.iter().map(|f| f.pat).for_each(f);
             }
-            Pat::Box { inner } => f(*inner),
+            Pat::Box { inner } | Pat::Deref { inner } => f(*inner),
         }
     }
 }

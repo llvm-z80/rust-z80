@@ -1,11 +1,10 @@
-//@ no-prefer-dynamic
 //@ aux-build: decl_with_default_panics.rs
 //@ edition: 2021
 //@ run-pass
 //@ needs-unwind
 //@ exec-env:RUST_BACKTRACE=1
 //@ ignore-backends: gcc
-// FIXME: linking on windows (speciifcally mingw) not yet supported, see tracking issue #125418
+// FIXME: linking on windows (specifically mingw) not yet supported, see tracking issue #125418
 //@ ignore-windows
 // A small test to make sure that unwinding works properly.
 //

@@ -58,7 +58,9 @@ pub(crate) struct AutoDiffWithoutLto;
 pub(crate) struct AutoDiffWithoutEnable;
 
 #[derive(Diagnostic)]
-#[diag("using the offload feature requires -Z offload=<Device or Host=/absolute/path/to/host.out>")]
+#[diag(
+    "using the offload feature requires -Z offload=<Device or Host=/absolute/path/to/device.bin>"
+)]
 pub(crate) struct OffloadWithoutEnable;
 
 #[derive(Diagnostic)]
@@ -66,23 +68,23 @@ pub(crate) struct OffloadWithoutEnable;
 pub(crate) struct OffloadWithoutFatLTO;
 
 #[derive(Diagnostic)]
-#[diag("using the `-Z offload=Host=/absolute/path/to/host.out` flag requires an absolute path")]
+#[diag("using the `-Z offload=Host=/absolute/path/to/device.bin` flag requires an absolute path")]
 pub(crate) struct OffloadWithoutAbsPath;
 
 #[derive(Diagnostic)]
 #[diag(
-    "using the `-Z offload=Host=/absolute/path/to/host.out` flag must point to a `host.out` file"
+    "using the `-Z offload=Host=/absolute/path/to/device.bin` flag must point to a `device.bin` file"
 )]
 pub(crate) struct OffloadWrongFileName;
 
 #[derive(Diagnostic)]
 #[diag(
-    "the given path/file to `host.out` does not exist. Did you forget to run the device compilation first?"
+    "the given path/file to `device.bin` does not exist. Did you forget to run the device compilation first?"
 )]
 pub(crate) struct OffloadNonexistingPath;
 
 #[derive(Diagnostic)]
-#[diag("call to BundleImages failed, `host.out` was not created")]
+#[diag("call to BundleImages failed, `device.bin` was not created")]
 pub(crate) struct OffloadBundleImagesFailed;
 
 #[derive(Diagnostic)]
@@ -203,4 +205,40 @@ pub(crate) struct MismatchedDataLayout<'a> {
 #[diag("the `-Zfixed-x18` flag is not supported on the `{$arch}` architecture")]
 pub(crate) struct FixedX18InvalidArch<'a> {
     pub arch: &'a str,
+}
+
+#[derive(Diagnostic)]
+#[diag("`-Zpacked-stack` is incompatible with `backchain` target feature")]
+#[note(
+    "enabling both `-Zpacked-stack` and the `backchain` target feature is incompatible with the default s390x ABI. Switch to s390x-unknown-none-softfloat if you need both attributes"
+)]
+pub(crate) struct PackedStackBackchainNeedsSoftfloat;
+
+#[derive(Diagnostic)]
+#[diag(
+    "intrinsic signature mismatch for `{$name}`: expected signature `{$llvm_fn_ty}`, found `{$rust_fn_ty}`"
+)]
+pub(crate) struct IntrinsicSignatureMismatch<'a> {
+    pub name: &'a str,
+    pub llvm_fn_ty: &'a str,
+    pub rust_fn_ty: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unknown LLVM intrinsic `{$name}`")]
+pub(crate) struct UnknownIntrinsic<'a> {
+    pub name: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("intrinsic `{$name}` cannot be used with target arch `{$target_arch}`")]
+pub(crate) struct IntrinsicWrongArch<'a> {
+    pub name: &'a str,
+    pub target_arch: &'a str,
+    #[primary_span]
+    pub span: Span,
 }

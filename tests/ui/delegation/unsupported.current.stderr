@@ -36,6 +36,14 @@ LL |         reuse ToReuse::opaque_ret;
    |                        ^^^^^^^^^^
    = note: see https://rustc-dev-guide.rust-lang.org/overview.html#queries and https://rustc-dev-guide.rust-lang.org/query.html for more information
 
-error: aborting due to 2 previous errors
+error: delegation self type is not specified
+  --> $DIR/unsupported.rs:54:18
+   |
+LL |     reuse Trait::foo;
+   |                  ^^^
+   |
+   = help: consider explicitly specifying self type: `reuse </* Type */ as Trait>::function`
+
+error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0391`.

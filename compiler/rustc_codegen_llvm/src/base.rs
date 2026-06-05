@@ -21,7 +21,7 @@ use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::attrs::Linkage;
 use rustc_middle::dep_graph;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrs, SanitizerFnAttrs};
-use rustc_middle::mir::mono::Visibility;
+use rustc_middle::mono::Visibility;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{DebugInfo, Offload};
 use rustc_span::Symbol;
@@ -65,8 +65,7 @@ pub(crate) fn compile_codegen_unit(
     let (module, _) = tcx.dep_graph.with_task(
         dep_node,
         tcx,
-        cgu_name,
-        module_codegen,
+        || module_codegen(tcx, cgu_name),
         Some(dep_graph::hash_result),
     );
     let time_to_codegen = start_time.elapsed();

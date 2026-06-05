@@ -12,15 +12,15 @@ use rustc_ast::{self as ast};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_data_structures::sorted_map::SortedMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{DynSend, DynSync, try_par_for_each_in};
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
-use rustc_hir::lints::DelayedLint;
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap, LocalModDefId};
+use rustc_hir::lints::DelayedLints;
 use rustc_hir::*;
 use rustc_index::IndexVec;
-use rustc_macros::{Decodable, Encodable, HashStable};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::{ErrorGuaranteed, ExpnId, Span};
 
 use crate::query::Providers;
@@ -73,20 +73,20 @@ impl<'hir> Crate<'hir> {
             tcx.ensure_done().lower_delayed_owner(def_id);
         }
 
-        tcx.delayed_owner(def_id)
+        tcx.hir_delayed_owner(def_id)
     }
 }
 
-impl<HirCtx: HashStableContext> HashStable<HirCtx> for Crate<'_> {
-    fn hash_stable(&self, hcx: &mut HirCtx, hasher: &mut StableHasher) {
+impl StableHash for Crate<'_> {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         let Crate { opt_hir_hash, .. } = self;
-        opt_hir_hash.unwrap().hash_stable(hcx, hasher)
+        opt_hir_hash.unwrap().stable_hash(hcx, hasher)
     }
 }
 
 /// Gather the LocalDefId for each item-like within a module, including items contained within
 /// bodies. The Ids are in visitor order. This is used to partition a pass between modules.
-#[derive(Debug, HashStable, Encodable, Decodable)]
+#[derive(Debug, StableHash, Encodable, Decodable)]
 pub struct ModuleItems {
     /// Whether this represents the whole crate, in which case we need to add `CRATE_OWNER_ID` to
     /// the iterators if we want to account for the crate root.
@@ -236,42 +236,28 @@ impl<'tcx> TyCtxt<'tcx> {
         node: OwnerNode<'_>,
         bodies: &SortedMap<ItemLocalId, &Body<'_>>,
         attrs: &SortedMap<ItemLocalId, &[Attribute]>,
-        delayed_lints: &[DelayedLint],
         define_opaque: Option<&[(Span, LocalDefId)]>,
     ) -> Hashes {
-        if !self.needs_crate_hash() {
-            return Hashes {
-                opt_hash_including_bodies: None,
-                attrs_hash: None,
-                delayed_lints_hash: None,
-            };
+        if !self.needs_hir_hash() {
+            return Hashes { opt_hash_including_bodies: None, attrs_hash: None };
         }
 
         self.with_stable_hashing_context(|mut hcx| {
             let mut stable_hasher = StableHasher::new();
-            node.hash_stable(&mut hcx, &mut stable_hasher);
+            node.stable_hash(&mut hcx, &mut stable_hasher);
             // Bodies are stored out of line, so we need to pull them explicitly in the hash.
-            bodies.hash_stable(&mut hcx, &mut stable_hasher);
+            bodies.stable_hash(&mut hcx, &mut stable_hasher);
             let h1 = stable_hasher.finish();
 
             let mut stable_hasher = StableHasher::new();
-            attrs.hash_stable(&mut hcx, &mut stable_hasher);
+            attrs.stable_hash(&mut hcx, &mut stable_hasher);
 
             // Hash the defined opaque types, which are not present in the attrs.
-            define_opaque.hash_stable(&mut hcx, &mut stable_hasher);
+            define_opaque.stable_hash(&mut hcx, &mut stable_hasher);
 
             let h2 = stable_hasher.finish();
 
-            // hash lints emitted during ast lowering
-            let mut stable_hasher = StableHasher::new();
-            delayed_lints.hash_stable(&mut hcx, &mut stable_hasher);
-            let h3 = stable_hasher.finish();
-
-            Hashes {
-                opt_hash_including_bodies: Some(h1),
-                attrs_hash: Some(h2),
-                delayed_lints_hash: Some(h3),
-            }
+            Hashes { opt_hash_including_bodies: Some(h1), attrs_hash: Some(h2) }
         })
     }
 
@@ -315,8 +301,8 @@ impl<'tcx> TyCtxt<'tcx> {
             Node::Expr(parent_expr) => {
                 match parent_expr.kind {
                     // Addr-of, field projections, and LHS of assignment don't constitute reads.
-                    // Assignment does call `drop_in_place`, though, but its safety
-                    // requirements are not the same.
+                    // Assignment does call `drop_glue`, though, but its safety requirements are
+                    // not the same.
                     ExprKind::AddrOf(..) | ExprKind::Field(..) => false,
 
                     // Place-preserving expressions only constitute reads if their
@@ -437,8 +423,7 @@ impl<'tcx> TyCtxt<'tcx> {
             HirId {
                 owner: parent_owner_id,
                 local_id: self
-                    .hir_crate(())
-                    .owner(self, parent_owner_id.def_id)
+                    .hir_owner(parent_owner_id.def_id)
                     .unwrap()
                     .parenting
                     .get(&owner_id.def_id)
@@ -465,26 +450,78 @@ impl<'tcx> TyCtxt<'tcx> {
 pub struct Hashes {
     pub opt_hash_including_bodies: Option<Fingerprint>,
     pub attrs_hash: Option<Fingerprint>,
-    pub delayed_lints_hash: Option<Fingerprint>,
+}
+
+/// Unites some of `OwnerInfo`'s fields into same struct that is used by `hir_owner` query.
+/// `AttributeMap` is handled separately as placing it in this struct led to perf regressions:
+/// <https://github.com/rust-lang/rust/pull/155678#issuecomment-4304597871>.
+/// This struct is created mainly for uniting/splitting fields of `OwnerInfo` so they are
+/// stored/invalidated together in incremental compilation.
+/// For comments about each field see `OwnerInfo` struct.
+#[derive(Clone, Copy, Debug, StableHash)]
+pub struct ProjectedOwnerInfo<'tcx> {
+    nodes: &'tcx OwnerNodes<'tcx>,
+    parenting: &'tcx LocalDefIdMap<ItemLocalId>,
+    trait_map: &'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>,
+
+    #[stable_hash(ignore)]
+    delayed_lints: &'tcx Steal<DelayedLints>,
+}
+
+impl<'tcx> ProjectedOwnerInfo<'tcx> {
+    pub fn new(
+        nodes: &'tcx OwnerNodes<'tcx>,
+        parenting: &'tcx LocalDefIdMap<ItemLocalId>,
+        trait_map: &'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>,
+        delayed_lints: &'tcx Steal<DelayedLints>,
+    ) -> ProjectedOwnerInfo<'tcx> {
+        ProjectedOwnerInfo { nodes, parenting, trait_map, delayed_lints }
+    }
+}
+
+#[derive(Clone, Copy, Debug, StableHash)]
+pub enum ProjectedMaybeOwner<'tcx> {
+    Owner(ProjectedOwnerInfo<'tcx>),
+    NonOwner(HirId),
+}
+
+impl<'tcx> ProjectedMaybeOwner<'tcx> {
+    pub fn new(value: MaybeOwner<'tcx>, def_id: LocalDefId) -> Self {
+        match value {
+            MaybeOwner::Owner(o) => ProjectedMaybeOwner::Owner(ProjectedOwnerInfo {
+                nodes: &o.nodes,
+                parenting: &o.parenting,
+                trait_map: &o.trait_map,
+                delayed_lints: &o.delayed_lints,
+            }),
+            MaybeOwner::NonOwner(hir_id) => ProjectedMaybeOwner::NonOwner(hir_id),
+            // Can't debug fmt `def_id` since it doesn't exist.
+            MaybeOwner::Phantom => bug!("No HirId for {:?}", def_id.local_def_index),
+        }
+    }
+
+    pub fn as_owner(&self) -> Option<&ProjectedOwnerInfo<'tcx>> {
+        match self {
+            ProjectedMaybeOwner::Owner(i) => Some(i),
+            ProjectedMaybeOwner::NonOwner(_) => None,
+        }
+    }
+
+    pub fn unwrap(&'tcx self) -> &'tcx ProjectedOwnerInfo<'tcx> {
+        self.as_owner().unwrap_or_else(|| panic!("Not a HIR owner"))
+    }
 }
 
 pub fn provide(providers: &mut Providers) {
     providers.hir_crate_items = map::hir_crate_items;
     providers.crate_hash = map::crate_hash;
     providers.hir_module_items = map::hir_module_items;
-    providers.local_def_id_to_hir_id = |tcx, def_id| match tcx.hir_crate(()).owner(tcx, def_id) {
-        MaybeOwner::Owner(_) => HirId::make_owner(def_id),
-        MaybeOwner::NonOwner(hir_id) => hir_id,
-        MaybeOwner::Phantom => bug!("No HirId for {:?}", def_id),
-    };
-    providers.opt_hir_owner_nodes =
-        |tcx, id| tcx.hir_crate(()).owner(tcx, id).as_owner().map(|i| &i.nodes);
-    providers.hir_owner_parent_q = |tcx, owner_id| tcx.hir_owner_parent_impl(owner_id);
     providers.hir_attr_map = |tcx, id| {
         tcx.hir_crate(()).owner(tcx, id.def_id).as_owner().map_or(AttributeMap::EMPTY, |o| &o.attrs)
     };
-    providers.opt_ast_lowering_delayed_lints =
-        |tcx, id| tcx.hir_crate(()).owner(tcx, id.def_id).as_owner().map(|o| &o.delayed_lints);
+    providers.hir_owner =
+        |tcx, def_id| ProjectedMaybeOwner::new(tcx.hir_crate(()).owner(tcx, def_id), def_id);
+    providers.hir_owner_parent_q = |tcx, owner_id| tcx.hir_owner_parent_impl(owner_id);
     providers.def_span = |tcx, def_id| tcx.hir_span(tcx.local_def_id_to_hir_id(def_id));
     providers.def_ident_span = |tcx, def_id| {
         let hir_id = tcx.local_def_id_to_hir_id(def_id);
@@ -524,7 +561,4 @@ pub fn provide(providers: &mut Providers) {
         |tcx, trait_id| tcx.resolutions(()).trait_impls.get(&trait_id).map_or(&[], |xs| &xs[..]);
     providers.expn_that_defined =
         |tcx, id| tcx.resolutions(()).expn_that_defined.get(&id).copied().unwrap_or(ExpnId::root());
-    providers.in_scope_traits_map = |tcx, id| {
-        tcx.hir_crate(()).owner(tcx, id.def_id).as_owner().map(|owner_info| &owner_info.trait_map)
-    };
 }

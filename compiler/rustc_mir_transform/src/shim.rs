@@ -9,7 +9,7 @@ use rustc_middle::mir::visit::{MutVisitor, PlaceContext};
 use rustc_middle::mir::*;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
-    self, CoroutineArgs, CoroutineArgsExt, EarlyBinder, GenericArgs, Ty, TyCtxt,
+    self, CoroutineArgs, CoroutineArgsExt, EarlyBinder, GenericArgs, Ty, TyCtxt, Unnormalized,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Span, Spanned, dummy_spanned};
@@ -28,40 +28,6 @@ mod async_destructor_ctor;
 
 pub(super) fn provide(providers: &mut Providers) {
     providers.mir_shims = make_shim;
-}
-
-// Replace Pin<&mut ImplCoroutine> accesses (_1.0) into Pin<&mut ProxyCoroutine> accesses
-struct FixProxyFutureDropVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    replace_to: Local,
-}
-
-impl<'tcx> MutVisitor<'tcx> for FixProxyFutureDropVisitor<'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn visit_place(
-        &mut self,
-        place: &mut Place<'tcx>,
-        _context: PlaceContext,
-        _location: Location,
-    ) {
-        if place.local == Local::from_u32(1) {
-            if place.projection.len() == 1 {
-                assert!(matches!(
-                    place.projection.first(),
-                    Some(ProjectionElem::Field(FieldIdx::ZERO, _))
-                ));
-                *place = Place::from(self.replace_to);
-            } else if place.projection.len() == 2 {
-                assert!(matches!(place.projection[0], ProjectionElem::Field(FieldIdx::ZERO, _)));
-                assert!(matches!(place.projection[1], ProjectionElem::Deref));
-                *place =
-                    Place::from(self.replace_to).project_deeper(&[ProjectionElem::Deref], self.tcx);
-            }
-        }
-    }
 }
 
 fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<'tcx> {
@@ -141,7 +107,8 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<
                         .unwrap()
                 };
 
-                let mut body = EarlyBinder::bind(body.clone()).instantiate(tcx, args);
+                let mut body =
+                    EarlyBinder::bind(body.clone()).instantiate(tcx, args).skip_norm_wip();
                 debug!("make_shim({:?}) = {:?}", instance, body);
 
                 pm::run_passes(
@@ -159,7 +126,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<
                 return body;
             }
 
-            build_drop_shim(tcx, def_id, ty)
+            build_drop_shim(tcx, def_id, ty, ty::TypingEnv::post_analysis(tcx, def_id))
         }
         ty::InstanceKind::ThreadLocalShim(..) => build_thread_local_shim(tcx, instance),
         ty::InstanceKind::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
@@ -189,7 +156,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<
             // Main pass required here is StateTransform to convert sync drop ladder
             // into coroutine.
             // Others are minimal passes as for sync drop glue shim
-            pm::run_passes(
+            pm::run_passes_no_validate(
                 tcx,
                 &mut body,
                 &[
@@ -200,7 +167,6 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceKind<'tcx>) -> Body<
                     &crate::coroutine::StateTransform,
                 ],
                 Some(MirPhase::Runtime(RuntimePhase::PostCleanup)),
-                pm::Optimizations::Allowed,
             );
             run_optimization_passes(tcx, &mut body);
             debug!("make_shim({:?}) = {:?}", instance, body);
@@ -295,41 +261,16 @@ fn local_decls_for_sig<'tcx>(
         .collect()
 }
 
-fn dropee_emit_retag<'tcx>(
+/// Builds the drop glue for the provided type. The `def_id` is that of `core::ptr::drop_glue`.
+///
+/// Inside rustc this is only called on a monomorphic type, but we expose the function for
+/// rustc_driver writers to be able to generate drop glue for a polymorphic type.
+pub fn build_drop_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
-    body: &mut Body<'tcx>,
-    mut dropee_ptr: Place<'tcx>,
-    span: Span,
-) -> Place<'tcx> {
-    if tcx.sess.opts.unstable_opts.mir_emit_retag {
-        let source_info = SourceInfo::outermost(span);
-        // We want to treat the function argument as if it was passed by `&mut`. As such, we
-        // generate
-        // ```
-        // temp = &mut *arg;
-        // Retag(temp, FnEntry)
-        // ```
-        // It's important that we do this first, before anything that depends on `dropee_ptr`
-        // has been put into the body.
-        let reborrow = Rvalue::Ref(
-            tcx.lifetimes.re_erased,
-            BorrowKind::Mut { kind: MutBorrowKind::Default },
-            tcx.mk_place_deref(dropee_ptr),
-        );
-        let ref_ty = reborrow.ty(body.local_decls(), tcx);
-        dropee_ptr = body.local_decls.push(LocalDecl::new(ref_ty, span)).into();
-        let new_statements = [
-            StatementKind::Assign(Box::new((dropee_ptr, reborrow))),
-            StatementKind::Retag(RetagKind::FnEntry, Box::new(dropee_ptr)),
-        ];
-        for s in new_statements {
-            body.basic_blocks_mut()[START_BLOCK].statements.push(Statement::new(source_info, s));
-        }
-    }
-    dropee_ptr
-}
-
-fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>) -> Body<'tcx> {
+    def_id: DefId,
+    ty: Option<Ty<'tcx>>,
+    typing_env: ty::TypingEnv<'tcx>,
+) -> Body<'tcx> {
     debug!("build_drop_shim(def_id={:?}, ty={:?})", def_id, ty);
 
     assert!(!matches!(ty, Some(ty) if ty.is_coroutine()));
@@ -339,7 +280,7 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     } else {
         GenericArgs::identity_for_item(tcx, def_id)
     };
-    let sig = tcx.fn_sig(def_id).instantiate(tcx, args);
+    let sig = tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip();
     let sig = tcx.instantiate_bound_regions_with_erased(sig);
     let span = tcx.def_span(def_id);
 
@@ -350,20 +291,57 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
     let block = |blocks: &mut IndexVec<_, _>, kind| {
         blocks.push(BasicBlockData::new(Some(Terminator { source_info, kind }), false))
     };
-    block(&mut blocks, TerminatorKind::Goto { target: return_block });
+    if ty.is_some() {
+        block(&mut blocks, TerminatorKind::Goto { target: return_block });
+    }
     block(&mut blocks, TerminatorKind::Return);
 
     let source = MirSource::from_instance(ty::InstanceKind::DropGlue(def_id, ty));
     let mut body =
         new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
-    // The first argument (index 0), but add 1 for the return value.
-    let dropee_ptr = Place::from(Local::new(1 + 0));
-    let dropee_ptr = dropee_emit_retag(tcx, &mut body, dropee_ptr, span);
+    let Some(ty) = ty else {
+        return body;
+    };
 
-    if ty.is_some() {
+    let dropee_ptr = Place::from(Local::arg(0));
+
+    if let ty::Array(ety, _len) = *ty.kind() {
+        // Don't write out the elaboration for each array type.
+        // Instead, just delegate to the slice version.
+        let slice_ty = Ty::new_slice(tcx, ety);
+        let mut_slice_ty = Ty::new_ref(tcx, tcx.lifetimes.re_erased, slice_ty, ty::Mutability::Mut);
+        let erased_local = body.local_decls.push(LocalDecl::new(mut_slice_ty, span));
+
+        let start = &mut body.basic_blocks_mut()[START_BLOCK];
+        start.statements.push(Statement::new(
+            source_info,
+            StatementKind::Assign(Box::new((
+                Place::from(erased_local),
+                Rvalue::Cast(
+                    CastKind::PointerCoercion(
+                        ty::adjustment::PointerCoercion::Unsize,
+                        CoercionSource::Implicit,
+                    ),
+                    Operand::Move(dropee_ptr),
+                    mut_slice_ty,
+                ),
+            ))),
+        ));
+        start.terminator = Some(Terminator {
+            source_info,
+            kind: TerminatorKind::Call {
+                func: Operand::function_handle(tcx, def_id, [ty::GenericArg::from(slice_ty)], span),
+                args: Box::new([Spanned { span, node: Operand::Move(Place::from(erased_local)) }]),
+                destination: Place::from(RETURN_PLACE),
+                target: Some(return_block),
+                unwind: UnwindAction::Continue,
+                call_source: CallSource::Misc,
+                fn_span: span,
+            },
+        });
+    } else {
         let patch = {
-            let typing_env = ty::TypingEnv::post_analysis(tcx, def_id);
             let mut elaborator = DropShimElaborator {
                 body: &body,
                 patch: MirPatch::new(&body),
@@ -458,9 +436,6 @@ impl<'a, 'tcx> DropElaborator<'a, 'tcx> for DropShimElaborator<'a, 'tcx> {
         self.typing_env
     }
 
-    fn terminator_loc(&self, bb: BasicBlock) -> Location {
-        self.patch.terminator_loc(self.body, bb)
-    }
     fn allow_async_drops(&self) -> bool {
         self.produce_async_drops
     }
@@ -537,7 +512,7 @@ fn build_clone_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'tcx>) -
     let mut builder = CloneShimBuilder::new(tcx, def_id, self_ty);
 
     let dest = Place::return_place();
-    let src = tcx.mk_place_deref(Place::from(Local::new(1 + 0)));
+    let src = tcx.mk_place_deref(Place::from(Local::arg(0)));
 
     match self_ty.kind() {
         ty::FnDef(..) | ty::FnPtr(..) => builder.copy_shim(),
@@ -570,7 +545,7 @@ impl<'tcx> CloneShimBuilder<'tcx> {
         // we must instantiate the self_ty because it's
         // otherwise going to be TySelf and we can't index
         // or access fields of a Place of type TySelf.
-        let sig = tcx.fn_sig(def_id).instantiate(tcx, &[self_ty.into()]);
+        let sig = tcx.fn_sig(def_id).instantiate(tcx, &[self_ty.into()]).skip_norm_wip();
         let sig = tcx.instantiate_bound_regions_with_erased(sig);
         let span = tcx.def_span(def_id);
 
@@ -623,10 +598,10 @@ impl<'tcx> CloneShimBuilder<'tcx> {
     }
 
     fn copy_shim(&mut self) {
-        let rcvr = self.tcx.mk_place_deref(Place::from(Local::new(1 + 0)));
+        let rcvr = self.tcx.mk_place_deref(Place::from(Local::arg(0)));
         let ret_statement = self.make_statement(StatementKind::Assign(Box::new((
             Place::return_place(),
-            Rvalue::Use(Operand::Copy(rcvr)),
+            Rvalue::Use(Operand::Copy(rcvr), WithRetag::Yes),
         ))));
         self.block(vec![ret_statement], TerminatorKind::Return, false);
     }
@@ -722,7 +697,6 @@ impl<'tcx> CloneShimBuilder<'tcx> {
                     unwind: UnwindAction::Terminate(UnwindTerminateReason::InCleanup),
                     replace: false,
                     drop: None,
-                    async_fut: None,
                 },
                 /* is_cleanup */ true,
             );
@@ -824,9 +798,9 @@ fn build_call_shim<'tcx>(
 
     assert_eq!(sig_args.is_some(), !instance.has_polymorphic_mir_body());
     let mut sig = if let Some(sig_args) = sig_args {
-        sig.instantiate(tcx, &sig_args)
+        sig.instantiate(tcx, &sig_args).skip_norm_wip()
     } else {
-        sig.instantiate_identity()
+        sig.instantiate_identity().skip_norm_wip()
     };
 
     if let CallKind::Indirect(fnty) = call_kind {
@@ -878,7 +852,7 @@ fn build_call_shim<'tcx>(
 
     let rcvr_place = || {
         assert!(rcvr_adjustment.is_some());
-        Place::from(Local::new(1))
+        Place::from(Local::arg(0))
     };
     let mut statements = vec![];
 
@@ -912,7 +886,7 @@ fn build_call_shim<'tcx>(
 
         // `FnDef` call with optional receiver.
         CallKind::Direct(def_id) => {
-            let ty = tcx.type_of(def_id).instantiate_identity();
+            let ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
             (
                 Operand::Constant(Box::new(ConstOperand {
                     span,
@@ -937,11 +911,11 @@ fn build_call_shim<'tcx>(
     }
 
     // Pass all of the non-special arguments directly.
-    args.extend(arg_range.map(|i| Operand::Move(Place::from(Local::new(1 + i)))));
+    args.extend(arg_range.map(|i| Operand::Move(Place::from(Local::arg(i)))));
 
     // Untuple the last argument, if we have to.
     if let Some(untuple_args) = untuple_args {
-        let tuple_arg = Local::new(1 + (sig.inputs().len() - 1));
+        let tuple_arg = Local::arg(sig.inputs().len() - 1);
         args.extend(untuple_args.iter().enumerate().map(|(i, ity)| {
             Operand::Move(tcx.mk_place_field(Place::from(tuple_arg), FieldIdx::new(i), *ity))
         }));
@@ -989,7 +963,6 @@ fn build_call_shim<'tcx>(
                 unwind: UnwindAction::Continue,
                 replace: false,
                 drop: None,
-                async_fut: None,
             },
             false,
         );
@@ -1008,7 +981,6 @@ fn build_call_shim<'tcx>(
                 unwind: UnwindAction::Terminate(UnwindTerminateReason::InCleanup),
                 replace: false,
                 drop: None,
-                async_fut: None,
             },
             /* is_cleanup */ true,
         );
@@ -1020,7 +992,7 @@ fn build_call_shim<'tcx>(
     let mut body =
         new_body(MirSource::from_instance(instance), blocks, local_decls, sig.inputs().len(), span);
 
-    if let ExternAbi::RustCall = sig.abi {
+    if let ExternAbi::RustCall = sig.abi() {
         body.spread_arg = Some(Local::new(sig.inputs().len()));
     }
 
@@ -1036,9 +1008,10 @@ pub(super) fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
     let sig = tcx
         .fn_sig(ctor_id)
         .instantiate_identity()
+        .skip_norm_wip()
         .no_bound_vars()
         .expect("LBR in ADT constructor signature");
-    let sig = tcx.normalize_erasing_regions(typing_env, sig);
+    let sig = tcx.normalize_erasing_regions(typing_env, Unnormalized::new_wip(sig));
 
     let ty::Adt(adt_def, args) = sig.output().kind() else {
         bug!("unexpected type for ADT ctor {:?}", sig.output());
@@ -1072,7 +1045,7 @@ pub(super) fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
             Rvalue::Aggregate(
                 Box::new(kind),
                 (0..variant.fields.len())
-                    .map(|idx| Operand::Move(Place::from(Local::new(idx + 1))))
+                    .map(|idx| Operand::Move(Place::from(Local::arg(idx))))
                     .collect(),
             ),
         ))),
@@ -1111,7 +1084,9 @@ pub(super) fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
 fn build_fn_ptr_addr_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'tcx>) -> Body<'tcx> {
     assert_matches!(self_ty.kind(), ty::FnPtr(..), "expected fn ptr, found {self_ty}");
     let span = tcx.def_span(def_id);
-    let Some(sig) = tcx.fn_sig(def_id).instantiate(tcx, &[self_ty.into()]).no_bound_vars() else {
+    let Some(sig) =
+        tcx.fn_sig(def_id).instantiate(tcx, &[self_ty.into()]).skip_norm_wip().no_bound_vars()
+    else {
         span_bug!(span, "FnPtr::addr with bound vars for `{self_ty}`");
     };
     let locals = local_decls_for_sig(&sig, span);
@@ -1121,7 +1096,7 @@ fn build_fn_ptr_addr_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'t
     // provenance.
     let rvalue = Rvalue::Cast(
         CastKind::FnPtrToPtr,
-        Operand::Move(Place::from(Local::new(1))),
+        Operand::Move(Place::from(Local::arg(0))),
         Ty::new_imm_ptr(tcx, tcx.types.unit),
     );
     let stmt = Statement::new(
@@ -1143,8 +1118,8 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
     coroutine_closure_def_id: DefId,
     receiver_by_ref: bool,
 ) -> Body<'tcx> {
-    let mut self_ty = tcx.type_of(coroutine_closure_def_id).instantiate_identity();
-    let mut self_local: Place<'tcx> = Local::from_usize(1).into();
+    let mut self_ty = tcx.type_of(coroutine_closure_def_id).instantiate_identity().skip_norm_wip();
+    let mut self_local: Place<'tcx> = Local::arg(0).into();
     let ty::CoroutineClosure(_, args) = *self_ty.kind() else {
         bug!();
     };
@@ -1171,9 +1146,7 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
                 args.as_coroutine_closure().tupled_upvars_ty(),
                 args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
             ),
-            sig.c_variadic,
-            sig.safety,
-            sig.abi,
+            sig.fn_sig_kind,
         )
     });
     let sig = tcx.liberate_late_bound_regions(coroutine_closure_def_id, poly_sig);
@@ -1188,7 +1161,7 @@ fn build_construct_coroutine_by_move_shim<'tcx>(
 
     // Move all of the closure args.
     for idx in 1..sig.inputs().len() {
-        fields.push(Operand::Move(Local::from_usize(idx + 1).into()));
+        fields.push(Operand::Move(Local::arg(idx).into()));
     }
 
     for (idx, ty) in args.as_coroutine_closure().upvar_tys().iter().enumerate() {

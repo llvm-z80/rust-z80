@@ -4,13 +4,11 @@
 //! various types in `rustdoc::clean`.
 //!
 //! These implementations all emit HTML. As an internal implementation detail,
-//! some of them support an alternate format that emits text, but that should
-//! not be used external to this module.
+//! some of them support an alternate format that emits plain text.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Display, Write};
-use std::iter::{self, once};
-use std::slice;
+use std::{iter, slice};
 
 use itertools::{Either, Itertools};
 use rustc_abi::ExternAbi;
@@ -185,9 +183,9 @@ pub(crate) fn print_where_clause(
 
         let clause = if f.alternate() {
             if ending == Ending::Newline {
-                format!(" where{where_preds},")
+                format!(" where{where_preds:#},")
             } else {
-                format!(" where{where_preds}")
+                format!(" where{where_preds:#}")
             }
         } else {
             let mut br_with_padding = String::with_capacity(6 * indent + 28);
@@ -434,25 +432,33 @@ fn generate_item_def_id_path(
 
     let tcx = cx.tcx();
     let crate_name = tcx.crate_name(def_id.krate);
+    let mut prim = None;
 
     // No need to try to infer the actual parent item if it's not an associated item from the `impl`
     // block.
     if def_id != original_def_id && matches!(tcx.def_kind(def_id), DefKind::Impl { .. }) {
         let infcx = tcx.infer_ctxt().build(TypingMode::non_body_analysis());
-        def_id = infcx
+        let ty = tcx.type_of(def_id);
+        let ty = infcx
             .at(&ObligationCause::dummy(), tcx.param_env(def_id))
-            .query_normalize(ty::Binder::dummy(tcx.type_of(def_id).instantiate_identity()))
-            .map(|resolved| infcx.resolve_vars_if_possible(resolved.value))
-            .ok()
-            .and_then(|normalized| normalized.skip_binder().ty_adt_def())
-            .map(|adt| adt.did())
-            .unwrap_or(def_id);
+            .query_normalize(ty::Binder::dummy(ty.instantiate_identity().skip_norm_wip()))
+            .map(|resolved| infcx.resolve_vars_if_possible(resolved.value).skip_binder())
+            .unwrap_or(ty.skip_binder());
+        if let Some(new_def_id) = ty.ty_adt_def().map(|adt| adt.did()) {
+            def_id = new_def_id;
+        } else {
+            prim = PrimitiveType::from_ty(ty);
+        }
     }
 
-    let relative = clean::inline::item_relative_path(tcx, def_id);
-    let fqp: Vec<Symbol> = once(crate_name).chain(relative).collect();
-
-    let shortty = ItemType::from_def_id(def_id, tcx);
+    let mut fqp = vec![crate_name];
+    let shortty = if let Some(prim) = prim {
+        fqp.push(prim.as_sym());
+        ItemType::Primitive
+    } else {
+        fqp.append(&mut clean::inline::item_relative_path(tcx, def_id));
+        ItemType::from_def_id(def_id, tcx)
+    };
     let module_fqp = to_module_fqp(shortty, &fqp);
 
     let (parts, is_absolute) = url_parts(cx.cache(), def_id, module_fqp, &cx.current)?;
@@ -959,7 +965,7 @@ fn fmt_type(
                 }
             }
         },
-        clean::Slice(box clean::Generic(name)) => {
+        clean::Slice(clean::Generic(name)) => {
             primitive_link(f, PrimitiveType::Slice, format_args!("[{name}]"), cx)
         }
         clean::Slice(t) => Wrapped::with_square_brackets().wrap(print_type(t, cx)).fmt(f),
@@ -972,7 +978,7 @@ fn fmt_type(
             fmt::Display::fmt(&print_type(t, cx), f)?;
             write!(f, ", {field})")
         }
-        clean::Array(box clean::Generic(name), n) if !f.alternate() => primitive_link(
+        clean::Array(clean::Generic(name), n) if !f.alternate() => primitive_link(
             f,
             PrimitiveType::Array,
             format_args!("[{name}; {n}]", n = Escape(n)),
@@ -1278,7 +1284,7 @@ fn print_parameter(parameter: &clean::Parameter, cx: &Context<'_>) -> impl fmt::
         if let Some(self_ty) = parameter.to_receiver() {
             match self_ty {
                 clean::SelfTy => f.write_str("self"),
-                clean::BorrowedRef { lifetime, mutability, type_: box clean::SelfTy } => {
+                clean::BorrowedRef { lifetime, mutability, type_: clean::SelfTy } => {
                     f.write_str(if f.alternate() { "&" } else { "&amp;" })?;
                     if let Some(lt) = lifetime {
                         write!(f, "{lt} ", lt = print_lifetime(lt))?;

@@ -47,8 +47,8 @@ pub(super) fn is_inline_valid_on_fn<'tcx>(
     }
 
     let ty = tcx.type_of(def_id);
-    if match ty.instantiate_identity().kind() {
-        ty::FnDef(..) => tcx.fn_sig(def_id).instantiate_identity().c_variadic(),
+    if match ty.instantiate_identity().skip_norm_wip().kind() {
+        ty::FnDef(..) => tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip().c_variadic(),
         ty::Closure(_, args) => args.as_closure().sig().c_variadic(),
         _ => false,
     } {
@@ -59,12 +59,12 @@ pub(super) fn is_inline_valid_on_fn<'tcx>(
         return Err("cold");
     }
 
-    // Intrinsic fallback bodies are automatically made cross-crate inlineable,
-    // but at this stage we don't know whether codegen knows the intrinsic,
-    // so just conservatively don't inline it. This also ensures that we do not
-    // accidentally inline the body of an intrinsic that *must* be overridden.
-    if find_attr!(tcx, def_id, RustcIntrinsic) {
-        return Err("callee is an intrinsic");
+    // Intrinsics without fallback body cannot be inlined. The logic for which intrinsics *with*
+    // body can be inlined is in the inlining pass.
+    if let Some(intrinsic) = tcx.intrinsic(def_id)
+        && intrinsic.must_be_overridden
+    {
+        return Err("callee is an intrinsic without fallback body");
     }
 
     Ok(())

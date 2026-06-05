@@ -1,6 +1,6 @@
 use rustc_middle::queries::TaggedQueryKey;
 use rustc_middle::query::erase::{self, Erased};
-use rustc_middle::query::{AsLocalQueryKey, QueryMode, QueryVTable};
+use rustc_middle::query::{QueryKey, QueryMode, QueryVTable};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
@@ -19,8 +19,10 @@ macro_rules! define_queries {
                     arena_cache: $arena_cache:literal,
                     cache_on_disk: $cache_on_disk:literal,
                     depth_limit: $depth_limit:literal,
+                    desc: $desc:expr,
                     eval_always: $eval_always:literal,
                     feedable: $feedable:literal,
+                    handle_cycle_error: $handle_cycle_error:literal,
                     no_force: $no_force:literal,
                     no_hash: $no_hash:literal,
                     returns_error_guaranteed: $returns_error_guaranteed:literal,
@@ -129,7 +131,6 @@ macro_rules! define_queries {
                     -> QueryVTable<'tcx, rustc_middle::queries::$name::Cache<'tcx>>
                 {
                     use rustc_middle::queries::$name::Value;
-
                     QueryVTable {
                         name: stringify!($name),
                         eval_always: $eval_always,
@@ -138,36 +139,31 @@ macro_rules! define_queries {
                         dep_kind: rustc_middle::dep_graph::DepKind::$name,
                         state: Default::default(),
                         cache: Default::default(),
+                        cache_on_disk_local: $cache_on_disk,
+                        separate_provide_extern: $separate_provide_extern,
 
                         invoke_provider_fn: self::invoke_provider_fn::__rust_begin_short_backtrace,
 
                         #[cfg($cache_on_disk)]
-                        will_cache_on_disk_for_key_fn:
-                            rustc_middle::queries::_cache_on_disk_if_fns::$name,
-                        #[cfg(not($cache_on_disk))]
-                        will_cache_on_disk_for_key_fn: |_, _| false,
-
-                        #[cfg($cache_on_disk)]
-                        try_load_from_disk_fn: |tcx, key, prev_index, index| {
+                        try_load_from_disk_fn: |tcx, prev_index| {
                             use rustc_middle::queries::$name::{ProvidedValue, provided_to_erased};
 
-                            // Check the `cache_on_disk_if` condition for this key.
-                            if !rustc_middle::queries::_cache_on_disk_if_fns::$name(tcx, key) {
-                                return None;
-                            }
-
                             let loaded_value: ProvidedValue<'tcx> =
-                                $crate::plumbing::try_load_from_disk(tcx, prev_index, index)?;
+                                $crate::plumbing::try_load_from_disk(tcx, prev_index)?;
 
                             // Arena-alloc the value if appropriate, and erase it.
                             Some(provided_to_erased(tcx, loaded_value))
                         },
                         #[cfg(not($cache_on_disk))]
-                        try_load_from_disk_fn: |_tcx, _key, _prev_index, _index| None,
+                        try_load_from_disk_fn: |_tcx, _prev_index| None,
 
-                        // The default just emits `err` and then aborts.
-                        // `handle_cycle_error::specialize_query_vtables` overwrites this default
-                        // for certain queries.
+                        #[cfg($handle_cycle_error)]
+                        handle_cycle_error_fn: |tcx, key, cycle, err| {
+                            use rustc_middle::query::erase::erase_val;
+
+                            erase_val($crate::handle_cycle_error::$name(tcx, key, cycle, err))
+                        },
+                        #[cfg(not($handle_cycle_error))]
                         handle_cycle_error_fn: |_tcx, _key, _cycle, err| {
                             $crate::handle_cycle_error::default(err)
                         },

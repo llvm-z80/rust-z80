@@ -10,7 +10,6 @@ use syntax::{
     ast::{
         self, BlockExpr, Expr, ExprStmt, HasArgList,
         edit::{AstNodeEdit, IndentLevel},
-        syntax_factory::SyntaxFactory,
     },
 };
 
@@ -20,7 +19,14 @@ use crate::{Assist, Diagnostic, DiagnosticCode, DiagnosticsContext, adjusted_dis
 //
 // This diagnostic is triggered when the type of an expression or pattern does not match
 // the expected type.
-pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<'_>) -> Diagnostic {
+pub(crate) fn type_mismatch(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::TypeMismatch<'_>,
+) -> Option<Diagnostic> {
+    if d.expected.is_unknown() || d.actual.is_unknown() {
+        return None;
+    }
+
     let display_range = adjusted_display_range(ctx, d.expr_or_pat, &|node| {
         let Either::Left(expr) = node else { return None };
         let salient_token_range = match expr {
@@ -39,24 +45,26 @@ pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<
         cov_mark::hit!(type_mismatch_range_adjustment);
         Some(salient_token_range)
     });
-    Diagnostic::new(
-        DiagnosticCode::RustcHardError("E0308"),
-        format!(
-            "expected {}, found {}",
-            d.expected
-                .display(ctx.sema.db, ctx.display_target)
-                .with_closure_style(ClosureStyle::ClosureWithId),
-            d.actual
-                .display(ctx.sema.db, ctx.display_target)
-                .with_closure_style(ClosureStyle::ClosureWithId),
-        ),
-        display_range,
+    Some(
+        Diagnostic::new(
+            DiagnosticCode::RustcHardError("E0308"),
+            format!(
+                "expected {}, found {}",
+                d.expected
+                    .display(ctx.sema.db, ctx.display_target)
+                    .with_closure_style(ClosureStyle::ClosureWithId),
+                d.actual
+                    .display(ctx.sema.db, ctx.display_target)
+                    .with_closure_style(ClosureStyle::ClosureWithId),
+            ),
+            display_range,
+        )
+        .stable()
+        .with_fixes(fixes(ctx, d)),
     )
-    .stable()
-    .with_fixes(fixes(ctx, d))
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<'_>) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::TypeMismatch<'_>) -> Option<Vec<Assist>> {
     let mut fixes = Vec::new();
 
     if let Some(expr_ptr) = d.expr_or_pat.value.cast::<ast::Expr>() {
@@ -72,7 +80,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<'_>) -> Option<Vec<
 }
 
 fn add_reference(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TypeMismatch<'_>,
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
@@ -94,14 +102,15 @@ fn add_reference(
 }
 
 fn add_missing_ok_or_some(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TypeMismatch<'_>,
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
     let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
-    let expr_range = expr.syntax().text_range();
+    let hir::FileRange { file_id, range: expr_range } =
+        ctx.sema.original_range_opt(expr.syntax())?;
     let scope = ctx.sema.scope(expr.syntax())?;
 
     let expected_adt = d.expected.as_adt()?;
@@ -124,6 +133,8 @@ fn add_missing_ok_or_some(
         return None;
     }
 
+    let file_id = file_id.file_id(ctx.sema.db);
+
     if d.actual.is_unit() {
         if let Expr::BlockExpr(block) = &expr {
             if block.tail_expr().is_none() {
@@ -135,21 +146,18 @@ fn add_missing_ok_or_some(
                     // Empty block
                     let indent = block_indent + 1;
                     builder.insert(
-                        block.syntax().text_range().start() + TextSize::from(1),
+                        expr_range.start() + TextSize::from(1),
                         format!("\n{indent}{variant_name}(())\n{block_indent}"),
                     );
                 } else {
                     let indent = IndentLevel::from(1);
                     builder.insert(
-                        block.syntax().text_range().end() - TextSize::from(1),
+                        expr_range.end() - TextSize::from(1),
                         format!("{indent}{variant_name}(())\n{block_indent}"),
                     );
                 }
 
-                let source_change = SourceChange::from_text_edit(
-                    expr_ptr.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
-                    builder.finish(),
-                );
+                let source_change = SourceChange::from_text_edit(file_id, builder.finish());
                 let name = format!("Insert {variant_name}(()) as the tail of this block");
                 acc.push(fix("insert_wrapped_unit", &name, source_change, expr_range));
             }
@@ -158,33 +166,38 @@ fn add_missing_ok_or_some(
             // Fix for forms like `fn foo() -> Result<(), String> { return; }`
             if ret_expr.expr().is_none() {
                 let mut builder = TextEdit::builder();
-                builder
-                    .insert(ret_expr.syntax().text_range().end(), format!(" {variant_name}(())"));
-                let source_change = SourceChange::from_text_edit(
-                    expr_ptr.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
-                    builder.finish(),
-                );
+                builder.insert(expr_range.end(), format!(" {variant_name}(())"));
+                let source_change = SourceChange::from_text_edit(file_id, builder.finish());
                 let name = format!("Insert {variant_name}(()) as the return value");
                 acc.push(fix("insert_wrapped_unit", &name, source_change, expr_range));
             }
+            return Some(());
+        } else if expr.is_block_like()
+            && expr.syntax().parent().and_then(ast::StmtList::cast).is_some()
+        {
+            // Fix for forms like `fn foo() -> Result<(), String> { for _ in 0..8 {} }`
+            let mut builder = TextEdit::builder();
+            let indent = expr.indent_level();
+            builder.insert(expr_range.end(), format!("\n{indent}{variant_name}(())"));
+
+            let source_change = SourceChange::from_text_edit(file_id, builder.finish());
+            let name = format!("Insert {variant_name}(()) as the tail of this block");
+            acc.push(fix("insert_wrapped_unit", &name, source_change, expr_range));
             return Some(());
         }
     }
 
     let mut builder = TextEdit::builder();
-    builder.insert(expr.syntax().text_range().start(), format!("{variant_name}("));
-    builder.insert(expr.syntax().text_range().end(), ")".to_owned());
-    let source_change = SourceChange::from_text_edit(
-        expr_ptr.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
-        builder.finish(),
-    );
+    builder.insert(expr_range.start(), format!("{variant_name}("));
+    builder.insert(expr_range.end(), ")".to_owned());
+    let source_change = SourceChange::from_text_edit(file_id, builder.finish());
     let name = format!("Wrap in {variant_name}");
     acc.push(fix("wrap_in_constructor", &name, source_change, expr_range));
     Some(())
 }
 
 fn remove_unnecessary_wrapper(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TypeMismatch<'_>,
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
@@ -192,6 +205,7 @@ fn remove_unnecessary_wrapper(
     let db = ctx.sema.db;
     let root = db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
+    // FIXME: support inside MacroCall?
     let expr = ctx.sema.original_ast_node(expr)?;
 
     let Expr::CallExpr(call_expr) = expr else {
@@ -220,7 +234,7 @@ fn remove_unnecessary_wrapper(
 
     let file_id = expr_ptr.file_id.original_file(db);
     let mut builder = SourceChangeBuilder::new(file_id.file_id(ctx.sema.db));
-    let mut editor;
+    let editor;
     match inner_arg {
         // We're returning `()`
         Expr::TupleExpr(tup) if tup.fields().next().is_none() => {
@@ -230,7 +244,7 @@ fn remove_unnecessary_wrapper(
                 .and_then(Either::<ast::ReturnExpr, ast::StmtList>::cast)?;
 
             editor = builder.make_editor(parent.syntax());
-            let make = SyntaxFactory::with_mappings();
+            let make = editor.make();
 
             match parent {
                 Either::Left(ret_expr) => {
@@ -246,8 +260,6 @@ fn remove_unnecessary_wrapper(
                     editor.replace(stmt_list.syntax().parent()?, new_block.syntax());
                 }
             }
-
-            editor.add_mappings(make.finish_with_mappings());
         }
         _ => {
             editor = builder.make_editor(call_expr.syntax());
@@ -267,7 +279,7 @@ fn remove_unnecessary_wrapper(
 }
 
 fn remove_semicolon(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TypeMismatch<'_>,
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
@@ -278,6 +290,7 @@ fn remove_semicolon(
         return None;
     }
     let block = BlockExpr::cast(expr.syntax().clone())?;
+    // FIXME: support inside MacroCall?
     let expr_before_semi =
         block.statements().last().and_then(|s| ExprStmt::cast(s.syntax().clone()))?;
     let type_before_semi = ctx.sema.type_of_expr(&expr_before_semi.expr()?)?.original();
@@ -297,7 +310,7 @@ fn remove_semicolon(
 }
 
 fn str_ref_to_owned(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::TypeMismatch<'_>,
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
@@ -311,16 +324,13 @@ fn str_ref_to_owned(
 
     let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
-    let expr_range = expr.syntax().text_range();
+    let hir::FileRange { file_id, range } = ctx.sema.original_range_opt(expr.syntax())?;
 
     let to_owned = ".to_owned()".to_owned();
 
-    let edit = TextEdit::insert(expr.syntax().text_range().end(), to_owned);
-    let source_change = SourceChange::from_text_edit(
-        expr_ptr.file_id.original_file(ctx.sema.db).file_id(ctx.sema.db),
-        edit,
-    );
-    acc.push(fix("str_ref_to_owned", "Add .to_owned() here", source_change, expr_range));
+    let edit = TextEdit::insert(range.end(), to_owned);
+    let source_change = SourceChange::from_text_edit(file_id.file_id(ctx.sema.db), edit);
+    acc.push(fix("str_ref_to_owned", "Add .to_owned() here", source_change, range));
 
     Some(())
 }
@@ -328,7 +338,8 @@ fn str_ref_to_owned(
 #[cfg(test)]
 mod tests {
     use crate::tests::{
-        check_diagnostics, check_diagnostics_with_disabled, check_fix, check_has_fix, check_no_fix,
+        check_diagnostics, check_diagnostics_with_disabled, check_fix, check_fix_with_disabled,
+        check_has_fix, check_no_fix,
     };
 
     #[test]
@@ -568,6 +579,32 @@ fn div(x: i32, y: i32) -> Result<i32, ()> {
 }
 "#,
         );
+
+        check_fix(
+            r#"
+//- minicore: option, result
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+identity! {
+    fn div(x: i32, y: i32) -> Result<i32, ()> {
+        if y == 0 {
+            return Err(());
+        }
+        x / y$0
+    }
+}
+"#,
+            r#"
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+identity! {
+    fn div(x: i32, y: i32) -> Result<i32, ()> {
+        if y == 0 {
+            return Err(());
+        }
+        Ok(x / y)
+    }
+}
+"#,
+        );
     }
 
     #[test]
@@ -700,11 +737,26 @@ fn foo() -> Result<(), ()> {
 }
             "#,
         );
+
+        check_fix(
+            r#"
+//- minicore: result, iterator
+fn foo() -> Result<(), ()> {
+    for _ in 0..5 {}$0
+}
+            "#,
+            r#"
+fn foo() -> Result<(), ()> {
+    for _ in 0..5 {}
+    Ok(())
+}
+            "#,
+        );
     }
 
     #[test]
     fn wrapped_unit_as_return_expr() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: result
 fn foo(b: bool) -> Result<(), String> {
@@ -722,6 +774,7 @@ fn foo(b: bool) -> Result<(), String> {
 
     Err("oh dear".to_owned())
 }"#,
+            &["E0599"],
         );
     }
 
@@ -771,7 +824,7 @@ fn foo() -> SomeOtherEnum { 0$0 }
 
     #[test]
     fn unwrap_return_type() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: option, result
 fn div(x: i32, y: i32) -> i32 {
@@ -789,6 +842,7 @@ fn div(x: i32, y: i32) -> i32 {
     x / y
 }
 "#,
+            &["E0282"],
         );
     }
 
@@ -846,7 +900,7 @@ fn div(x: i32, y: i32) -> i32 {
 
     #[test]
     fn unwrap_return_type_option_tail_unit() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: option, result
 fn div(x: i32, y: i32) {
@@ -864,12 +918,13 @@ fn div(x: i32, y: i32) {
     }
 }
 "#,
+            &["E0282"],
         );
     }
 
     #[test]
     fn unwrap_return_type_handles_generic_functions() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: option, result
 fn div<T>(x: T) -> T {
@@ -887,12 +942,13 @@ fn div<T>(x: T) -> T {
     x
 }
 "#,
+            &["E0282"],
         );
     }
 
     #[test]
     fn unwrap_return_type_handles_type_aliases() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: option, result
 type MyResult<T> = T;
@@ -914,12 +970,13 @@ fn div(x: i32, y: i32) -> MyResult<i32> {
     x / y
 }
 "#,
+            &["E0282"],
         );
     }
 
     #[test]
     fn unwrap_tail_expr() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: result
 fn foo() -> () {
@@ -932,12 +989,13 @@ fn foo() -> () {
     println!("Hello, world!");
 }
             "#,
+            &["E0282"],
         );
     }
 
     #[test]
     fn unwrap_to_empty_block() {
-        check_fix(
+        check_fix_with_disabled(
             r#"
 //- minicore: result
 fn foo() -> () {
@@ -947,6 +1005,7 @@ fn foo() -> () {
             r#"
 fn foo() -> () {}
             "#,
+            &["E0282"],
         );
     }
 
@@ -1040,6 +1099,29 @@ fn test() -> String {
 }
             "#,
         );
+
+        check_fix(
+            r#"
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+struct String;
+
+identity! {
+    fn test() -> String {
+        "a"$0
+    }
+}
+            "#,
+            r#"
+macro_rules! identity { ($($t:tt)*) => ($($t)*) }
+struct String;
+
+identity! {
+    fn test() -> String {
+        "a".to_owned()
+    }
+}
+            "#,
+        );
     }
 
     #[test]
@@ -1116,9 +1198,7 @@ fn f() {
     let &() = &mut ();
       //^^^ error: expected &mut (), found &()
     match &() {
-        // FIXME: we should only show the deep one.
         &9 => ()
-      //^^ error: expected &(), found &i32
        //^ error: expected (), found i32
     }
 }
@@ -1171,7 +1251,7 @@ trait B {}
 
 fn test(a: &dyn A) -> &dyn B {
     a
-  //^ error: expected &(dyn B + 'static), found &(dyn A + 'static)
+  //^💡 error: expected &(dyn B + 'static), found &(dyn A + 'static)
 }
 "#,
         );
@@ -1249,6 +1329,27 @@ fn main() {
     enum E { V() }
     let E::V() = &S {};
      // ^^^^^^ error: expected S, found E
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_ignore_unknown_mismatch() {
+        check_diagnostics(
+            r#"
+pub trait Foo {
+    type Out;
+}
+impl Foo for [i32; 1] {
+    type Out = ();
+}
+pub fn foo<T: Foo>(_: T) -> (T::Out,) { loop { } }
+
+fn main() {
+    let _x = foo(2);
+     // ^^ error: type annotations needed
+          // ^^^ error: the trait bound `i32: Foo` is not satisfied
 }
 "#,
         );

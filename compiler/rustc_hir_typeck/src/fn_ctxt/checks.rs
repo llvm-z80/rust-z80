@@ -13,14 +13,16 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{Expr, ExprKind, FnRetTy, HirId, LangItem, Node, QPath, is_range_literal};
 use rustc_hir_analysis::check::potentially_plural_count;
-use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, PermitVariants};
+use rustc_hir_analysis::delegation::opt_get_delegation_info;
+use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, ResolvedStructPath};
 use rustc_index::IndexVec;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_session::Session;
+use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
 use rustc_trait_selection::error_reporting::infer::{FailureCode, ObligationCauseExt};
 use rustc_trait_selection::infer::InferCtxtExt;
@@ -95,8 +97,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // as otherwise we can wind up conservatively proving `Copy` which may
                 // infer the repeat expr count to something that never required `Copy` in
                 // the first place.
-                let count = self
-                    .structurally_resolve_const(element.span, self.normalize(element.span, count));
+                let count = self.structurally_resolve_const(
+                    element.span,
+                    self.normalize(element.span, Unnormalized::new_wip(count)),
+                );
 
                 // Avoid run on "`NotCopy: Copy` is not implemented" errors when the
                 // repeat expr count is erroneous/unknown. The user might wind up
@@ -183,6 +187,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // The expressions for each provided argument
         provided_args: &'tcx [hir::Expr<'tcx>],
         // Whether the function is variadic, for example when imported from C
+        // FIXME(splat): maybe change this to FnSigKind?
         c_variadic: bool,
         // Whether the arguments have been bundled in a tuple (ex: closures)
         tuple_arguments: TupleArgumentsFlag,
@@ -238,37 +243,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let origin = self.misc(call_span);
                     ocx.sup(&origin, self.param_env, expected_output, formal_output)?;
 
-                    let formal_input_tys_ns;
-                    let formal_input_tys = if self.next_trait_solver() {
-                        // In the new solver, the normalizations are done lazily.
-                        // Because of this, if we encounter unnormalized alias types inside this
-                        // fudge scope, we might lose the relationships between them and other vars
-                        // when fudging inference variables created here.
-                        // So, we utilize generalization to normalize aliases by adding a new
-                        // inference var and equating it with the type we want to pull out of the
-                        // fudge scope.
-                        formal_input_tys_ns = formal_input_tys
-                            .iter()
-                            .map(|&ty| {
-                                // If we replace a (unresolved) inference var with a new inference
-                                // var, it will be eventually resolved to itself and this will
-                                // weaken type inferences as the new inference var will be fudged
-                                // out and lose all relationships with other vars while the former
-                                // will not be fudged.
-                                if ty.is_ty_var() {
-                                    return ty;
-                                }
-
-                                let generalized_ty = self.next_ty_var(call_span);
-                                ocx.eq(&origin, self.param_env, ty, generalized_ty).unwrap();
-                                generalized_ty
-                            })
-                            .collect_vec();
-
-                        formal_input_tys_ns.as_slice()
-                    } else {
-                        formal_input_tys
-                    };
+                    // Check the well-formedness of expected input tys, as using ill-formed
+                    // expectation may cause type inference errors, see #150316.
+                    for &ty in formal_input_tys {
+                        ocx.register_obligation(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(call_span),
+                            self.param_env,
+                            ty::ClauseKind::WellFormed(ty.into()),
+                        ));
+                    }
 
                     if !ocx.try_evaluate_obligations().is_empty() {
                         return Err(TypeError::Mismatch);
@@ -276,7 +260,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                     // Record all the argument types, with the args
                     // produced from the above subtyping unification.
-                    Ok(Some(formal_input_tys.to_vec()))
+                    Ok(Some(
+                        formal_input_tys
+                            .iter()
+                            .map(|&ty| self.resolve_vars_if_possible(ty))
+                            .collect(),
+                    ))
                 })
                 .ok()
             })
@@ -341,7 +330,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let demand_compatible = |idx| {
             let formal_input_ty: Ty<'tcx> = formal_input_tys[idx];
             let expected_input_ty: Ty<'tcx> = expected_input_tys[idx];
-            let provided_arg = &provided_args[idx];
+            let provided_arg: &hir::Expr<'tcx> = &provided_args[idx];
 
             debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
@@ -350,7 +339,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // 1. Unify the provided argument with the expected type
             let expectation = Expectation::rvalue_hint(self, expected_input_ty);
 
-            let checked_ty = self.check_expr_with_expectation(provided_arg, expectation);
+            // If we are processing first arg of delegation then we could have adjusted it
+            // in `execute_delegation_aware_arguments_check`.
+            let checked_ty = opt_get_delegation_info(self.tcx, self.body_id)
+                .and_then(|_| self.typeck_results.borrow().node_type_opt(provided_arg.hir_id))
+                .unwrap_or_else(|| self.check_expr_with_expectation(provided_arg, expectation));
 
             // 2. Coerce to the most detailed type that could be coerced
             //    to, which is `expected_ty` if `rvalue_hint` returns an
@@ -487,7 +480,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                 // There are a few types which get autopromoted when passed via varargs
                 // in C but we just error out instead and require explicit casts.
+                //
+                // We use implementations of VaArgSafe as the source of truth. On some embedded
+                // targets, c_double is f32 and c_int/c_uing are i16/u16, and these types implement
+                // VaArgSafe there. On all other targets, these types do not implement VaArgSafe.
+                //
+                // cfg(bootstrap): change the if let to an unwrap.
                 let arg_ty = self.structurally_resolve_type(arg.span, arg_ty);
+                if let Some(trait_def_id) = tcx.lang_items().va_arg_safe()
+                    && self
+                        .type_implements_trait(trait_def_id, [arg_ty], self.param_env)
+                        .must_apply_modulo_regions()
+                {
+                    continue;
+                }
+
                 match arg_ty.kind() {
                     ty::Float(ty::FloatTy::F32) => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_double");
@@ -711,6 +718,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_expr_lit(
         &self,
         lit: &hir::Lit,
+        lint_id: HirId,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let tcx = self.tcx;
@@ -758,7 +766,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty::Float(_) => Some(ty),
                     _ => None,
                 });
-                opt_ty.unwrap_or_else(|| self.next_float_var())
+                opt_ty.unwrap_or_else(|| self.next_float_var(lit.span, Some(lint_id)))
             }
             ast::LitKind::Bool(_) => tcx.types.bool,
             ast::LitKind::CStr(_, _) => Ty::new_imm_ref(
@@ -952,14 +960,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // wrapping in parentheses. We find the statement or expression
                         // following the `match` (`&& true`) and see if it is something that
                         // can reasonably be interpreted as a binop following an expression.
-                        err.multipart_suggestion(
-                            "parentheses are required to parse this as an expression",
-                            vec![
-                                (expr.span.shrink_to_lo(), "(".to_string()),
-                                (expr.span.shrink_to_hi(), ")".to_string()),
-                            ],
-                            Applicability::MachineApplicable,
-                        );
+                        err.subdiagnostic(ExprParenthesesNeeded::surrounding(expr.span));
                     } else if expr.can_have_side_effects() {
                         self.suggest_semicolon_at_end(expr.span, err);
                     }
@@ -1260,38 +1261,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         path_span: Span,
         hir_id: HirId,
     ) -> (Res, LoweredTy<'tcx>) {
+        let ResolvedStructPath { res: result, ty } =
+            self.lowerer().lower_path_for_struct_expr(*qpath, path_span, hir_id);
         match *qpath {
-            QPath::Resolved(ref maybe_qself, path) => {
-                let self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself).raw);
-                let ty = self.lowerer().lower_resolved_ty_path(
-                    self_ty,
-                    path,
-                    hir_id,
-                    PermitVariants::Yes,
-                );
-                (path.res, LoweredTy::from_raw(self, path_span, ty))
-            }
-            QPath::TypeRelative(hir_self_ty, segment) => {
-                let self_ty = self.lower_ty(hir_self_ty);
-
-                let result = self.lowerer().lower_type_relative_ty_path(
-                    self_ty.raw,
-                    hir_self_ty,
-                    segment,
-                    hir_id,
-                    path_span,
-                    PermitVariants::Yes,
-                );
-                let ty = result
-                    .map(|(ty, _, _)| ty)
-                    .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar));
+            QPath::Resolved(_, path) => (path.res, LoweredTy::from_raw(self, path_span, ty)),
+            QPath::TypeRelative(_, _) => {
                 let ty = LoweredTy::from_raw(self, path_span, ty);
-                let result = result.map(|(_, kind, def_id)| (kind, def_id));
+                let resolution =
+                    result.map(|res: Res| (self.tcx().def_kind(res.def_id()), res.def_id()));
 
                 // Write back the new resolution.
-                self.write_resolution(hir_id, result);
+                self.write_resolution(hir_id, resolution);
 
-                (result.map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)), ty)
+                (result.unwrap_or(Res::Err), ty)
             }
         }
     }
@@ -1402,7 +1384,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // fn-like predicates with different args, but callable types really never
                         // do that, so it's OK.
                         for (predicate, span) in instantiated {
-                            if let ty::ClauseKind::Trait(pred) = predicate.kind().skip_binder()
+                            if let ty::ClauseKind::Trait(pred) =
+                                predicate.skip_norm_wip().kind().skip_binder()
                                 && pred.self_ty().peel_refs() == callee_ty
                                 && self.tcx.is_fn_trait(pred.def_id())
                             {
@@ -1412,7 +1395,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                 }
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: new_def_id, .. })
+                ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: new_def_id }, .. })
                 | ty::Closure(new_def_id, _)
                 | ty::FnDef(new_def_id, _) => {
                     def_id = new_def_id;
@@ -1805,14 +1788,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             (Some(_), Some(_)) | (None, None) => unreachable!(),
             (Some(body), None) => {
                 let params = self.tcx.hir_body(body).params;
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((fn_inputs.zip(params.iter().map(FnParam::Param)).collect(), generics))
             }
             (None, Some(params)) => {
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((
                     fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect(),
@@ -1894,14 +1877,14 @@ impl FnParam<'_> {
     }
 }
 
-struct FnCallDiagCtxt<'a, 'b, 'tcx> {
-    arg_matching_ctxt: ArgMatchingCtxt<'a, 'b, 'tcx>,
+struct FnCallDiagCtxt<'a, 'tcx> {
+    arg_matching_ctxt: ArgMatchingCtxt<'a, 'tcx>,
     errors: Vec<Error<'tcx>>,
     matched_inputs: IndexVec<ExpectedIdx, Option<ProvidedIdx>>,
 }
 
-impl<'a, 'b, 'tcx> Deref for FnCallDiagCtxt<'a, 'b, 'tcx> {
-    type Target = ArgMatchingCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for FnCallDiagCtxt<'a, 'tcx> {
+    type Target = ArgMatchingCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.arg_matching_ctxt
@@ -1914,9 +1897,9 @@ enum ArgumentsFormatting {
     Multiline { fallback_indent: String, brace_indent: String },
 }
 
-impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2339,6 +2322,17 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                         provided_span,
                         format!("unexpected argument{idx}{provided_ty_name}"),
                     ));
+                    if self.provided_arg_tys.len() == 1
+                        && let Some(span) = self.maybe_suggest_expect_for_unwrap(provided_ty)
+                    {
+                        err.span_suggestion_verbose(
+                            span,
+                            "did you mean to use `expect`?",
+                            "expect",
+                            Applicability::MaybeIncorrect,
+                        );
+                        continue;
+                    }
                     let mut span = provided_span;
                     if span.can_be_used_for_suggestions()
                         && self.call_metadata.error_span.can_be_used_for_suggestions()
@@ -2611,7 +2605,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
         (suggestions, labels, suggestion_text)
     }
 
-    fn label_generic_mismatches(&self, err: &mut Diag<'b>) {
+    fn label_generic_mismatches(&self, err: &mut Diag<'a>) {
         self.fn_ctxt.label_generic_mismatches(
             err,
             self.fn_def_id,
@@ -2769,24 +2763,40 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
 
         (suggestion_span, suggestion)
     }
+
+    fn maybe_suggest_expect_for_unwrap(&self, provided_ty: Ty<'tcx>) -> Option<Span> {
+        let tcx = self.tcx();
+        if let Some(call_ident) = self.call_metadata.call_ident
+            && call_ident.name == sym::unwrap
+            && let Some(callee_ty) = self.callee_ty
+            && let ty::Adt(adt, _) = callee_ty.peel_refs().kind()
+            && (tcx.is_diagnostic_item(sym::Option, adt.did())
+                || tcx.is_diagnostic_item(sym::Result, adt.did()))
+            && self.may_coerce(provided_ty, Ty::new_static_str(tcx))
+        {
+            Some(call_ident.span)
+        } else {
+            None
+        }
+    }
 }
 
-struct ArgMatchingCtxt<'a, 'b, 'tcx> {
-    args_ctxt: ArgsCtxt<'a, 'b, 'tcx>,
+struct ArgMatchingCtxt<'a, 'tcx> {
+    args_ctxt: ArgsCtxt<'a, 'tcx>,
     provided_arg_tys: IndexVec<ProvidedIdx, (Ty<'tcx>, Span)>,
 }
 
-impl<'a, 'b, 'tcx> Deref for ArgMatchingCtxt<'a, 'b, 'tcx> {
-    type Target = ArgsCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for ArgMatchingCtxt<'a, 'tcx> {
+    type Target = ArgsCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.args_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> ArgMatchingCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> ArgMatchingCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2917,23 +2927,23 @@ impl<'a, 'b, 'tcx> ArgMatchingCtxt<'a, 'b, 'tcx> {
     }
 }
 
-struct ArgsCtxt<'a, 'b, 'tcx> {
-    call_ctxt: CallCtxt<'a, 'b, 'tcx>,
+struct ArgsCtxt<'a, 'tcx> {
+    call_ctxt: CallCtxt<'a, 'tcx>,
     call_metadata: CallMetadata,
     args_span: Span,
 }
 
-impl<'a, 'b, 'tcx> Deref for ArgsCtxt<'a, 'b, 'tcx> {
-    type Target = CallCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for ArgsCtxt<'a, 'tcx> {
+    type Target = CallCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.call_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2944,7 +2954,7 @@ impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
         call_expr: &'tcx Expr<'tcx>,
         tuple_arguments: TupleArgumentsFlag,
     ) -> Self {
-        let call_ctxt: CallCtxt<'_, '_, '_> = CallCtxt::new(
+        let call_ctxt: CallCtxt<'_, '_> = CallCtxt::new(
             arg,
             compatibility_diagonal,
             formal_and_expected_inputs,
@@ -3026,7 +3036,8 @@ impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
                 .fn_ctxt
                 .tcx
                 .fn_sig(assoc.def_id)
-                .instantiate(self.call_ctxt.fn_ctxt.tcx, args);
+                .instantiate(self.call_ctxt.fn_ctxt.tcx, args)
+                .skip_norm_wip();
 
             self.call_ctxt.fn_ctxt.instantiate_binder_with_fresh_vars(
                 call_name.span,
@@ -3050,8 +3061,8 @@ struct CallMetadata {
     is_method: bool,
 }
 
-struct CallCtxt<'a, 'b, 'tcx> {
-    fn_ctxt: &'a FnCtxt<'b, 'tcx>,
+struct CallCtxt<'a, 'tcx> {
+    fn_ctxt: &'a FnCtxt<'a, 'tcx>,
     compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
     formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
     provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
@@ -3065,17 +3076,17 @@ struct CallCtxt<'a, 'b, 'tcx> {
     callee_ty: Option<Ty<'tcx>>,
 }
 
-impl<'a, 'b, 'tcx> Deref for CallCtxt<'a, 'b, 'tcx> {
-    type Target = &'a FnCtxt<'b, 'tcx>;
+impl<'a, 'tcx> Deref for CallCtxt<'a, 'tcx> {
+    type Target = &'a FnCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.fn_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> CallCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> CallCtxt<'a, 'tcx> {
     fn new(
-        fn_ctxt: &'a FnCtxt<'b, 'tcx>,
+        fn_ctxt: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
@@ -3085,7 +3096,7 @@ impl<'a, 'b, 'tcx> CallCtxt<'a, 'b, 'tcx> {
         call_span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
         tuple_arguments: TupleArgumentsFlag,
-    ) -> CallCtxt<'a, 'b, 'tcx> {
+    ) -> CallCtxt<'a, 'tcx> {
         let callee_expr = match &call_expr.peel_blocks().kind {
             hir::ExprKind::Call(callee, _) => Some(*callee),
             hir::ExprKind::MethodCall(_, receiver, ..) => {

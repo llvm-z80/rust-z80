@@ -229,103 +229,93 @@ fn connected_to_root<'tcx>(
     false
 }
 
-/// Looks for a query cycle using the last query in `jobs`.
-/// If a cycle is found, all queries in the cycle is removed from `jobs` and
-/// the function return true.
-/// If a cycle was not found, the starting query is removed from `jobs` and
-/// the function returns false.
-fn remove_cycle<'tcx>(
+/// Processes a found query cycle into a `Cycle`
+fn process_cycle<'tcx>(job_map: &QueryJobMap<'tcx>, stack: Vec<(Span, QueryJobId)>) -> Cycle<'tcx> {
+    // The stack is a vector of pairs of spans and queries; reverse it so that
+    // the earlier entries require later entries
+    let (mut spans, queries): (Vec<_>, Vec<_>) = stack.into_iter().rev().unzip();
+
+    // Shift the spans so that queries are matched with the span for their waitee
+    spans.rotate_right(1);
+
+    // Zip them back together
+    let mut stack: Vec<_> = iter::zip(spans, queries).collect();
+
+    struct EntryPoint {
+        query_in_cycle: QueryJobId,
+        query_waiting_on_cycle: Option<(Span, QueryJobId)>,
+    }
+
+    // Find the queries in the cycle which are
+    // connected to queries outside the cycle
+    let entry_points = stack
+        .iter()
+        .filter_map(|&(_, query_in_cycle)| {
+            let mut entrypoint = false;
+            let mut query_waiting_on_cycle = None;
+
+            // Find a direct waiter who leads to the root
+            for abstracted_waiter in abstracted_waiters_of(job_map, query_in_cycle) {
+                let Some(parent) = abstracted_waiter.parent else {
+                    // The query in the cycle is directly connected to root.
+                    entrypoint = true;
+                    continue;
+                };
+
+                // Mark all the other queries in the cycle as already visited,
+                // so paths to the root through the cycle itself won't count.
+                let mut visited = FxHashSet::from_iter(stack.iter().map(|q| q.1));
+
+                if connected_to_root(job_map, parent, &mut visited) {
+                    query_waiting_on_cycle = Some((abstracted_waiter.span, parent));
+                    entrypoint = true;
+                    break;
+                }
+            }
+
+            entrypoint.then_some(EntryPoint { query_in_cycle, query_waiting_on_cycle })
+        })
+        .collect::<Vec<EntryPoint>>();
+
+    // Pick an entry point, preferring ones with waiters
+    let entry_point = entry_points
+        .iter()
+        .find(|entry_point| entry_point.query_waiting_on_cycle.is_some())
+        .unwrap_or(&entry_points[0]);
+
+    // Shift the stack so that our entry point is first
+    let entry_point_pos = stack.iter().position(|(_, query)| *query == entry_point.query_in_cycle);
+    if let Some(pos) = entry_point_pos {
+        stack.rotate_left(pos);
+    }
+
+    let usage = entry_point
+        .query_waiting_on_cycle
+        .map(|(span, job)| QueryStackFrame { span, tagged_key: job_map.tagged_key_of(job) });
+
+    // Create the cycle error
+    Cycle {
+        usage,
+        frames: stack
+            .iter()
+            .map(|&(span, job)| QueryStackFrame { span, tagged_key: job_map.tagged_key_of(job) })
+            .collect(),
+    }
+}
+
+/// Looks for a query cycle starting at `query`.
+/// Returns a waiter to resume if a cycle is found.
+fn find_and_process_cycle<'tcx>(
     job_map: &QueryJobMap<'tcx>,
-    jobs: &mut Vec<QueryJobId>,
-    wakelist: &mut Vec<Arc<QueryWaiter<'tcx>>>,
-) -> bool {
+    query: QueryJobId,
+) -> Option<Arc<QueryWaiter<'tcx>>> {
     let mut visited = FxHashSet::default();
     let mut stack = Vec::new();
-    // Look for a cycle starting with the last query in `jobs`
     if let ControlFlow::Break(resumable) =
-        find_cycle(job_map, jobs.pop().unwrap(), DUMMY_SP, &mut stack, &mut visited)
+        find_cycle(job_map, query, DUMMY_SP, &mut stack, &mut visited)
     {
-        // The stack is a vector of pairs of spans and queries; reverse it so that
-        // the earlier entries require later entries
-        let (mut spans, queries): (Vec<_>, Vec<_>) = stack.into_iter().rev().unzip();
-
-        // Shift the spans so that queries are matched with the span for their waitee
-        spans.rotate_right(1);
-
-        // Zip them back together
-        let mut stack: Vec<_> = iter::zip(spans, queries).collect();
-
-        // Remove the queries in our cycle from the list of jobs to look at
-        for r in &stack {
-            if let Some(pos) = jobs.iter().position(|j| j == &r.1) {
-                jobs.remove(pos);
-            }
-        }
-
-        struct EntryPoint {
-            query_in_cycle: QueryJobId,
-            query_waiting_on_cycle: Option<(Span, QueryJobId)>,
-        }
-
-        // Find the queries in the cycle which are
-        // connected to queries outside the cycle
-        let entry_points = stack
-            .iter()
-            .filter_map(|&(_, query_in_cycle)| {
-                let mut entrypoint = false;
-                let mut query_waiting_on_cycle = None;
-
-                // Find a direct waiter who leads to the root
-                for abstracted_waiter in abstracted_waiters_of(job_map, query_in_cycle) {
-                    let Some(parent) = abstracted_waiter.parent else {
-                        // The query in the cycle is directly connected to root.
-                        entrypoint = true;
-                        continue;
-                    };
-
-                    // Mark all the other queries in the cycle as already visited,
-                    // so paths to the root through the cycle itself won't count.
-                    let mut visited = FxHashSet::from_iter(stack.iter().map(|q| q.1));
-
-                    if connected_to_root(job_map, parent, &mut visited) {
-                        query_waiting_on_cycle = Some((abstracted_waiter.span, parent));
-                        entrypoint = true;
-                        break;
-                    }
-                }
-
-                entrypoint.then_some(EntryPoint { query_in_cycle, query_waiting_on_cycle })
-            })
-            .collect::<Vec<EntryPoint>>();
-
-        // Pick an entry point, preferring ones with waiters
-        let entry_point = entry_points
-            .iter()
-            .find(|entry_point| entry_point.query_waiting_on_cycle.is_some())
-            .unwrap_or(&entry_points[0]);
-
-        // Shift the stack so that our entry point is first
-        let entry_point_pos =
-            stack.iter().position(|(_, query)| *query == entry_point.query_in_cycle);
-        if let Some(pos) = entry_point_pos {
-            stack.rotate_left(pos);
-        }
-
-        let usage = entry_point
-            .query_waiting_on_cycle
-            .map(|(span, job)| QueryStackFrame { span, tagged_key: job_map.tagged_key_of(job) });
-
         // Create the cycle error
-        let error = Cycle {
-            usage,
-            frames: stack
-                .iter()
-                .map(|&(span, job)| QueryStackFrame {
-                    span,
-                    tagged_key: job_map.tagged_key_of(job),
-                })
-                .collect(),
-        };
+        let error = process_cycle(job_map, stack);
 
         // We unwrap `resumable` here since there must always be one
         // edge which is resumable / waited using a query latch
@@ -338,62 +328,31 @@ fn remove_cycle<'tcx>(
         *waiter.cycle.lock() = Some(error);
 
         // Put the waiter on the list of things to resume
-        wakelist.push(waiter);
-
-        true
+        Some(waiter)
     } else {
-        false
+        None
     }
 }
 
 /// Detects query cycles by using depth first search over all active query jobs.
 /// If a query cycle is found it will break the cycle by finding an edge which
 /// uses a query latch and then resuming that waiter.
-/// There may be multiple cycles involved in a deadlock, so this searches
-/// all active queries for cycles before finally resuming all the waiters at once.
-pub fn break_query_cycles<'tcx>(
-    job_map: QueryJobMap<'tcx>,
-    registry: &rustc_thread_pool::Registry,
-) {
-    let mut wakelist = Vec::new();
-    // It is OK per the comments:
-    // - https://github.com/rust-lang/rust/pull/131200#issuecomment-2798854932
-    // - https://github.com/rust-lang/rust/pull/131200#issuecomment-2798866392
-    #[allow(rustc::potential_query_instability)]
-    let mut jobs: Vec<QueryJobId> = job_map.map.keys().copied().collect();
+///
+/// There may be multiple cycles involved in a deadlock, but this only breaks one at a time so
+/// there will be multiple rounds through the deadlock handler if multiple cycles are present.
+#[allow(rustc::potential_query_instability)]
+pub fn break_query_cycle<'tcx>(job_map: QueryJobMap<'tcx>, registry: &rustc_thread_pool::Registry) {
+    // Look for a cycle starting at each query job
+    let waiter = job_map
+        .map
+        .keys()
+        .find_map(|query| find_and_process_cycle(&job_map, *query))
+        .expect("unable to find a query cycle");
 
-    let mut found_cycle = false;
+    // Mark the thread we're about to wake up as unblocked.
+    rustc_thread_pool::mark_unblocked(registry);
 
-    while jobs.len() > 0 {
-        if remove_cycle(&job_map, &mut jobs, &mut wakelist) {
-            found_cycle = true;
-        }
-    }
-
-    // Check that a cycle was found. It is possible for a deadlock to occur without
-    // a query cycle if a query which can be waited on uses Rayon to do multithreading
-    // internally. Such a query (X) may be executing on 2 threads (A and B) and A may
-    // wait using Rayon on B. Rayon may then switch to executing another query (Y)
-    // which in turn will wait on X causing a deadlock. We have a false dependency from
-    // X to Y due to Rayon waiting and a true dependency from Y to X. The algorithm here
-    // only considers the true dependency and won't detect a cycle.
-    if !found_cycle {
-        panic!(
-            "deadlock detected as we're unable to find a query cycle to break\n\
-            current query map:\n{job_map:#?}",
-        );
-    }
-
-    // Mark all the thread we're about to wake up as unblocked. This needs to be done before
-    // we wake the threads up as otherwise Rayon could detect a deadlock if a thread we
-    // resumed fell asleep and this thread had yet to mark the remaining threads as unblocked.
-    for _ in 0..wakelist.len() {
-        rustc_thread_pool::mark_unblocked(registry);
-    }
-
-    for waiter in wakelist.into_iter() {
-        waiter.condvar.notify_one();
-    }
+    assert!(waiter.condvar.notify_one(), "unable to wake the waiter");
 }
 
 pub fn print_query_stack<'tcx>(
@@ -454,15 +413,16 @@ pub fn print_query_stack<'tcx>(
 pub(crate) fn create_cycle_error<'tcx>(
     tcx: TyCtxt<'tcx>,
     Cycle { usage, frames }: &Cycle<'tcx>,
+    nested: bool,
 ) -> Diag<'tcx> {
     assert!(!frames.is_empty());
 
-    let span = frames[0].tagged_key.default_span(tcx, frames[1 % frames.len()].span);
+    let span = frames[0].tagged_key.catch_default_span(tcx, frames[1 % frames.len()].span);
 
     let mut cycle_stack = Vec::new();
 
     use crate::error::StackCount;
-    let stack_bottom = frames[0].tagged_key.description(tcx);
+    let stack_bottom = frames[0].tagged_key.catch_description(tcx);
     let stack_count = if frames.len() == 1 {
         StackCount::Single { stack_bottom: stack_bottom.clone() }
     } else {
@@ -471,37 +431,60 @@ pub(crate) fn create_cycle_error<'tcx>(
 
     for i in 1..frames.len() {
         let frame = &frames[i];
-        let span = frame.tagged_key.default_span(tcx, frames[(i + 1) % frames.len()].span);
+        let span = frame.tagged_key.catch_default_span(tcx, frames[(i + 1) % frames.len()].span);
         cycle_stack
-            .push(crate::error::CycleStack { span, desc: frame.tagged_key.description(tcx) });
+            .push(crate::error::CycleStack { span, desc: frame.tagged_key.catch_description(tcx) });
     }
 
     let cycle_usage = usage.as_ref().map(|usage| crate::error::CycleUsage {
-        span: usage.tagged_key.default_span(tcx, usage.span),
-        usage: usage.tagged_key.description(tcx),
+        span: usage.tagged_key.catch_default_span(tcx, usage.span),
+        usage: usage.tagged_key.catch_description(tcx),
     });
 
-    let alias = if frames
-        .iter()
-        .all(|frame| frame.tagged_key.def_kind(tcx) == Some(DefKind::TyAlias))
-    {
-        Some(crate::error::Alias::Ty)
-    } else if frames.iter().all(|frame| frame.tagged_key.def_kind(tcx) == Some(DefKind::TraitAlias))
-    {
-        Some(crate::error::Alias::Trait)
+    let is_all_def_kind = |def_kind| {
+        // Trivial type alias and trait alias cycles consists of `type_of` and
+        // `explicit_implied_predicates_of` queries, so we just check just these here.
+        frames.iter().all(|frame| match frame.tagged_key {
+            TaggedQueryKey::type_of(def_id)
+            | TaggedQueryKey::explicit_implied_predicates_of(def_id)
+                if tcx.def_kind(def_id) == def_kind =>
+            {
+                true
+            }
+            _ => false,
+        })
+    };
+
+    let alias = if !nested {
+        if is_all_def_kind(DefKind::TyAlias) {
+            Some(crate::error::Alias::Ty)
+        } else if is_all_def_kind(DefKind::TraitAlias) {
+            Some(crate::error::Alias::Trait)
+        } else {
+            None
+        }
     } else {
         None
     };
 
-    let cycle_diag = crate::error::Cycle {
-        span,
-        cycle_stack,
-        stack_bottom,
-        alias,
-        cycle_usage,
-        stack_count,
-        note_span: (),
-    };
-
-    tcx.sess.dcx().create_err(cycle_diag)
+    if nested {
+        tcx.sess.dcx().create_err(crate::error::NestedCycle {
+            span,
+            cycle_stack,
+            stack_bottom: crate::error::NestedCycleBottom { stack_bottom },
+            cycle_usage,
+            stack_count,
+            note_span: (),
+        })
+    } else {
+        tcx.sess.dcx().create_err(crate::error::Cycle {
+            span,
+            cycle_stack,
+            stack_bottom,
+            alias,
+            cycle_usage,
+            stack_count,
+            note_span: (),
+        })
+    }
 }

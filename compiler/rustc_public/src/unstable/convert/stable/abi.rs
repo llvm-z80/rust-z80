@@ -10,8 +10,9 @@ use rustc_target::callconv;
 
 use crate::abi::{
     AddressSpace, ArgAbi, CallConvention, FieldsShape, FloatLength, FnAbi, IntegerLength,
-    IntegerType, Layout, LayoutShape, PassMode, Primitive, ReprFlags, ReprOptions, Scalar,
-    TagEncoding, TyAndLayout, ValueAbi, VariantFields, VariantsShape, WrappingRange,
+    IntegerType, Layout, LayoutShape, NumScalableVectors, PassMode, Primitive, ReprFlags,
+    ReprOptions, Scalar, TagEncoding, TyAndLayout, ValueAbi, VariantFields, VariantsShape,
+    WrappingRange,
 };
 use crate::compiler_interface::BridgeTys;
 use crate::target::MachineSize as Size;
@@ -57,7 +58,7 @@ impl<'tcx> Stable<'tcx> for rustc_abi::Layout<'tcx> {
         tables: &mut Tables<'cx, BridgeTys>,
         cx: &CompilerCtxt<'cx, BridgeTys>,
     ) -> Self::T {
-        tables.layout_id(cx.lift(*self).unwrap())
+        tables.layout_id(cx.lift(*self))
     }
 }
 
@@ -125,6 +126,7 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
             CanonAbi::RustCold => CallConvention::Cold,
             CanonAbi::RustPreserveNone => CallConvention::PreserveNone,
             CanonAbi::Custom => CallConvention::Custom,
+            CanonAbi::Swift => CallConvention::Swift,
             CanonAbi::Arm(arm_call) => match arm_call {
                 ArmCall::Aapcs => CallConvention::ArmAapcs,
                 ArmCall::CCmseNonSecureCall => CallConvention::CCmseNonSecureCall,
@@ -219,11 +221,8 @@ impl<'tcx> Stable<'tcx> for rustc_abi::Variants<rustc_abi::FieldIdx, rustc_abi::
                     tag_field: tag_field.stable(tables, cx),
                     variants: variants
                         .iter()
-                        .map(|v| match &v.fields {
-                            rustc_abi::FieldsShape::Arbitrary { offsets, .. } => VariantFields {
-                                offsets: offsets.iter().as_slice().stable(tables, cx),
-                            },
-                            _ => panic!("variant layout should be Arbitrary"),
+                        .map(|v| VariantFields {
+                            offsets: v.field_offsets.iter().as_slice().stable(tables, cx),
                         })
                         .collect(),
                 }
@@ -253,6 +252,18 @@ impl<'tcx> Stable<'tcx> for rustc_abi::TagEncoding<rustc_abi::VariantIdx> {
     }
 }
 
+impl<'tcx> Stable<'tcx> for rustc_abi::NumScalableVectors {
+    type T = NumScalableVectors;
+
+    fn stable<'cx>(
+        &self,
+        _tables: &mut Tables<'cx, BridgeTys>,
+        _cx: &CompilerCtxt<'cx, BridgeTys>,
+    ) -> Self::T {
+        NumScalableVectors(self.0)
+    }
+}
+
 impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
     type T = ValueAbi;
 
@@ -269,8 +280,12 @@ impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
             rustc_abi::BackendRepr::SimdVector { element, count } => {
                 ValueAbi::Vector { element: element.stable(tables, cx), count }
             }
-            rustc_abi::BackendRepr::SimdScalableVector { element, count } => {
-                ValueAbi::ScalableVector { element: element.stable(tables, cx), count }
+            rustc_abi::BackendRepr::SimdScalableVector { element, count, number_of_vectors } => {
+                ValueAbi::ScalableVector {
+                    element: element.stable(tables, cx),
+                    count,
+                    number_of_vectors: number_of_vectors.stable(tables, cx),
+                }
             }
             rustc_abi::BackendRepr::Memory { sized } => ValueAbi::Aggregate { sized },
         }

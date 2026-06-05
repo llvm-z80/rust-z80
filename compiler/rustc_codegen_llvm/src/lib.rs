@@ -25,10 +25,10 @@ use back::write::{create_informational_target_machine, create_target_machine};
 use context::SimpleCx;
 use llvm_util::target_config;
 use rustc_ast::expand::allocator::AllocatorMethod;
-use rustc_codegen_ssa::back::lto::{SerializedModule, ThinModule};
+use rustc_codegen_ssa::back::lto::ThinModule;
 use rustc_codegen_ssa::back::write::{
     CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryConfig,
-    TargetMachineFactoryFn,
+    TargetMachineFactoryFn, ThinLtoInput,
 };
 use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
@@ -93,6 +93,8 @@ impl Drop for TimeTraceProfiler {
 }
 
 impl ExtraBackendMethods for LlvmCodegenBackend {
+    type Module = ModuleLlvm;
+
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -121,6 +123,7 @@ impl WriteBackendMethods for LlvmCodegenBackend {
     type ModuleBuffer = back::lto::ModuleBuffer;
     type TargetMachine = OwnedTargetMachine;
     type ThinData = back::lto::ThinData;
+
     fn thread_profiler() -> Box<dyn Any> {
         Box::new(TimeTraceProfiler::new())
     }
@@ -133,8 +136,8 @@ impl WriteBackendMethods for LlvmCodegenBackend {
         back::write::target_machine_factory(sess, optlvl, target_features)
     }
     fn optimize_and_codegen_fat_lto(
+        sess: &Session,
         cgcx: &CodegenContext,
-        prof: &SelfProfilerRef,
         shared_emitter: &SharedEmitter,
         tm_factory: TargetMachineFactoryFn<LlvmCodegenBackend>,
         exported_symbols_for_lto: &[String],
@@ -143,7 +146,7 @@ impl WriteBackendMethods for LlvmCodegenBackend {
     ) -> CompiledModule {
         let mut module = back::lto::run_fat(
             cgcx,
-            prof,
+            &sess.prof,
             shared_emitter,
             tm_factory,
             exported_symbols_for_lto,
@@ -153,9 +156,9 @@ impl WriteBackendMethods for LlvmCodegenBackend {
 
         let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
         let dcx = dcx.handle();
-        back::lto::run_pass_manager(cgcx, prof, dcx, &mut module, false);
+        back::lto::run_pass_manager(cgcx, &sess.prof, dcx, &mut module, false);
 
-        back::write::codegen(cgcx, prof, shared_emitter, module, &cgcx.module_config)
+        back::write::codegen(cgcx, &sess.prof, shared_emitter, module, &cgcx.module_config)
     }
     fn run_thin_lto(
         cgcx: &CodegenContext,
@@ -163,8 +166,7 @@ impl WriteBackendMethods for LlvmCodegenBackend {
         dcx: DiagCtxtHandle<'_>,
         exported_symbols_for_lto: &[String],
         each_linked_rlib_for_lto: &[PathBuf],
-        modules: Vec<(String, Self::ModuleBuffer)>,
-        cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
+        modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
         back::lto::run_thin(
             cgcx,
@@ -173,7 +175,6 @@ impl WriteBackendMethods for LlvmCodegenBackend {
             exported_symbols_for_lto,
             each_linked_rlib_for_lto,
             modules,
-            cached_modules,
         )
     }
     fn optimize(
@@ -316,6 +317,10 @@ impl CodegenBackend for LlvmCodegenBackend {
         llvm::LLVMRustLLVMHasZstdCompression()
     }
 
+    fn has_mnemonic(&self, sess: &Session, mnemonic: &str) -> bool {
+        llvm_util::target_has_mnemonic(sess, mnemonic)
+    }
+
     fn target_config(&self, sess: &Session) -> TargetConfig {
         target_config(sess)
     }
@@ -331,12 +336,20 @@ impl CodegenBackend for LlvmCodegenBackend {
         will_not_use_fallback
     }
 
+    fn fallback_intrinsics(&self) -> Vec<Symbol> {
+        // `type_id_eq` is a safe choice since *all* backends use the fallback body for that.
+        // When adding more intrinsics, keep in mind that the distributed standard library
+        // is compiled with the LLVM backend but might later be included in a project built
+        // with cranelift or GCC.
+        vec![sym::type_id_eq]
+    }
+
     fn target_cpu(&self, sess: &Session) -> String {
         crate::llvm_util::target_cpu(sess).to_string()
     }
 
-    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>, crate_info: &CrateInfo) -> Box<dyn Any> {
-        Box::new(rustc_codegen_ssa::base::codegen_crate(LlvmCodegenBackend(()), tcx, crate_info))
+    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
+        Box::new(rustc_codegen_ssa::base::codegen_crate(LlvmCodegenBackend(()), tcx))
     }
 
     fn join_codegen(
@@ -344,11 +357,12 @@ impl CodegenBackend for LlvmCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
     ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
         let (compiled_modules, work_products) = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<LlvmCodegenBackend>>()
             .expect("Expected LlvmCodegenBackend's OngoingCodegen, found Box<Any>")
-            .join(sess);
+            .join(sess, crate_info);
 
         if sess.opts.unstable_opts.llvm_time_trace {
             sess.time("llvm_dump_timing_file", || {
@@ -368,6 +382,10 @@ impl CodegenBackend for LlvmCodegenBackend {
     fn print_statistics(&self) {
         let stats = llvm::build_string(|s| unsafe { llvm::LLVMRustPrintStatistics(s) }).unwrap();
         print!("{stats}");
+    }
+
+    fn print_statistics_json(&self) -> String {
+        llvm::build_string(|s| unsafe { llvm::LLVMRustPrintStatisticsJSON(s) }).unwrap()
     }
 
     fn link(

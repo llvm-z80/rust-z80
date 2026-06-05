@@ -14,12 +14,12 @@ use rustc_codegen_ssa::back::write::produce_final_output_artifacts;
 use rustc_codegen_ssa::base::determine_cgu_reuse;
 use rustc_codegen_ssa::{CompiledModule, CompiledModules, ModuleKind};
 use rustc_data_structures::profiling::SelfProfilerRef;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::sync::{IntoDynSyncSend, par_map};
 use rustc_hir::attrs::Linkage as RLinkage;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir::mono::{CodegenUnit, MonoItem, MonoItemData, Visibility};
+use rustc_middle::mono::{CodegenUnit, MonoItem, MonoItemData, Visibility};
 use rustc_session::Session;
 use rustc_session::config::{OutputFilenames, OutputType};
 
@@ -35,8 +35,7 @@ fn disable_incr_cache() -> bool {
 }
 
 struct ModuleCodegenResult {
-    module_regular: CompiledModule,
-    module_global_asm: Option<CompiledModule>,
+    module: CompiledModule,
     existing_work_product: Option<(WorkProductId, WorkProduct)>,
 }
 
@@ -45,8 +44,8 @@ enum OngoingModuleCodegen {
     Async(JoinHandle<Result<ModuleCodegenResult, String>>),
 }
 
-impl<HCX> HashStable<HCX> for OngoingModuleCodegen {
-    fn hash_stable(&self, _: &mut HCX, _: &mut StableHasher) {
+impl StableHash for OngoingModuleCodegen {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, _: &mut StableHasher) {
         // do nothing
     }
 }
@@ -80,29 +79,25 @@ impl OngoingCodegen {
                 Ok(module_codegen_result) => module_codegen_result,
                 Err(err) => sess.dcx().fatal(err),
             };
-            let ModuleCodegenResult { module_regular, module_global_asm, existing_work_product } =
-                module_codegen_result;
+            let ModuleCodegenResult { module, existing_work_product } = module_codegen_result;
 
             if let Some((work_product_id, work_product)) = existing_work_product {
                 work_products.insert(work_product_id, work_product);
             } else {
                 let work_product = if disable_incr_cache {
                     None
-                } else if let Some(module_global_asm) = &module_global_asm {
+                } else if let Some(global_asm_object) = &module.global_asm_object {
                     rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
                         sess,
-                        &module_regular.name,
-                        &[
-                            ("o", module_regular.object.as_ref().unwrap()),
-                            ("asm.o", module_global_asm.object.as_ref().unwrap()),
-                        ],
+                        &module.name,
+                        &[("o", module.object.as_ref().unwrap()), ("asm.o", global_asm_object)],
                         &[],
                     )
                 } else {
                     rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
                         sess,
-                        &module_regular.name,
-                        &[("o", module_regular.object.as_ref().unwrap())],
+                        &module.name,
+                        &[("o", module.object.as_ref().unwrap())],
                         &[],
                     )
                 };
@@ -111,10 +106,7 @@ impl OngoingCodegen {
                 }
             }
 
-            modules.push(module_regular);
-            if let Some(module_global_asm) = module_global_asm {
-                modules.push(module_global_asm);
-            }
+            modules.push(module);
         }
 
         self.concurrency_limiter.finished();
@@ -150,7 +142,6 @@ fn make_module(sess: &Session, name: String) -> UnwindModule<ObjectModule> {
 
 fn emit_cgu(
     output_filenames: &OutputFilenames,
-    invocation_temp: Option<&str>,
     prof: &SelfProfilerRef,
     name: String,
     module: UnwindModule<ObjectModule>,
@@ -164,39 +155,26 @@ fn emit_cgu(
         debug.emit(&mut product);
     }
 
-    let module_regular = emit_module(
+    let module = emit_module(
         output_filenames,
-        invocation_temp,
         prof,
         product.object,
         ModuleKind::Regular,
         name.clone(),
+        global_asm_object_file,
         producer,
     )?;
 
-    Ok(ModuleCodegenResult {
-        module_regular,
-        module_global_asm: global_asm_object_file.map(|global_asm_object_file| CompiledModule {
-            name: format!("{name}.asm"),
-            kind: ModuleKind::Regular,
-            object: Some(global_asm_object_file),
-            dwarf_object: None,
-            bytecode: None,
-            assembly: None,
-            llvm_ir: None,
-            links_from_incr_cache: Vec::new(),
-        }),
-        existing_work_product: None,
-    })
+    Ok(ModuleCodegenResult { module, existing_work_product: None })
 }
 
 fn emit_module(
     output_filenames: &OutputFilenames,
-    invocation_temp: Option<&str>,
     prof: &SelfProfilerRef,
     mut object: cranelift_object::object::write::Object<'_>,
     kind: ModuleKind,
     name: String,
+    global_asm_object: Option<PathBuf>,
     producer_str: &str,
 ) -> Result<CompiledModule, String> {
     if object.format() == cranelift_object::object::BinaryFormat::Elf {
@@ -211,7 +189,7 @@ fn emit_module(
         object.set_section_data(comment_section, producer, 1);
     }
 
-    let tmp_file = output_filenames.temp_path_for_cgu(OutputType::Object, &name, invocation_temp);
+    let tmp_file = output_filenames.temp_path_for_cgu(OutputType::Object, &name);
     let file = match File::create(&tmp_file) {
         Ok(file) => file,
         Err(err) => return Err(format!("error creating object file: {}", err)),
@@ -238,6 +216,7 @@ fn emit_module(
         name,
         kind,
         object: Some(tmp_file),
+        global_asm_object,
         dwarf_object: None,
         bytecode: None,
         assembly: None,
@@ -251,11 +230,8 @@ fn reuse_workproduct_for_cgu(
     cgu: &CodegenUnit<'_>,
 ) -> Result<ModuleCodegenResult, String> {
     let work_product = cgu.previous_work_product(tcx);
-    let obj_out_regular = tcx.output_filenames(()).temp_path_for_cgu(
-        OutputType::Object,
-        cgu.name().as_str(),
-        tcx.sess.invocation_temp.as_deref(),
-    );
+    let obj_out_regular =
+        tcx.output_filenames(()).temp_path_for_cgu(OutputType::Object, cgu.name().as_str());
     let source_file_regular = rustc_incremental::in_incr_comp_dir_sess(
         tcx.sess,
         work_product.saved_files.get("o").expect("no saved object file in work product"),
@@ -271,7 +247,7 @@ fn reuse_workproduct_for_cgu(
     }
 
     let obj_out_global_asm =
-        crate::global_asm::add_file_stem_postfix(obj_out_regular.clone(), ".asm");
+        tcx.output_filenames(()).temp_path_ext_for_cgu("asm.o", cgu.name().as_str());
     let source_file_global_asm = if let Some(asm_o) = work_product.saved_files.get("asm.o") {
         let source_file_global_asm = rustc_incremental::in_incr_comp_dir_sess(tcx.sess, asm_o);
         if let Err(err) = rustc_fs_util::link_or_copy(&source_file_global_asm, &obj_out_global_asm)
@@ -289,26 +265,21 @@ fn reuse_workproduct_for_cgu(
     };
 
     Ok(ModuleCodegenResult {
-        module_regular: CompiledModule {
+        module: CompiledModule {
             name: cgu.name().to_string(),
             kind: ModuleKind::Regular,
             object: Some(obj_out_regular),
+            global_asm_object: source_file_global_asm.as_ref().map(|_| obj_out_global_asm),
             dwarf_object: None,
             bytecode: None,
             assembly: None,
             llvm_ir: None,
-            links_from_incr_cache: vec![source_file_regular],
+            links_from_incr_cache: if let Some(source_file_global_asm) = source_file_global_asm {
+                vec![source_file_regular, source_file_global_asm]
+            } else {
+                vec![source_file_regular]
+            },
         },
-        module_global_asm: source_file_global_asm.map(|source_file| CompiledModule {
-            name: cgu.name().to_string(),
-            kind: ModuleKind::Regular,
-            object: Some(obj_out_global_asm),
-            dwarf_object: None,
-            bytecode: None,
-            assembly: None,
-            llvm_ir: None,
-            links_from_incr_cache: vec![source_file],
-        }),
         existing_work_product: Some((cgu.work_product_id(), work_product)),
     })
 }
@@ -380,11 +351,9 @@ fn codegen_cgu_content(
 
 fn module_codegen(
     tcx: TyCtxt<'_>,
-    (global_asm_config, cgu_name, token): (
-        Arc<GlobalAsmConfig>,
-        rustc_span::Symbol,
-        ConcurrencyLimiterToken,
-    ),
+    global_asm_config: Arc<GlobalAsmConfig>,
+    cgu_name: rustc_span::Symbol,
+    token: ConcurrencyLimiterToken,
 ) -> OngoingModuleCodegen {
     let mut module = make_module(tcx.sess, cgu_name.as_str().to_string());
 
@@ -396,7 +365,6 @@ fn module_codegen(
     let producer = crate::debuginfo::producer(tcx.sess);
 
     let profiler = tcx.prof.clone();
-    let invocation_temp = tcx.sess.invocation_temp.clone();
     let output_filenames = tcx.output_filenames(()).clone();
     let should_write_ir = crate::pretty_clif::should_write_ir(tcx.sess);
 
@@ -423,19 +391,13 @@ fn module_codegen(
 
         let global_asm_object_file =
             profiler.generic_activity_with_arg("compile assembly", &*cgu_name).run(|| {
-                crate::global_asm::compile_global_asm(
-                    &global_asm_config,
-                    &cgu_name,
-                    global_asm,
-                    invocation_temp.as_deref(),
-                )
+                crate::global_asm::compile_global_asm(&global_asm_config, &cgu_name, global_asm)
             })?;
 
         let codegen_result =
             profiler.generic_activity_with_arg("write object file", &*cgu_name).run(|| {
                 emit_cgu(
                     &global_asm_config.output_filenames,
-                    invocation_temp.as_deref(),
                     &profiler,
                     cgu_name,
                     module,
@@ -458,11 +420,11 @@ fn emit_allocator_module(tcx: TyCtxt<'_>) -> Option<CompiledModule> {
 
         match emit_module(
             tcx.output_filenames(()),
-            tcx.sess.invocation_temp.as_deref(),
             &tcx.sess.prof,
             product.object,
             ModuleKind::Allocator,
             "allocator_shim".to_owned(),
+            None,
             &crate::debuginfo::producer(tcx.sess),
         ) {
             Ok(allocator_module) => Some(allocator_module),
@@ -513,8 +475,14 @@ pub(crate) fn run_aot(tcx: TyCtxt<'_>) -> Box<OngoingCodegen> {
                 let (module, _) = tcx.dep_graph.with_task(
                     dep_node,
                     tcx,
-                    (global_asm_config.clone(), cgu.name(), concurrency_limiter.acquire(tcx.dcx())),
-                    module_codegen,
+                    || {
+                        module_codegen(
+                            tcx,
+                            global_asm_config.clone(),
+                            cgu.name(),
+                            concurrency_limiter.acquire(tcx.dcx()),
+                        )
+                    },
                     Some(rustc_middle::dep_graph::hash_result),
                 );
                 IntoDynSyncSend(module)

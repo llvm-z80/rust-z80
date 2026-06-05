@@ -98,7 +98,7 @@ impl<'tcx> CValue<'tcx> {
 
     /// Create an instance of a ZST
     ///
-    /// The is represented by a dangling pointer of suitable alignment.
+    /// The ZST is represented by a dangling pointer of suitable alignment.
     pub(crate) fn zst(layout: TyAndLayout<'tcx>) -> CValue<'tcx> {
         assert!(layout.is_zst());
         CValue::by_ref(crate::Pointer::dangling(layout.align.abi), layout)
@@ -204,7 +204,9 @@ impl<'tcx> CValue<'tcx> {
                 let (field_ptr, field_layout) = codegen_field(fx, ptr, None, layout, field);
                 CValue::by_ref(field_ptr, field_layout)
             }
-            CValueInner::ByRef(_, Some(_)) => todo!(),
+            CValueInner::ByRef(_, Some(_)) => {
+                bug!("value_field for unsized by-ref value not supported")
+            }
         }
     }
 
@@ -655,7 +657,13 @@ impl<'tcx> CPlace<'tcx> {
                             flags,
                         );
                     }
-                    CValueInner::ByRef(_, Some(_)) => todo!(),
+                    CValueInner::ByRef(_from_ptr, Some(_extra)) => {
+                        bug!(
+                            "write_cvalue for unsized by-ref value not allowed: dst={:?} src={:?}",
+                            dst_layout.ty,
+                            from.layout().ty
+                        );
+                    }
                 }
             }
         }
@@ -870,20 +878,10 @@ pub(crate) fn assert_assignable<'tcx>(
             let from_sig = fx
                 .tcx
                 .normalize_erasing_late_bound_regions(fx.typing_env(), from_ty.fn_sig(fx.tcx));
-            let FnSig {
-                inputs_and_output: types_from,
-                c_variadic: c_variadic_from,
-                safety: unsafety_from,
-                abi: abi_from,
-            } = from_sig;
+            let FnSig { inputs_and_output: types_from, fn_sig_kind: fn_sig_kind_from } = from_sig;
             let to_sig =
                 fx.tcx.normalize_erasing_late_bound_regions(fx.typing_env(), to_ty.fn_sig(fx.tcx));
-            let FnSig {
-                inputs_and_output: types_to,
-                c_variadic: c_variadic_to,
-                safety: unsafety_to,
-                abi: abi_to,
-            } = to_sig;
+            let FnSig { inputs_and_output: types_to, fn_sig_kind: fn_sig_kind_to } = to_sig;
             let mut types_from = types_from.iter();
             let mut types_to = types_to.iter();
             loop {
@@ -894,17 +892,7 @@ pub(crate) fn assert_assignable<'tcx>(
                 }
             }
             assert_eq!(
-                c_variadic_from, c_variadic_to,
-                "Can't write fn ptr with incompatible sig {:?} to place with sig {:?}\n\n{:#?}",
-                from_sig, to_sig, fx,
-            );
-            assert_eq!(
-                unsafety_from, unsafety_to,
-                "Can't write fn ptr with incompatible sig {:?} to place with sig {:?}\n\n{:#?}",
-                from_sig, to_sig, fx,
-            );
-            assert_eq!(
-                abi_from, abi_to,
+                fn_sig_kind_from, fn_sig_kind_to,
                 "Can't write fn ptr with incompatible sig {:?} to place with sig {:?}\n\n{:#?}",
                 from_sig, to_sig, fx,
             );

@@ -19,6 +19,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Object/ObjectFile.h"
@@ -48,6 +49,9 @@
 #include "llvm/Transforms/Instrumentation/RealtimeSanitizer.h"
 #include "llvm/Transforms/Instrumentation/ThreadSanitizer.h"
 #include "llvm/Transforms/Scalar/AnnotationRemarks.h"
+#if LLVM_VERSION_GE(23, 0)
+#include "llvm/Transforms/Utils/AssignGUID.h"
+#endif
 #include "llvm/Transforms/Utils/CanonicalizeAliases.h"
 #include "llvm/Transforms/Utils/FunctionImportUtils.h"
 #include "llvm/Transforms/Utils/NameAnonGlobals.h"
@@ -90,8 +94,31 @@ extern "C" void LLVMRustTimeTraceProfilerFinish(const char *FileName) {
 extern "C" bool LLVMRustHasFeature(LLVMTargetMachineRef TM,
                                    const char *Feature) {
   TargetMachine *Target = unwrap(TM);
-  const MCSubtargetInfo *MCInfo = Target->getMCSubtargetInfo();
-  return MCInfo->checkFeatures(std::string("+") + Feature);
+#if LLVM_VERSION_GE(23, 0)
+  const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
+#else
+  const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
+#endif
+  return MCInfo.checkFeatures(std::string("+") + Feature);
+}
+
+/// Check whether the target has a specific assembly mnemonic like `ret` or
+/// `nop`.
+/// This should be fast enough but if its not we have to look into another
+/// method of checking.
+extern "C" bool LLVMRustTargetHasMnemonic(LLVMTargetMachineRef TM,
+                                          const char *Mnemonic) {
+  TargetMachine *Target = unwrap(TM);
+  const MCInstrInfo *MII = Target->getMCInstrInfo();
+  StringRef MnemonicRef(Mnemonic);
+
+  for (unsigned i = 0; i < MII->getNumOpcodes(); i++) {
+    StringRef Name = MII->getName(i);
+    if (Name.equals_insensitive(MnemonicRef)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 enum class LLVMRustCodeModel {
@@ -165,10 +192,17 @@ static OptimizationLevel fromRust(LLVMRustPassBuilderOptLevel Level) {
     return OptimizationLevel::O2;
   case LLVMRustPassBuilderOptLevel::O3:
     return OptimizationLevel::O3;
+#if LLVM_VERSION_GE(23, 0)
+  case LLVMRustPassBuilderOptLevel::Os:
+    return OptimizationLevel::O2;
+  case LLVMRustPassBuilderOptLevel::Oz:
+    return OptimizationLevel::O2;
+#else
   case LLVMRustPassBuilderOptLevel::Os:
     return OptimizationLevel::Os;
   case LLVMRustPassBuilderOptLevel::Oz:
     return OptimizationLevel::Oz;
+#endif
   default:
     report_fatal_error("Bad PassBuilderOptLevel.");
   }
@@ -247,7 +281,11 @@ static llvm::DebugCompressionType fromRust(LLVMRustCompressionKind Kind) {
 extern "C" void LLVMRustPrintTargetCPUs(LLVMTargetMachineRef TM,
                                         RustStringRef OutStr) {
   ArrayRef<SubtargetSubTypeKV> CPUTable =
+#if LLVM_VERSION_GE(23, 0)
+      unwrap(TM)->getMCSubtargetInfo().getAllProcessorDescriptions();
+#else
       unwrap(TM)->getMCSubtargetInfo()->getAllProcessorDescriptions();
+#endif
   auto OS = RawRustStringOstream(OutStr);
 
   // Just print a bare list of target CPU names, and let Rust-side code handle
@@ -259,9 +297,13 @@ extern "C" void LLVMRustPrintTargetCPUs(LLVMTargetMachineRef TM,
 
 extern "C" size_t LLVMRustGetTargetFeaturesCount(LLVMTargetMachineRef TM) {
   const TargetMachine *Target = unwrap(TM);
-  const MCSubtargetInfo *MCInfo = Target->getMCSubtargetInfo();
+#if LLVM_VERSION_GE(23, 0)
+  const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
+#else
+  const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
+#endif
   const ArrayRef<SubtargetFeatureKV> FeatTable =
-      MCInfo->getAllProcessorFeatures();
+      MCInfo.getAllProcessorFeatures();
   return FeatTable.size();
 }
 
@@ -269,9 +311,13 @@ extern "C" void LLVMRustGetTargetFeature(LLVMTargetMachineRef TM, size_t Index,
                                          const char **Feature,
                                          const char **Desc) {
   const TargetMachine *Target = unwrap(TM);
-  const MCSubtargetInfo *MCInfo = Target->getMCSubtargetInfo();
+#if LLVM_VERSION_GE(23, 0)
+  const MCSubtargetInfo &MCInfo = Target->getMCSubtargetInfo();
+#else
+  const MCSubtargetInfo &MCInfo = *Target->getMCSubtargetInfo();
+#endif
   const ArrayRef<SubtargetFeatureKV> FeatTable =
-      MCInfo->getAllProcessorFeatures();
+      MCInfo.getAllProcessorFeatures();
   const SubtargetFeatureKV Feat = FeatTable[Index];
   *Feature = Feat.Key;
   *Desc = Feat.Desc;
@@ -872,6 +918,9 @@ extern "C" LLVMRustResult LLVMRustOptimize(
   if (NeedThinLTOBufferPasses) {
     MPM.addPass(CanonicalizeAliasesPass());
     MPM.addPass(NameAnonGlobalPass());
+#if LLVM_VERSION_GE(23, 0)
+    MPM.addPass(AssignGUIDPass());
+#endif
   }
   // For `-Copt-level=0`, and the pre-link fat/thin LTO stages.
   if (ThinLTOBufferRef && *ThinLTOBufferRef == nullptr) {
@@ -1411,6 +1460,9 @@ extern "C" LLVMRustBuffer *LLVMRustModuleSerialize(LLVMModuleRef M,
         PB.registerLoopAnalyses(LAM);
         PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
         ModulePassManager MPM;
+#if LLVM_VERSION_GE(23, 0)
+        MPM.addPass(AssignGUIDPass());
+#endif
         MPM.addPass(ThinLTOBitcodeWriterPass(OS, nullptr));
         MPM.run(*unwrap(M), MAM);
       } else {

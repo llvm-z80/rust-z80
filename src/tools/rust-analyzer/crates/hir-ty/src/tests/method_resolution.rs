@@ -1193,7 +1193,7 @@ fn test() {
             123..167 '{     ...o(); }': ()
             133..134 's': &'? S
             137..151 'unsafe { f() }': &'? S
-            146..147 'f': fn f() -> &'static S
+            146..147 'f': extern "C" fn f() -> &'static S
             146..149 'f()': &'static S
             157..158 's': &'? S
             157..164 's.foo()': bool
@@ -1367,7 +1367,7 @@ mod a {
 mod b {
     fn foo() {
         let x = super::a::Bar::new().0;
-             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not))))
+             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Not)))
              // ^^^^^^^^^^^^^^^^^^^^^^ type: char
     }
 }
@@ -2129,7 +2129,7 @@ impl Foo {
 use core::mem::ManuallyDrop;
 fn test() {
     ManuallyDrop::new(Foo).foo();
-  //^^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not)))), Borrow(Ref(Not))
+  //^^^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Not))), Borrow(Ref(Not))
 }
 "#,
     );

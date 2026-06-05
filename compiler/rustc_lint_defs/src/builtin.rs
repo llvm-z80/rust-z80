@@ -34,9 +34,11 @@ declare_lint_pass! {
         CONST_EVALUATABLE_UNCHECKED,
         CONST_ITEM_MUTATION,
         DEAD_CODE,
+        DEAD_CODE_PUB_IN_BINARY,
         DEPENDENCY_ON_UNIT_NEVER_TYPE_FALLBACK,
         DEPRECATED,
         DEPRECATED_IN_FUTURE,
+        DEPRECATED_LLVM_INTRINSIC,
         DEPRECATED_SAFE_2024,
         DEPRECATED_WHERE_CLAUSE_LOCATION,
         DUPLICATE_FEATURES,
@@ -46,14 +48,13 @@ declare_lint_pass! {
         EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
         EXPORTED_PRIVATE_DEPENDENCIES,
         FFI_UNWIND_CALLS,
+        FLOAT_LITERAL_F32_FALLBACK,
         FORBIDDEN_LINT_GROUPS,
         FUNCTION_ITEM_REFERENCES,
-        FUZZY_PROVENANCE_CASTS,
         HIDDEN_GLOB_REEXPORTS,
         ILL_FORMED_ATTRIBUTE_INPUT,
         INCOMPLETE_INCLUDE,
         INEFFECTIVE_UNSTABLE_TRAIT_IMPL,
-        INLINE_ALWAYS_MISMATCHING_TARGET_FEATURES,
         INLINE_NO_SANITIZE,
         INVALID_DOC_ATTRIBUTES,
         INVALID_MACRO_EXPORT_ARGUMENTS,
@@ -65,7 +66,6 @@ declare_lint_pass! {
         LINKER_INFO,
         LINKER_MESSAGES,
         LONG_RUNNING_CONST_EVAL,
-        LOSSY_PROVENANCE_CASTS,
         MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS,
         MACRO_USE_EXTERN_CRATE,
         MALFORMED_DIAGNOSTIC_ATTRIBUTES,
@@ -107,6 +107,7 @@ declare_lint_pass! {
         SHADOWING_SUPERTRAIT_ITEMS,
         SINGLE_USE_LIFETIMES,
         STABLE_FEATURES,
+        TAIL_CALL_TRACK_CALLER,
         TAIL_EXPR_DROP_ORDER,
         TEST_UNSTABLE_LINT,
         TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
@@ -190,6 +191,11 @@ declare_lint! {
         reason: fcw!(FutureReleaseError #81670),
         report_in_deps: true,
     };
+    // We exempt `FORBIDDEN_LINT_GROUPS` from `-Dwarnings` because it specifically
+    // triggers in cases (like #80988) where you have `forbid(warnings)`,
+    // and so if we turned that into an error, it'd defeat the purpose of the
+    // future compatibility warning.
+    ignore_deny_warnings
 }
 
 declare_lint! {
@@ -779,6 +785,37 @@ declare_lint! {
     pub DEAD_CODE,
     Warn,
     "detect unused, unexported items"
+}
+
+declare_lint! {
+    /// The `dead_code_pub_in_binary` lint detects unused `pub` items in
+    /// executable crates.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// #![deny(dead_code_pub_in_binary)]
+    ///
+    /// pub fn unused_pub_fn() {}
+    ///
+    /// fn main() {}
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// In executable crates, `pub` items are often implementation details
+    /// rather than part of an external API. This lint helps find those items
+    /// when they are never used.
+    ///
+    /// This lint only applies to executable crates. In library crates, public
+    /// items are considered part of the crate's API and are not reported by
+    /// this lint.
+    pub DEAD_CODE_PUB_IN_BINARY,
+    Allow,
+    "detect public items in executable crates that are never used",
+    crate_level_only
 }
 
 declare_lint! {
@@ -2555,96 +2592,6 @@ declare_lint! {
 }
 
 declare_lint! {
-    /// The `fuzzy_provenance_casts` lint detects an `as` cast between an integer
-    /// and a pointer.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// #![feature(strict_provenance_lints)]
-    /// #![warn(fuzzy_provenance_casts)]
-    ///
-    /// fn main() {
-    ///     let _dangling = 16_usize as *const u8;
-    /// }
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// This lint is part of the strict provenance effort, see [issue #95228].
-    /// Casting an integer to a pointer is considered bad style, as a pointer
-    /// contains, besides the *address* also a *provenance*, indicating what
-    /// memory the pointer is allowed to read/write. Casting an integer, which
-    /// doesn't have provenance, to a pointer requires the compiler to assign
-    /// (guess) provenance. The compiler assigns "all exposed valid" (see the
-    /// docs of [`ptr::with_exposed_provenance`] for more information about this
-    /// "exposing"). This penalizes the optimiser and is not well suited for
-    /// dynamic analysis/dynamic program verification (e.g. Miri or CHERI
-    /// platforms).
-    ///
-    /// It is much better to use [`ptr::with_addr`] instead to specify the
-    /// provenance you want. If using this function is not possible because the
-    /// code relies on exposed provenance then there is as an escape hatch
-    /// [`ptr::with_exposed_provenance`].
-    ///
-    /// [issue #95228]: https://github.com/rust-lang/rust/issues/95228
-    /// [`ptr::with_addr`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.with_addr
-    /// [`ptr::with_exposed_provenance`]: https://doc.rust-lang.org/core/ptr/fn.with_exposed_provenance.html
-    pub FUZZY_PROVENANCE_CASTS,
-    Allow,
-    "a fuzzy integer to pointer cast is used",
-    @feature_gate = strict_provenance_lints;
-}
-
-declare_lint! {
-    /// The `lossy_provenance_casts` lint detects an `as` cast between a pointer
-    /// and an integer.
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// #![feature(strict_provenance_lints)]
-    /// #![warn(lossy_provenance_casts)]
-    ///
-    /// fn main() {
-    ///     let x: u8 = 37;
-    ///     let _addr: usize = &x as *const u8 as usize;
-    /// }
-    /// ```
-    ///
-    /// {{produces}}
-    ///
-    /// ### Explanation
-    ///
-    /// This lint is part of the strict provenance effort, see [issue #95228].
-    /// Casting a pointer to an integer is a lossy operation, because beyond
-    /// just an *address* a pointer may be associated with a particular
-    /// *provenance*. This information is used by the optimiser and for dynamic
-    /// analysis/dynamic program verification (e.g. Miri or CHERI platforms).
-    ///
-    /// Since this cast is lossy, it is considered good style to use the
-    /// [`ptr::addr`] method instead, which has a similar effect, but doesn't
-    /// "expose" the pointer provenance. This improves optimisation potential.
-    /// See the docs of [`ptr::addr`] and [`ptr::expose_provenance`] for more information
-    /// about exposing pointer provenance.
-    ///
-    /// If your code can't comply with strict provenance and needs to expose
-    /// the provenance, then there is [`ptr::expose_provenance`] as an escape hatch,
-    /// which preserves the behaviour of `as usize` casts while being explicit
-    /// about the semantics.
-    ///
-    /// [issue #95228]: https://github.com/rust-lang/rust/issues/95228
-    /// [`ptr::addr`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.addr
-    /// [`ptr::expose_provenance`]: https://doc.rust-lang.org/core/primitive.pointer.html#method.expose_provenance
-    pub LOSSY_PROVENANCE_CASTS,
-    Allow,
-    "a lossy pointer to integer cast is used",
-    @feature_gate = strict_provenance_lints;
-}
-
-declare_lint! {
     /// The `const_evaluatable_unchecked` lint detects a generic constant used
     /// in a type.
     ///
@@ -2718,7 +2665,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```rust,compile_fail
     /// enum Void {}
     /// unsafe extern {
     ///     static EXTERN: Void;
@@ -2734,10 +2681,11 @@ declare_lint! {
     /// compiler which assumes that there are no initialized uninhabited places (such as locals or
     /// statics). This was accidentally allowed, but is being phased out.
     pub UNINHABITED_STATIC,
-    Warn,
+    Deny,
     "uninhabited static",
     @future_incompatible = FutureIncompatibleInfo {
         reason: fcw!(FutureReleaseError #74840),
+        report_in_deps: true,
     };
 }
 
@@ -3156,7 +3104,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust
-    /// #[cfg(FALSE)]
+    /// #[cfg(feature = "nightly")]
     /// macro foo() {}
     /// ```
     ///
@@ -3180,22 +3128,22 @@ declare_lint! {
     ///    ( $($tokens:tt)* ) => { $($tokens)* }
     /// }
     ///
-    /// #[cfg(FALSE)]
+    /// #[cfg(feature = "nightly")]
     /// identity! {
     ///    macro foo() {}
     /// }
     /// ```
     ///
     /// This is a [future-incompatible] lint to transition this
-    /// to a hard error in the future. See [issue #65860] for more details.
+    /// to a hard error in the future. See [issue #154045] for more details.
     ///
-    /// [issue #65860]: https://github.com/rust-lang/rust/issues/65860
+    /// [issue #154045]: https://github.com/rust-lang/rust/issues/154045
     /// [future-incompatible]: ../index.md#future-incompatible-lints
     pub UNSTABLE_SYNTAX_PRE_EXPANSION,
     Warn,
     "unstable syntax can change at any point in the future, causing a hard error!",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #65860),
+        reason: fcw!(FutureReleaseError #154045),
     };
 }
 
@@ -4069,8 +4017,12 @@ declare_lint! {
     /// and actionable warning of similar quality to our other diagnostics. See this tracking
     /// issue for more details: <https://github.com/rust-lang/rust/issues/136096>.
     pub LINKER_MESSAGES,
-    Allow,
-    "warnings emitted at runtime by the target-specific linker program"
+    Warn,
+    "warnings emitted at runtime by the target-specific linker program",
+    // Linker messages don't live up to the high standard people expect of rustc's errors.
+    // Prevent `-D warnings` from applying to it.
+    // It's still possible to pass `-D linker-messages` specifically.
+    ignore_deny_warnings
 }
 
 declare_lint! {
@@ -4577,28 +4529,21 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust,compile_fail
-    /// #![deny(ambiguous_glob_imports)]
-    /// pub fn foo() -> u32 {
-    ///     use sub::*;
-    ///     C
-    /// }
+    /// ```rust,ignore (needs extern crate)
+    /// // library crate `my_library`
+    /// mod mod1 { pub const C: u32 = 1; }
+    /// mod mod2 { pub const C: u32 = 2; }
+    /// pub use mod1::*;
+    /// pub use mod2::*;
     ///
-    /// mod sub {
-    ///     mod mod1 { pub const C: u32 = 1; }
-    ///     mod mod2 { pub const C: u32 = 2; }
-    ///
-    ///     pub use mod1::*;
-    ///     pub use mod2::*;
-    /// }
+    /// // another crate using `my_library`
+    /// let c = my_library::C; // `C` is ambiguous
     /// ```
-    ///
-    /// {{produces}}
     ///
     /// ### Explanation
     ///
-    /// Previous versions of Rust compile it successfully because it
-    /// had lost the ambiguity error when resolve `use sub::mod2::*`.
+    /// Previous versions of Rust compile it successfully because
+    /// ambiguous glob imports weren't preserved correctly over crate boundaries.
     ///
     /// This is a [future-incompatible] lint to transition this to a
     /// hard error in the future.
@@ -5448,61 +5393,6 @@ declare_lint! {
     @feature_gate = explicit_tail_calls;
 }
 declare_lint! {
-    /// The `inline_always_mismatching_target_features` lint will trigger when a
-    /// function with the `#[inline(always)]` and `#[target_feature(enable = "...")]`
-    /// attributes is called and cannot be inlined due to missing target features in the caller.
-    ///
-    /// ### Example
-    ///
-    /// ```rust,ignore (fails on x86_64)
-    /// #[inline(always)]
-    /// #[target_feature(enable = "fp16")]
-    /// unsafe fn callee() {
-    ///     // operations using fp16 types
-    /// }
-    ///
-    /// // Caller does not enable the required target feature
-    /// fn caller() {
-    ///     unsafe { callee(); }
-    /// }
-    ///
-    /// fn main() {
-    ///     caller();
-    /// }
-    /// ```
-    ///
-    /// This will produce:
-    ///
-    /// ```text
-    /// warning: call to `#[inline(always)]`-annotated `callee` requires the same target features. Function will not have `alwaysinline` attribute applied
-    ///   --> $DIR/builtin.rs:5192:14
-    ///    |
-    /// 10 |     unsafe { callee(); }
-    ///    |              ^^^^^^^^
-    ///    |
-    /// note: `fp16` target feature enabled in `callee` here but missing from `caller`
-    ///   --> $DIR/builtin.rs:5185:1
-    ///    |
-    /// 3  | #[target_feature(enable = "fp16")]
-    ///    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    /// 4  | unsafe fn callee() {
-    ///    | ------------------
-    ///    = note: `#[warn(inline_always_mismatching_target_features)]` on by default
-    /// warning: 1 warning emitted
-    /// ```
-    ///
-    /// ### Explanation
-    ///
-    /// Inlining a function with a target feature attribute into a caller that
-    /// lacks the corresponding target feature can lead to unsound behavior.
-    /// LLVM may select the wrong instructions or registers, or reorder
-    /// operations, potentially resulting in runtime errors.
-    pub INLINE_ALWAYS_MISMATCHING_TARGET_FEATURES,
-    Warn,
-    r#"detects when a function annotated with `#[inline(always)]` and `#[target_feature(enable = "..")]` is inlined into a caller without the required target feature"#,
-}
-
-declare_lint! {
     /// The `repr_c_enums_larger_than_int` lint detects `repr(C)` enums with discriminant
     /// values that do not fit into a C `int` or `unsigned int`.
     ///
@@ -5556,7 +5446,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```rust,compile_fail
     /// // Using `...` in non-foreign function definitions is unstable, however stability is
     /// // currently only checked after attributes are expanded, so using `#[cfg(false)]` here will
     /// // allow this to compile on stable Rust.
@@ -5588,10 +5478,110 @@ declare_lint! {
     ///
     /// [future-incompatible]: ../index.md#future-incompatible-lints
     pub VARARGS_WITHOUT_PATTERN,
-    Warn,
+    Deny,
     "detects usage of `...` arguments without a pattern in non-foreign items",
     @future_incompatible = FutureIncompatibleInfo {
         reason: fcw!(FutureReleaseError #145544),
+        report_in_deps: true,
+    };
+}
+
+declare_lint! {
+    /// The `deprecated_llvm_intrinsic` lint detects usage of deprecated LLVM intrinsics.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,ignore (requires x86)
+    /// #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// #![feature(link_llvm_intrinsics, abi_unadjusted)]
+    /// #![deny(deprecated_llvm_intrinsic)]
+    ///
+    /// unsafe extern "unadjusted" {
+    ///     #[link_name = "llvm.x86.addcarryx.u32"]
+    ///     fn foo(a: u8, b: u32, c: u32, d: &mut u32) -> u8;
+    /// }
+    ///
+    /// #[inline(never)]
+    /// #[target_feature(enable = "adx")]
+    /// pub fn bar(a: u8, b: u32, c: u32, d: &mut u32) -> u8 {
+    ///     unsafe { foo(a, b, c, d) }
+    /// }
+    /// ```
+    ///
+    /// This will produce:
+    ///
+    /// ```text
+    /// error: Using deprecated intrinsic `llvm.x86.addcarryx.u32`
+    ///  --> example.rs:7:5
+    ///   |
+    /// 7 |     fn foo(a: u8, b: u32, c: u32, d: &mut u32) -> u8;
+    ///   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///   |
+    /// ```
+    ///
+    /// ### Explanation
+    ///
+    /// LLVM periodically updates its list of intrinsics. Deprecated intrinsics are unlikely
+    /// to be removed, but they may optimize less well than their new versions, so it's
+    /// best to use the new version. Also, some deprecated intrinsics might have buggy
+    /// behavior.
+    ///
+    /// This `link_llvm_intrinsics` lint is intended to be used internally only, and requires the
+    /// `#![feature(link_llvm_intrinsics)]` internal feature gate. For more information, see [its chapter in
+    /// the Unstable Book](https://doc.rust-lang.org/unstable-book/language-features/link-llvm-intrinsics.html)
+    /// and [its tracking issue](https://github.com/rust-lang/rust/issues/29602).
+    pub DEPRECATED_LLVM_INTRINSIC,
+    Allow,
+    "detects uses of deprecated LLVM intrinsics",
+    @feature_gate = link_llvm_intrinsics;
+}
+
+declare_lint! {
+    /// The `float_literal_f32_fallback` lint detects situations where the type of an unsuffixed
+    /// float literal falls back to `f32` instead of `f64` to avoid a compilation error. This occurs
+    /// when there is a trait bound `f32: From<T>` (or equivalent, such as `T: Into<f32>`) and the
+    /// literal is inferred to have the same type as `T`.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fn foo(x: impl Into<f32>) -> f32 {
+    ///     x.into()
+    /// }
+    ///
+    /// fn main() {
+    ///     dbg!(foo(2.5));
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Rust allows traits that are only implemented for a single floating point type to guide type
+    /// inference for floating point literals. This used to apply in the case of `f32: From<T>`
+    /// (where `T` was inferred to be the same type as a floating point literal), as the only
+    /// floating point type impl was `f32: From<f32>`. However, as Rust is in the process of adding
+    /// support for `f16`, there are now two implementations for floating point types:
+    /// `f32: From<f16>` and `f32: From<f32>`. This means that the trait bound `f32: From<T>` can no
+    /// longer guide inference for the type of the floating point literal. The default fallback for
+    /// unsuffixed floating point literals is `f64`. As `f32` does not implement `From<f64>`,
+    /// falling back to `f64` would cause a compilation error; therefore, the float type fallback
+    /// has been tempoarily adjusted to fallback to `f32` in this scenario.
+    ///
+    /// The lint will automatically provide a machine-applicable suggestion to add a `_f32` suffix
+    /// to the literal, which will fix the problem.
+    ///
+    /// This is a [future-incompatible] lint to transition this to a hard error in the future. See
+    /// [issue #154024] for more details.
+    ///
+    /// [issue #154024]: https://github.com/rust-lang/rust/issues/154024
+    /// [future-incompatible]: ../index.md#future-incompatible-lints
+    pub FLOAT_LITERAL_F32_FALLBACK,
+    Warn,
+    "detects unsuffixed floating point literals whose type fallback to `f32`",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #154024),
         report_in_deps: false,
     };
 }

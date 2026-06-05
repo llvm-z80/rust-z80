@@ -5,21 +5,23 @@
 use rustc_abi::ExternAbi;
 use rustc_ast::visit::{VisitorResult, walk_list};
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+use rustc_data_structures::steal::Steal;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{DynSend, DynSync, par_for_each_in, spawn, try_par_for_each_in};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId, LocalModDefId};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
 use rustc_hir::intravisit::Visitor;
+use rustc_hir::lints::DelayedLints;
 use rustc_hir::*;
 use rustc_hir_pretty as pprust_hir;
 use rustc_span::def_id::StableCrateId;
 use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol, kw, with_metavar_spans};
 
-use crate::hir::{ModuleItems, nested_filter};
+use crate::hir::{ModuleItems, ProjectedMaybeOwner, nested_filter};
 use crate::middle::debugger_visualizer::DebuggerVisualizerFile;
-use crate::query::LocalCrate;
+use crate::query::{IntoQueryKey, LocalCrate};
 use crate::ty::TyCtxt;
 
 /// An iterator that walks up the ancestor tree of a given `HirId`.
@@ -101,6 +103,37 @@ impl<'tcx> Iterator for ParentOwnerIterator<'tcx> {
 }
 
 impl<'tcx> TyCtxt<'tcx> {
+    #[inline]
+    pub fn local_def_id_to_hir_id(self, def_id: impl IntoQueryKey<LocalDefId>) -> HirId {
+        let def_id = def_id.into_query_key();
+        match self.hir_owner(def_id) {
+            ProjectedMaybeOwner::Owner(_) => HirId::make_owner(def_id),
+            ProjectedMaybeOwner::NonOwner(hir_id) => hir_id,
+        }
+    }
+
+    /// This function is used only inside eval-always query `analysis`
+    /// (`analysis -> run_required_analysis` -> `emit_delayed_lints`), so it is safe
+    /// to obtain delayed lints from non-eval-always `owner` query.
+    #[inline]
+    pub fn opt_ast_lowering_delayed_lints(self, id: OwnerId) -> Option<&'tcx Steal<DelayedLints>> {
+        self.dep_graph.assert_eval_always();
+        self.hir_owner(id.def_id).as_owner().map(|o| o.delayed_lints)
+    }
+
+    #[inline]
+    pub fn in_scope_traits_map(
+        self,
+        id: OwnerId,
+    ) -> Option<&'tcx ItemLocalMap<&'tcx [TraitCandidate<'tcx>]>> {
+        self.hir_owner(id.def_id).as_owner().map(|o| o.trait_map)
+    }
+
+    #[inline]
+    pub fn opt_hir_owner_nodes(self, def_id: LocalDefId) -> Option<&'tcx OwnerNodes<'tcx>> {
+        self.hir_owner(def_id).as_owner().map(|o| o.nodes)
+    }
+
     #[inline]
     fn expect_hir_owner_nodes(self, def_id: LocalDefId) -> &'tcx OwnerNodes<'tcx> {
         self.opt_hir_owner_nodes(def_id)
@@ -317,11 +350,9 @@ impl<'tcx> TyCtxt<'tcx> {
             BodyOwnerKind::Static(mutability) => ConstContext::Static(mutability),
 
             BodyOwnerKind::Fn if self.is_constructor(def_id) => return None,
-            // Const closures use their parent's const context
-            BodyOwnerKind::Closure if self.is_const_fn(def_id) => {
-                return self.hir_body_const_context(self.local_parent(local_def_id));
+            BodyOwnerKind::Fn | BodyOwnerKind::Closure if self.is_const_fn(def_id) => {
+                ConstContext::ConstFn
             }
-            BodyOwnerKind::Fn if self.is_const_fn(def_id) => ConstContext::ConstFn,
             BodyOwnerKind::Fn | BodyOwnerKind::Closure | BodyOwnerKind::GlobalAsm => return None,
         };
 
@@ -370,7 +401,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     pub fn hir_rustc_coherence_is_core(self) -> bool {
-        find_attr!(self.hir_krate_attrs(), RustcCoherenceIsCore(..))
+        find_attr!(self.hir_krate_attrs(), RustcCoherenceIsCore)
     }
 
     pub fn hir_get_module(self, module: LocalModDefId) -> (&'tcx Mod<'tcx>, Span, HirId) {
@@ -644,7 +675,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     | ItemKind::Enum(..)
                     | ItemKind::Struct(..)
                     | ItemKind::Union(..)
-                    | ItemKind::Trait(..)
+                    | ItemKind::Trait { .. }
                     | ItemKind::Impl { .. },
                 ..
             })
@@ -695,7 +726,7 @@ impl<'tcx> TyCtxt<'tcx> {
                     ItemKind::Enum(..) => "enum",
                     ItemKind::Struct(..) => "struct",
                     ItemKind::Union(..) => "union",
-                    ItemKind::Trait(..) => "trait",
+                    ItemKind::Trait { .. } => "trait",
                     ItemKind::TraitAlias(..) => "trait alias",
                     ItemKind::Impl { .. } => "impl",
                 };
@@ -707,7 +738,7 @@ impl<'tcx> TyCtxt<'tcx> {
             Node::ImplItem(ii) => {
                 let kind = match ii.kind {
                     ImplItemKind::Const(..) => "associated constant",
-                    ImplItemKind::Fn(fn_sig, _) => match fn_sig.decl.implicit_self {
+                    ImplItemKind::Fn(fn_sig, _) => match fn_sig.decl.implicit_self() {
                         ImplicitSelfKind::None => "associated function",
                         _ => "method",
                     },
@@ -718,7 +749,7 @@ impl<'tcx> TyCtxt<'tcx> {
             Node::TraitItem(ti) => {
                 let kind = match ti.kind {
                     TraitItemKind::Const(..) => "associated constant",
-                    TraitItemKind::Fn(fn_sig, _) => match fn_sig.decl.implicit_self {
+                    TraitItemKind::Fn(fn_sig, _) => match fn_sig.decl.implicit_self() {
                         ImplicitSelfKind::None => "associated function",
                         _ => "trait method",
                     },
@@ -945,7 +976,7 @@ impl<'tcx> TyCtxt<'tcx> {
             }) => until_within(*outer_span, ty.span),
             // With generics and bounds.
             Node::Item(Item {
-                kind: ItemKind::Trait(_, _, _, _, generics, bounds, _),
+                kind: ItemKind::Trait { generics, bounds, .. },
                 span: outer_span,
                 ..
             })
@@ -982,8 +1013,8 @@ impl<'tcx> TyCtxt<'tcx> {
                 span,
                 ..
             }) => {
-                // Ensure that the returned span has the item's SyntaxContext.
-                fn_decl_span.find_ancestor_inside(*span).unwrap_or(*span)
+                // Ensure that the returned span has the closure expression's SyntaxContext.
+                fn_decl_span.find_ancestor_inside_same_ctxt(*span).unwrap_or(*span)
             }
             _ => self.hir_span_with_body(hir_id),
         };
@@ -1163,10 +1194,10 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
 
     let crate_hash: Fingerprint = tcx.with_stable_hashing_context(|mut hcx| {
         let mut stable_hasher = StableHasher::new();
-        hir_body_hash.hash_stable(&mut hcx, &mut stable_hasher);
-        upstream_crates.hash_stable(&mut hcx, &mut stable_hasher);
-        source_file_names.hash_stable(&mut hcx, &mut stable_hasher);
-        debugger_visualizers.hash_stable(&mut hcx, &mut stable_hasher);
+        hir_body_hash.stable_hash(&mut hcx, &mut stable_hasher);
+        upstream_crates.stable_hash(&mut hcx, &mut stable_hasher);
+        source_file_names.stable_hash(&mut hcx, &mut stable_hasher);
+        debugger_visualizers.stable_hash(&mut hcx, &mut stable_hasher);
         if tcx.sess.opts.incremental.is_some() {
             let definitions = tcx.untracked().definitions.freeze();
             let mut owner_spans: Vec<_> = tcx
@@ -1180,17 +1211,17 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
                 })
                 .collect();
             owner_spans.sort_unstable_by_key(|bn| bn.0);
-            owner_spans.hash_stable(&mut hcx, &mut stable_hasher);
+            owner_spans.stable_hash(&mut hcx, &mut stable_hasher);
         }
-        tcx.sess.opts.dep_tracking_hash(true).hash_stable(&mut hcx, &mut stable_hasher);
-        tcx.stable_crate_id(LOCAL_CRATE).hash_stable(&mut hcx, &mut stable_hasher);
+        tcx.sess.opts.dep_tracking_hash(true).stable_hash(&mut hcx, &mut stable_hasher);
+        tcx.stable_crate_id(LOCAL_CRATE).stable_hash(&mut hcx, &mut stable_hasher);
         // Hash visibility information since it does not appear in HIR.
         // FIXME: Figure out how to remove `visibilities_for_hashing` by hashing visibilities on
         // the fly in the resolver, storing only their accumulated hash in `ResolverGlobalCtxt`,
         // and combining it with other hashes here.
-        resolutions.visibilities_for_hashing.hash_stable(&mut hcx, &mut stable_hasher);
+        resolutions.visibilities_for_hashing.stable_hash(&mut hcx, &mut stable_hasher);
         with_metavar_spans(|mspans| {
-            mspans.freeze_and_get_read_spans().hash_stable(&mut hcx, &mut stable_hasher);
+            mspans.freeze_and_get_read_spans().stable_hash(&mut hcx, &mut stable_hasher);
         });
         stable_hasher.finish()
     });

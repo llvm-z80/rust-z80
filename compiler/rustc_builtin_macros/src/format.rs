@@ -10,12 +10,12 @@ use rustc_ast::{
 };
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{
-    Applicability, BufferedEarlyLint, Diag, MultiSpan, PResult, SingleLabelManySpans, listify,
-    pluralize,
+    Applicability, BufferedEarlyLint, DecorateDiagCompat, Diag, Diagnostic, MultiSpan, PResult,
+    SingleLabelManySpans, listify, pluralize,
 };
 use rustc_expand::base::*;
+use rustc_lint_defs::LintId;
 use rustc_lint_defs::builtin::NAMED_ARGUMENTS_USED_POSITIONALLY;
-use rustc_lint_defs::{BuiltinLintDiag, LintId};
 use rustc_parse::exp;
 use rustc_parse_format as parse;
 use rustc_span::{BytePos, ErrorGuaranteed, Ident, InnerSpan, Span, Symbol};
@@ -173,6 +173,16 @@ fn make_format_args(
         style: fmt_style,
         uncooked_symbol: uncooked_fmt_str,
     } = {
+        // Extract snippet so that we can check cases `{}`, `{:?}` and `{:#?}` and emit help for
+        // them later.
+        let snippet = if let ExprKind::Block(b, None) = &efmt.kind
+            && b.stmts.len() <= 1
+        {
+            Some(ecx.sess.source_map().span_to_snippet(unexpanded_fmt_span))
+        } else {
+            None
+        };
+
         let ExpandResult::Ready(mac) = expr_to_spanned_string(ecx, efmt.clone(), msg) else {
             return ExpandResult::Retry(());
         };
@@ -222,12 +232,26 @@ fn make_format_args(
                                     });
                                 }
                                 sugg_fmt = sugg_fmt.trim_end().to_string();
-                                err.span_suggestion(
+                                err.span_suggestion_verbose(
                                     unexpanded_fmt_span.shrink_to_lo(),
                                     "you might be missing a string literal to format with",
                                     format!("\"{sugg_fmt}\", "),
                                     Applicability::MaybeIncorrect,
                                 );
+
+                                if let Some(Ok(snippet)) = snippet.as_ref() {
+                                    match snippet.as_str() {
+                                        "{}" | "{:?}" | "{:#?}" => {
+                                            err.span_suggestion_verbose(
+                                                unexpanded_fmt_span,
+                                                format!("you might want to enclose `{snippet}` with `\"\"`"),
+                                                format!("\"{snippet}\""),
+                                                Applicability::MaybeIncorrect,
+                                            );
+                                        }
+                                        _ => {}
+                                    };
+                                }
                             }
                         }
                         err.emit()
@@ -432,7 +456,7 @@ fn make_format_args(
             parse::Piece::Lit(s) => {
                 unfinished_literal.push_str(s);
             }
-            parse::Piece::NextArgument(box parse::Argument { position, position_span, format }) => {
+            parse::Piece::NextArgument(parse::Argument { position, position_span, format }) => {
                 if !unfinished_literal.is_empty() {
                     template.push(FormatArgsPiece::Literal(Symbol::intern(&unfinished_literal)));
                     unfinished_literal.clear();
@@ -611,14 +635,39 @@ fn make_format_args(
                 span: Some(arg_name.span.into()),
                 node_id: rustc_ast::CRATE_NODE_ID,
                 lint_id: LintId::of(NAMED_ARGUMENTS_USED_POSITIONALLY),
-                diagnostic: BuiltinLintDiag::NamedArgumentUsedPositionally {
-                    position_sp_to_replace,
-                    position_sp_for_msg,
-                    named_arg_sp: arg_name.span,
-                    named_arg_name: arg_name.name.to_string(),
-                    is_formatting_arg: matches!(used_as, Width | Precision),
-                }
-                .into(),
+                diagnostic: DecorateDiagCompat(Box::new(move |dcx, level, sess| {
+                    let (suggestion, name) =
+                        if let Some(positional_arg_to_replace) = position_sp_to_replace {
+                            let mut name = arg_name.name.to_string();
+                            let is_formatting_arg = matches!(used_as, Width | Precision);
+                            if is_formatting_arg {
+                                name.push('$')
+                            };
+                            let span_to_replace = if let Ok(positional_arg_content) = sess
+                                .downcast_ref::<rustc_session::Session>()
+                                .expect("expected a `Session`")
+                                .source_map()
+                                .span_to_snippet(positional_arg_to_replace)
+                                && positional_arg_content.starts_with(':')
+                            {
+                                positional_arg_to_replace.shrink_to_lo()
+                            } else {
+                                positional_arg_to_replace
+                            };
+                            (Some(span_to_replace), name)
+                        } else {
+                            (None, String::new())
+                        };
+
+                    errors::NamedArgumentUsedPositionally {
+                        named_arg_sp: arg_name.span,
+                        position_label_sp: position_sp_for_msg,
+                        suggestion,
+                        name,
+                        named_arg_name: arg_name.name.to_string(),
+                    }
+                    .into_diag(dcx, level)
+                })),
             });
         }
     }
@@ -938,6 +987,7 @@ fn report_invalid_references(
         // Collect all the implicit positions:
         let mut spans = Vec::new();
         let mut num_placeholders = 0;
+        let mut has_white_space_only_missing_arg = false;
         for piece in template {
             let mut placeholder = None;
             // `{arg:.*}`
@@ -960,13 +1010,21 @@ fn report_invalid_references(
             }
             // `{}`
             if let FormatArgsPiece::Placeholder(FormatPlaceholder {
-                argument: FormatArgPosition { kind: FormatArgPositionKind::Implicit, .. },
+                argument: FormatArgPosition { kind: FormatArgPositionKind::Implicit, index, .. },
                 span,
                 ..
             }) = piece
             {
                 placeholder = *span;
                 num_placeholders += 1;
+                //  Check whether there's any non-space whitespace in the placeholder. If so, we should emit a note suggesting an escaping `{`.
+                if index.is_err()
+                    && let Some(span) = span
+                    && let Ok(snippet) = ecx.source_map().span_to_snippet(*span)
+                    && snippet.chars().any(|c| c.is_whitespace() && c != ' ')
+                {
+                    has_white_space_only_missing_arg = true;
+                }
             }
             // For `{:.*}`, we only push one span.
             spans.extend(placeholder);
@@ -1021,6 +1079,9 @@ fn report_invalid_references(
         }
         if has_precision_star {
             e.note("positional arguments are zero-based");
+        }
+        if has_white_space_only_missing_arg {
+            e.note("if you intended to print `{`, you can escape it with `{{`");
         }
     } else {
         let mut indexes: Vec<_> = invalid_refs.iter().map(|&(index, _, _, _)| index).collect();

@@ -5,7 +5,7 @@ use rustc_hir::limit::Limit;
 use rustc_middle::bug;
 #[expect(unused_imports, reason = "used by doc comments")]
 use rustc_middle::dep_graph::DepKindVTable;
-use rustc_middle::dep_graph::{DepNode, DepNodeIndex, DepNodeKey, SerializedDepNodeIndex};
+use rustc_middle::dep_graph::{DepNode, DepNodeKey, SerializedDepNodeIndex};
 use rustc_middle::query::erase::{Erasable, Erased};
 use rustc_middle::query::on_disk_cache::{CacheDecoder, CacheEncoder};
 use rustc_middle::query::{QueryCache, QueryJobId, QueryMode, QueryVTable, erase};
@@ -93,7 +93,7 @@ fn encode_query_values_inner<'a, 'tcx, C, V>(
 
     assert!(all_inactive(&query.state));
     query.cache.for_each(&mut |key, value, dep_node| {
-        if (query.will_cache_on_disk_for_key_fn)(tcx, *key) {
+        if query.will_cache_on_disk_for_key(*key) {
             encoder.encode_query_value::<V>(dep_node, &erase::restore_val::<V>(*value));
         }
     });
@@ -152,7 +152,7 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
 
     // If the recovered key isn't eligible for cache-on-disk, then there's no
     // value on disk to promote.
-    if !(query.will_cache_on_disk_for_key_fn)(tcx, key) {
+    if !query.will_cache_on_disk_for_key(key) {
         return;
     }
 
@@ -184,23 +184,14 @@ pub(crate) fn loadable_from_disk<'tcx>(tcx: TyCtxt<'tcx>, id: SerializedDepNodeI
 pub(crate) fn try_load_from_disk<'tcx, V>(
     tcx: TyCtxt<'tcx>,
     prev_index: SerializedDepNodeIndex,
-    index: DepNodeIndex,
 ) -> Option<V>
 where
     V: for<'a> Decodable<CacheDecoder<'a, 'tcx>>,
 {
     let on_disk_cache = tcx.query_system.on_disk_cache.as_ref()?;
 
-    let prof_timer = tcx.prof.incr_cache_loading();
-
     // The call to `with_query_deserialization` enforces that no new `DepNodes`
     // are created during deserialization. See the docs of that method for more
     // details.
-    let value = tcx
-        .dep_graph
-        .with_query_deserialization(|| on_disk_cache.try_load_query_value(tcx, prev_index));
-
-    prof_timer.finish_with_query_invocation_id(index.into());
-
-    value
+    tcx.dep_graph.with_query_deserialization(|| on_disk_cache.try_load_query_value(tcx, prev_index))
 }

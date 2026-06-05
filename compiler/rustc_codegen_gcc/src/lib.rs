@@ -81,9 +81,9 @@ use gccjit::{CType, Context, OptimizationLevel};
 #[cfg(feature = "master")]
 use gccjit::{TargetInfo, Version};
 use rustc_ast::expand::allocator::AllocatorMethod;
-use rustc_codegen_ssa::back::lto::{SerializedModule, ThinModule};
+use rustc_codegen_ssa::back::lto::ThinModule;
 use rustc_codegen_ssa::back::write::{
-    CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn,
+    CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn, ThinLtoInput,
 };
 use rustc_codegen_ssa::base::codegen_crate;
 use rustc_codegen_ssa::target_features::cfg_target_feature;
@@ -98,7 +98,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
 use rustc_session::config::{OptLevel, OutputFilenames};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use rustc_target::spec::{Arch, RelocModel};
 use tempfile::TempDir;
 
@@ -291,8 +291,8 @@ impl CodegenBackend for GccCodegenBackend {
         target_cpu(sess).to_owned()
     }
 
-    fn codegen_crate(&self, tcx: TyCtxt<'_>, crate_info: &CrateInfo) -> Box<dyn Any> {
-        Box::new(codegen_crate(self.clone(), tcx, crate_info))
+    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        Box::new(codegen_crate(self.clone(), tcx))
     }
 
     fn join_codegen(
@@ -300,15 +300,20 @@ impl CodegenBackend for GccCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         _outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
     ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
         ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<GccCodegenBackend>>()
             .expect("Expected GccCodegenBackend's OngoingCodegen, found Box<Any>")
-            .join(sess)
+            .join(sess, crate_info)
     }
 
     fn target_config(&self, sess: &Session) -> TargetConfig {
         target_config(sess, &self.target_info)
+    }
+
+    fn fallback_intrinsics(&self) -> Vec<Symbol> {
+        vec![sym::type_id_eq]
     }
 }
 
@@ -334,9 +339,7 @@ fn new_context<'gcc, 'tcx>(tcx: TyCtxt<'tcx>) -> Context<'gcc> {
 }
 
 impl ExtraBackendMethods for GccCodegenBackend {
-    fn supports_parallel(&self) -> bool {
-        false
-    }
+    type Module = GccContext;
 
     fn codegen_allocator(
         &self,
@@ -419,6 +422,10 @@ impl WriteBackendMethods for GccCodegenBackend {
     type ModuleBuffer = ModuleBuffer;
     type ThinData = ();
 
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
     fn target_machine_factory(
         &self,
         _sess: &Session,
@@ -430,8 +437,8 @@ impl WriteBackendMethods for GccCodegenBackend {
     }
 
     fn optimize_and_codegen_fat_lto(
+        sess: &Session,
         cgcx: &CodegenContext,
-        prof: &SelfProfilerRef,
         shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
         // FIXME(bjorn3): Limit LTO exports to these symbols
@@ -439,7 +446,7 @@ impl WriteBackendMethods for GccCodegenBackend {
         each_linked_rlib_for_lto: &[PathBuf],
         modules: Vec<FatLtoInput<Self>>,
     ) -> CompiledModule {
-        back::lto::run_fat(cgcx, prof, shared_emitter, each_linked_rlib_for_lto, modules)
+        back::lto::run_fat(cgcx, &sess.prof, shared_emitter, each_linked_rlib_for_lto, modules)
     }
 
     fn run_thin_lto(
@@ -449,8 +456,7 @@ impl WriteBackendMethods for GccCodegenBackend {
         // FIXME(bjorn3): Limit LTO exports to these symbols
         _exported_symbols_for_lto: &[String],
         _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<(String, Self::ModuleBuffer)>,
-        _cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
+        _modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
         unreachable!()
     }

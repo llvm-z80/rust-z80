@@ -18,26 +18,17 @@ use crate::error_reporting::infer::ObligationCauseAsDiagArg;
 use crate::error_reporting::infer::need_type_info::UnderspecifiedArgKind;
 use crate::error_reporting::infer::nice_region_error::placeholder_error::Highlighted;
 
-pub mod note_and_explain;
+pub(crate) mod note_and_explain;
 
 #[derive(Diagnostic)]
 #[diag("unable to construct a constant value for the unevaluated constant {$unevaluated}")]
-pub struct UnableToConstructConstantValue<'a> {
+pub(crate) struct UnableToConstructConstantValue<'a> {
     #[primary_span]
     pub span: Span,
     pub unevaluated: ty::UnevaluatedConst<'a>,
 }
 
-#[derive(Diagnostic)]
-#[diag("this attribute must have a value", code = E0232)]
-#[note("e.g. `#[rustc_on_unimplemented(message=\"foo\")]`")]
-pub struct NoValueInOnUnimplemented {
-    #[primary_span]
-    #[label("expected value here")]
-    pub span: Span,
-}
-
-pub struct NegativePositiveConflict<'tcx> {
+pub(crate) struct NegativePositiveConflict<'tcx> {
     pub impl_span: Span,
     pub trait_desc: ty::TraitRef<'tcx>,
     pub self_ty: Option<Ty<'tcx>>,
@@ -86,13 +77,13 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for NegativePositiveConflict<'_> {
 
 #[derive(Diagnostic)]
 #[diag("overflow evaluating associated type `{$ty}`")]
-pub struct InherentProjectionNormalizationOverflow {
+pub(crate) struct InherentProjectionNormalizationOverflow {
     #[primary_span]
     pub span: Span,
     pub ty: String,
 }
 
-pub enum AdjustSignatureBorrow {
+pub(crate) enum AdjustSignatureBorrow {
     Borrow { to_borrow: Vec<(Span, String)> },
     RemoveBorrow { remove_borrow: Vec<(Span, String)> },
 }
@@ -132,7 +123,7 @@ impl Subdiagnostic for AdjustSignatureBorrow {
 
 #[derive(Diagnostic)]
 #[diag("expected a closure that implements the `{$trait_prefix}{$expected}` trait, but this closure only implements `{$trait_prefix}{$found}`", code = E0525)]
-pub struct ClosureKindMismatch {
+pub(crate) struct ClosureKindMismatch {
     #[primary_span]
     #[label("this closure implements `{$trait_prefix}{$found}`, not `{$trait_prefix}{$expected}`")]
     pub closure_span: Span,
@@ -154,7 +145,7 @@ pub struct ClosureKindMismatch {
 #[label(
     "closure is `{$trait_prefix}FnOnce` because it moves the variable `{$place}` out of its environment"
 )]
-pub struct ClosureFnOnceLabel {
+pub(crate) struct ClosureFnOnceLabel {
     #[primary_span]
     pub span: Span,
     pub place: String,
@@ -163,7 +154,7 @@ pub struct ClosureFnOnceLabel {
 
 #[derive(Subdiagnostic)]
 #[label("closure is `{$trait_prefix}FnMut` because it mutates the variable `{$place}` here")]
-pub struct ClosureFnMutLabel {
+pub(crate) struct ClosureFnMutLabel {
     #[primary_span]
     pub span: Span,
     pub place: String,
@@ -187,7 +178,7 @@ pub(crate) struct CoroClosureNotFn {
 [normal] type annotations needed for `{$source_name}`
 *[other] type annotations needed
 }", code = E0282)]
-pub struct AnnotationRequired<'a> {
+pub(crate) struct AnnotationRequired<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -209,7 +200,7 @@ pub struct AnnotationRequired<'a> {
 [normal] type annotations needed for `{$source_name}`
 *[other] type annotations needed
 }", code = E0283)]
-pub struct AmbiguousImpl<'a> {
+pub(crate) struct AmbiguousImpl<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -231,7 +222,7 @@ pub struct AmbiguousImpl<'a> {
 [normal] type annotations needed for `{$source_name}`
 *[other] type annotations needed
 }", code = E0284)]
-pub struct AmbiguousReturn<'a> {
+pub(crate) struct AmbiguousReturn<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -261,7 +252,7 @@ pub struct AmbiguousReturn<'a> {
 }
 }"
 )]
-pub struct InferenceBadError<'a> {
+pub(crate) struct InferenceBadError<'a> {
     #[primary_span]
     pub span: Span,
     pub bad_kind: &'static str,
@@ -274,7 +265,7 @@ pub struct InferenceBadError<'a> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum SourceKindSubdiag<'a> {
+pub(crate) enum SourceKindSubdiag<'a> {
     #[suggestion(
         "{$kind ->
             [with_pattern] consider giving `{$name}` an explicit type
@@ -286,7 +277,8 @@ pub enum SourceKindSubdiag<'a> {
                 [const_with_param] value of const parameter
                 [const] value of the constant
             } `{$arg_name}` is specified
-            [underscore] , where the placeholders `_` are specified
+            [underscore_single] , where the placeholder `_` is specified
+            [underscore_multiple] , where the placeholders `_` are specified
             *[empty] {\"\"}
         }",
         style = "verbose",
@@ -340,10 +332,32 @@ pub enum SourceKindSubdiag<'a> {
         arg_count: usize,
         args: String,
     },
+    #[suggestion(
+        "consider specifying a concrete type for the type parameter `{$param}`",
+        style = "verbose",
+        code = "::</* Type */>",
+        applicability = "has-placeholders"
+    )]
+    GenericTypeSuggestion {
+        #[primary_span]
+        span: Span,
+        param: String,
+    },
+    #[suggestion(
+        "consider specifying a const for the const parameter `{$param}`",
+        style = "verbose",
+        code = "::</* CONST */>",
+        applicability = "has-placeholders"
+    )]
+    ConstGenericSuggestion {
+        #[primary_span]
+        span: Span,
+        param: String,
+    },
 }
 
 #[derive(Subdiagnostic)]
-pub enum SourceKindMultiSuggestion<'a> {
+pub(crate) enum SourceKindMultiSuggestion<'a> {
     #[multipart_suggestion(
         "try using a fully qualified path to specify the expected types",
         style = "verbose",
@@ -373,7 +387,7 @@ pub enum SourceKindMultiSuggestion<'a> {
 }
 
 impl<'a> SourceKindMultiSuggestion<'a> {
-    pub fn new_fully_qualified(
+    pub(crate) fn new_fully_qualified(
         span: Span,
         def_path: String,
         adjustment: &'a str,
@@ -388,7 +402,7 @@ impl<'a> SourceKindMultiSuggestion<'a> {
         }
     }
 
-    pub fn new_closure_return(
+    pub(crate) fn new_closure_return(
         ty_info: String,
         data: &'a FnRetTy<'a>,
         should_wrap_expr: Option<Span>,
@@ -405,7 +419,7 @@ impl<'a> SourceKindMultiSuggestion<'a> {
     }
 }
 
-pub enum RegionOriginNote<'a> {
+pub(crate) enum RegionOriginNote<'a> {
     Plain {
         span: Span,
         msg: DiagMessage,
@@ -442,9 +456,11 @@ impl Subdiagnostic for RegionOriginNote<'_> {
                 label_or_note(diag, span, msg);
             }
             RegionOriginNote::WithName { span, msg, name, continues } => {
-                diag.arg("name", name);
-                diag.arg("continues", continues);
-                label_or_note(diag, span, msg);
+                label_or_note(
+                    diag,
+                    span,
+                    msg.arg("name", name).arg("continues", continues).format(),
+                );
             }
             RegionOriginNote::WithRequirement {
                 span,
@@ -499,7 +515,7 @@ impl Subdiagnostic for RegionOriginNote<'_> {
     }
 }
 
-pub enum LifetimeMismatchLabels {
+pub(crate) enum LifetimeMismatchLabels {
     InRet {
         param_span: Span,
         ret_span: Span,
@@ -580,7 +596,7 @@ impl Subdiagnostic for LifetimeMismatchLabels {
     }
 }
 
-pub struct AddLifetimeParamsSuggestion<'a> {
+pub(crate) struct AddLifetimeParamsSuggestion<'a> {
     pub tcx: TyCtxt<'a>,
     pub generic_param_scope: LocalDefId,
     pub sub: Region<'a>,
@@ -607,7 +623,7 @@ impl Subdiagnostic for AddLifetimeParamsSuggestion<'_> {
                     match self.tcx.parent_hir_node(self.tcx.local_def_id_to_hir_id(anon_reg.scope))
                     {
                         hir::Node::Item(hir::Item {
-                            kind: hir::ItemKind::Trait(_, _, _, _, generics, ..),
+                            kind: hir::ItemKind::Trait { generics, .. },
                             ..
                         })
                         | hir::Node::Item(hir::Item {
@@ -760,7 +776,7 @@ impl Subdiagnostic for AddLifetimeParamsSuggestion<'_> {
 
 #[derive(Diagnostic)]
 #[diag("lifetime mismatch", code = E0623)]
-pub struct LifetimeMismatch<'a> {
+pub(crate) struct LifetimeMismatch<'a> {
     #[primary_span]
     pub span: Span,
     #[subdiagnostic]
@@ -769,7 +785,7 @@ pub struct LifetimeMismatch<'a> {
     pub suggestion: AddLifetimeParamsSuggestion<'a>,
 }
 
-pub struct IntroducesStaticBecauseUnmetLifetimeReq {
+pub(crate) struct IntroducesStaticBecauseUnmetLifetimeReq {
     pub unmet_requirements: MultiSpan,
     pub binding_span: Span,
 }
@@ -789,7 +805,7 @@ impl Subdiagnostic for IntroducesStaticBecauseUnmetLifetimeReq {
 
 // FIXME(#100717): replace with a `Option<Span>` when subdiagnostic supports that
 #[derive(Subdiagnostic)]
-pub enum DoesNotOutliveStaticFromImpl {
+pub(crate) enum DoesNotOutliveStaticFromImpl {
     #[note(
         "...does not necessarily outlive the static lifetime introduced by the compatible `impl`"
     )]
@@ -804,7 +820,7 @@ pub enum DoesNotOutliveStaticFromImpl {
 }
 
 #[derive(Subdiagnostic)]
-pub enum ImplicitStaticLifetimeSubdiag {
+pub(crate) enum ImplicitStaticLifetimeSubdiag {
     #[note("this has an implicit `'static` lifetime requirement")]
     Note {
         #[primary_span]
@@ -824,7 +840,7 @@ pub enum ImplicitStaticLifetimeSubdiag {
 
 #[derive(Diagnostic)]
 #[diag("incompatible lifetime on type")]
-pub struct MismatchedStaticLifetime<'a> {
+pub(crate) struct MismatchedStaticLifetime<'a> {
     #[primary_span]
     pub cause_span: Span,
     #[subdiagnostic]
@@ -838,7 +854,7 @@ pub struct MismatchedStaticLifetime<'a> {
 }
 
 #[derive(Diagnostic)]
-pub enum ExplicitLifetimeRequired<'a> {
+pub(crate) enum ExplicitLifetimeRequired<'a> {
     #[diag("explicit lifetime required in the type of `{$simple_ident}`", code = E0621)]
     WithIdent {
         #[primary_span]
@@ -852,9 +868,13 @@ pub enum ExplicitLifetimeRequired<'a> {
             applicability = "unspecified",
             style = "verbose"
         )]
-        new_ty_span: Span,
-        #[skip_arg]
+        new_ty_span: Option<Span>,
         new_ty: Ty<'a>,
+        #[help(
+            "see <https://doc.rust-lang.org/nomicon/borrow-splitting.html> \
+             for more information about lifetime errors related to mutable references"
+        )]
+        link_nomicon: bool,
     },
     #[diag("explicit lifetime required in parameter type", code = E0621)]
     WithParamType {
@@ -868,13 +888,17 @@ pub enum ExplicitLifetimeRequired<'a> {
             applicability = "unspecified",
             style = "verbose"
         )]
-        new_ty_span: Span,
-        #[skip_arg]
+        new_ty_span: Option<Span>,
         new_ty: Ty<'a>,
+        #[help(
+            "see <https://doc.rust-lang.org/nomicon/borrow-splitting.html> \
+             for more information about lifetime errors related to mutable references"
+        )]
+        link_nomicon: bool,
     },
 }
 
-pub enum TyOrSig<'tcx> {
+pub(crate) enum TyOrSig<'tcx> {
     Ty(Highlighted<'tcx, Ty<'tcx>>),
     ClosureSig(Highlighted<'tcx, Binder<'tcx, FnSig<'tcx>>>),
 }
@@ -889,7 +913,7 @@ impl IntoDiagArg for TyOrSig<'_> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum ActualImplExplNotes<'tcx> {
+pub(crate) enum ActualImplExplNotes<'tcx> {
     #[note("{$leading_ellipsis ->
         [true] ...
         *[false] {\"\"}
@@ -1057,13 +1081,13 @@ pub enum ActualImplExplNotes<'tcx> {
     },
 }
 
-pub enum ActualImplExpectedKind {
+pub(crate) enum ActualImplExpectedKind {
     Signature,
     Passive,
     Other,
 }
 
-pub enum ActualImplExpectedLifetimeKind {
+pub(crate) enum ActualImplExpectedLifetimeKind {
     Two,
     Any,
     Some,
@@ -1071,7 +1095,7 @@ pub enum ActualImplExpectedLifetimeKind {
 }
 
 impl<'tcx> ActualImplExplNotes<'tcx> {
-    pub fn new_expected(
+    pub(crate) fn new_expected(
         kind: ActualImplExpectedKind,
         lt_kind: ActualImplExpectedLifetimeKind,
         leading_ellipsis: bool,
@@ -1141,7 +1165,7 @@ impl<'tcx> ActualImplExplNotes<'tcx> {
 
 #[derive(Diagnostic)]
 #[diag("implementation of `{$trait_def_id}` is not general enough")]
-pub struct TraitPlaceholderMismatch<'tcx> {
+pub(crate) struct TraitPlaceholderMismatch<'tcx> {
     #[primary_span]
     pub span: Span,
     #[label("doesn't satisfy where-clause")]
@@ -1157,7 +1181,7 @@ pub struct TraitPlaceholderMismatch<'tcx> {
     pub actual_impl_expl_notes: Vec<ActualImplExplNotes<'tcx>>,
 }
 
-pub struct ConsiderBorrowingParamHelp {
+pub(crate) struct ConsiderBorrowingParamHelp {
     pub spans: Vec<Span>,
 }
 
@@ -1178,7 +1202,7 @@ impl Subdiagnostic for ConsiderBorrowingParamHelp {
 
 #[derive(Diagnostic)]
 #[diag("`impl` item signature doesn't match `trait` item signature")]
-pub struct TraitImplDiff {
+pub(crate) struct TraitImplDiff {
     #[primary_span]
     #[label("found `{$found}`")]
     pub sp: Span,
@@ -1199,60 +1223,6 @@ pub struct TraitImplDiff {
     pub found: String,
 }
 
-pub struct DynTraitConstraintSuggestion {
-    pub span: Span,
-    pub ident: Ident,
-}
-
-impl Subdiagnostic for DynTraitConstraintSuggestion {
-    fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
-        let mut multi_span: MultiSpan = vec![self.span].into();
-        multi_span.push_span_label(
-            self.span,
-            msg!("this has an implicit `'static` lifetime requirement"),
-        );
-        multi_span.push_span_label(
-            self.ident.span,
-            msg!("calling this method introduces the `impl`'s `'static` requirement"),
-        );
-        let msg = msg!("the used `impl` has a `'static` requirement");
-        diag.span_note(multi_span, msg);
-        let msg = msg!("consider relaxing the implicit `'static` requirement");
-        diag.span_suggestion_verbose(
-            self.span.shrink_to_hi(),
-            msg,
-            " + '_",
-            Applicability::MaybeIncorrect,
-        );
-    }
-}
-
-pub struct ReqIntroducedLocations {
-    pub span: MultiSpan,
-    pub spans: Vec<Span>,
-    pub fn_decl_span: Span,
-    pub cause_span: Span,
-    pub add_label: bool,
-}
-
-impl Subdiagnostic for ReqIntroducedLocations {
-    fn add_to_diag<G: EmissionGuarantee>(mut self, diag: &mut Diag<'_, G>) {
-        for sp in self.spans {
-            self.span.push_span_label(sp, msg!("`'static` requirement introduced here"));
-        }
-
-        if self.add_label {
-            self.span.push_span_label(
-                self.fn_decl_span,
-                msg!("requirement introduced by this return type"),
-            );
-        }
-        self.span.push_span_label(self.cause_span, msg!("because of this returned expression"));
-        let msg = msg!("\"`'static` lifetime requirement introduced by the return type");
-        diag.span_note(self.span, msg);
-    }
-}
-
 #[derive(Diagnostic)]
 #[diag("{$has_param_name ->
     [true] `{$param_name}`
@@ -1261,7 +1231,7 @@ impl Subdiagnostic for ReqIntroducedLocations {
     [true] lifetime `{$lifetime}`
     *[false] an anonymous lifetime `'_`
 } but it needs to satisfy a `'static` lifetime requirement", code = E0759)]
-pub struct ButNeedsToSatisfy {
+pub(crate) struct ButNeedsToSatisfy {
     #[primary_span]
     pub sp: Span,
     #[label(
@@ -1299,7 +1269,7 @@ pub struct ButNeedsToSatisfy {
 
 #[derive(Diagnostic)]
 #[diag("lifetime of reference outlives lifetime of borrowed content...", code = E0312)]
-pub struct OutlivesContent<'a> {
+pub(crate) struct OutlivesContent<'a> {
     #[primary_span]
     pub span: Span,
     #[subdiagnostic]
@@ -1308,7 +1278,7 @@ pub struct OutlivesContent<'a> {
 
 #[derive(Diagnostic)]
 #[diag("lifetime of the source pointer does not outlive lifetime bound of the object type", code = E0476)]
-pub struct OutlivesBound<'a> {
+pub(crate) struct OutlivesBound<'a> {
     #[primary_span]
     pub span: Span,
     #[subdiagnostic]
@@ -1317,7 +1287,7 @@ pub struct OutlivesBound<'a> {
 
 #[derive(Diagnostic)]
 #[diag("the type `{$ty}` does not fulfill the required lifetime", code = E0477)]
-pub struct FulfillReqLifetime<'a> {
+pub(crate) struct FulfillReqLifetime<'a> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'a>,
@@ -1327,7 +1297,7 @@ pub struct FulfillReqLifetime<'a> {
 
 #[derive(Diagnostic)]
 #[diag("lifetime bound not satisfied", code = E0478)]
-pub struct LfBoundNotSatisfied<'a> {
+pub(crate) struct LfBoundNotSatisfied<'a> {
     #[primary_span]
     pub span: Span,
     #[subdiagnostic]
@@ -1336,7 +1306,7 @@ pub struct LfBoundNotSatisfied<'a> {
 
 #[derive(Diagnostic)]
 #[diag("in type `{$ty}`, reference has a longer lifetime than the data it references", code = E0491)]
-pub struct RefLongerThanData<'a> {
+pub(crate) struct RefLongerThanData<'a> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'a>,
@@ -1345,7 +1315,7 @@ pub struct RefLongerThanData<'a> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum WhereClauseSuggestions {
+pub(crate) enum WhereClauseSuggestions {
     #[suggestion(
         "remove the `where` clause",
         code = "",
@@ -1371,7 +1341,7 @@ pub enum WhereClauseSuggestions {
 }
 
 #[derive(Subdiagnostic)]
-pub enum SuggestRemoveSemiOrReturnBinding {
+pub(crate) enum SuggestRemoveSemiOrReturnBinding {
     #[multipart_suggestion(
         "consider removing this semicolon and boxing the expressions",
         applicability = "machine-applicable"
@@ -1418,7 +1388,7 @@ pub enum SuggestRemoveSemiOrReturnBinding {
 }
 
 #[derive(Subdiagnostic)]
-pub enum ConsiderAddingAwait {
+pub(crate) enum ConsiderAddingAwait {
     #[help("consider `await`ing on both `Future`s")]
     BothFuturesHelp,
     #[multipart_suggestion(
@@ -1458,7 +1428,7 @@ pub enum ConsiderAddingAwait {
 }
 
 #[derive(Diagnostic)]
-pub enum PlaceholderRelationLfNotSatisfied {
+pub(crate) enum PlaceholderRelationLfNotSatisfied {
     #[diag("lifetime bound not satisfied")]
     HasBoth {
         #[primary_span]
@@ -1528,7 +1498,7 @@ pub enum PlaceholderRelationLfNotSatisfied {
 
 #[derive(Diagnostic)]
 #[diag("hidden type for `{$opaque_ty}` captures lifetime that does not appear in bounds", code = E0700)]
-pub struct OpaqueCapturesLifetime<'tcx> {
+pub(crate) struct OpaqueCapturesLifetime<'tcx> {
     #[primary_span]
     pub span: Span,
     #[label("opaque type defined here")]
@@ -1537,7 +1507,7 @@ pub struct OpaqueCapturesLifetime<'tcx> {
 }
 
 #[derive(Subdiagnostic)]
-pub enum FunctionPointerSuggestion<'a> {
+pub(crate) enum FunctionPointerSuggestion<'a> {
     #[suggestion(
         "consider using a reference",
         code = "&",
@@ -1557,7 +1527,6 @@ pub enum FunctionPointerSuggestion<'a> {
     RemoveRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
     },
     #[suggestion(
@@ -1569,9 +1538,7 @@ pub enum FunctionPointerSuggestion<'a> {
     CastRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
-        #[skip_arg]
         sig: Binder<'a, FnSig<'a>>,
     },
     #[suggestion(
@@ -1583,7 +1550,6 @@ pub enum FunctionPointerSuggestion<'a> {
     Cast {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         sig: Binder<'a, FnSig<'a>>,
     },
     #[suggestion(
@@ -1595,7 +1561,6 @@ pub enum FunctionPointerSuggestion<'a> {
     CastBoth {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         found_sig: Binder<'a, FnSig<'a>>,
         expected_sig: Binder<'a, FnSig<'a>>,
     },
@@ -1608,9 +1573,7 @@ pub enum FunctionPointerSuggestion<'a> {
     CastBothRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
-        #[skip_arg]
         found_sig: Binder<'a, FnSig<'a>>,
         expected_sig: Binder<'a, FnSig<'a>>,
     },
@@ -1618,26 +1581,26 @@ pub enum FunctionPointerSuggestion<'a> {
 
 #[derive(Subdiagnostic)]
 #[note("fn items are distinct from fn pointers")]
-pub struct FnItemsAreDistinct;
+pub(crate) struct FnItemsAreDistinct;
 
 #[derive(Subdiagnostic)]
 #[note("different fn items have unique types, even if their signatures are the same")]
-pub struct FnUniqTypes;
+pub(crate) struct FnUniqTypes;
 
 #[derive(Subdiagnostic)]
 #[help("consider casting the fn item to a fn pointer: `{$casting}`")]
-pub struct FnConsiderCasting {
+pub(crate) struct FnConsiderCasting {
     pub casting: String,
 }
 
 #[derive(Subdiagnostic)]
 #[help("consider casting both fn items to fn pointers using `as {$sig}`")]
-pub struct FnConsiderCastingBoth<'a> {
+pub(crate) struct FnConsiderCastingBoth<'a> {
     pub sig: Binder<'a, FnSig<'a>>,
 }
 
 #[derive(Subdiagnostic)]
-pub enum SuggestAccessingField<'a> {
+pub(crate) enum SuggestAccessingField<'a> {
     #[suggestion(
         "you might have meant to use field `{$name}` whose type is `{$ty}`",
         code = "{snippet}.{name}",
@@ -1671,7 +1634,7 @@ pub enum SuggestAccessingField<'a> {
     "try wrapping the pattern in `{$variant}`",
     applicability = "maybe-incorrect"
 )]
-pub struct SuggestTuplePatternOne {
+pub(crate) struct SuggestTuplePatternOne {
     pub variant: String,
     #[suggestion_part(code = "{variant}(")]
     pub span_low: Span,
@@ -1679,7 +1642,7 @@ pub struct SuggestTuplePatternOne {
     pub span_high: Span,
 }
 
-pub struct SuggestTuplePatternMany {
+pub(crate) struct SuggestTuplePatternMany {
     pub path: String,
     pub cause_span: Span,
     pub compatible_variants: Vec<String>,
@@ -1897,7 +1860,7 @@ pub enum ObligationCauseFailureCode {
 }
 
 #[derive(Subdiagnostic)]
-pub enum AddPreciseCapturing {
+pub(crate) enum AddPreciseCapturing {
     #[suggestion(
         "add a `use<...>` bound to explicitly capture `{$new_lifetime}`",
         style = "verbose",
@@ -1925,7 +1888,7 @@ pub enum AddPreciseCapturing {
     },
 }
 
-pub struct AddPreciseCapturingAndParams {
+pub(crate) struct AddPreciseCapturingAndParams {
     pub suggs: Vec<(Span, String)>,
     pub new_lifetime: Symbol,
     pub apit_spans: Vec<Span>,

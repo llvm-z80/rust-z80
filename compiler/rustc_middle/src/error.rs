@@ -36,23 +36,8 @@ pub(crate) struct OpaqueHiddenTypeMismatch<'tcx> {
     pub sub: TypeMismatchReason,
 }
 
-#[derive(Diagnostic)]
-#[diag("we don't support unions yet: '{$ty_name}'")]
-pub struct UnsupportedUnion {
-    pub ty_name: String,
-}
-
-// FIXME(autodiff): I should get used somewhere
-#[derive(Diagnostic)]
-#[diag("reading from a `Duplicated` const {$ty} is unsafe")]
-pub struct AutodiffUnsafeInnerConstRef<'tcx> {
-    #[primary_span]
-    pub span: Span,
-    pub ty: Ty<'tcx>,
-}
-
 #[derive(Subdiagnostic)]
-pub enum TypeMismatchReason {
+pub(crate) enum TypeMismatchReason {
     #[label("this expression supplies two conflicting concrete types for the same opaque type")]
     ConflictType {
         #[primary_span]
@@ -71,6 +56,18 @@ pub enum TypeMismatchReason {
     "consider increasing the recursion limit by adding a `#![recursion_limit = \"{$suggested_limit}\"]`"
 )]
 pub(crate) struct RecursionLimitReached<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    pub suggested_limit: rustc_hir::limit::Limit,
+}
+
+#[derive(Diagnostic)]
+#[diag("reached the recursion limit while computing the size of `{$ty}`")]
+#[help(
+    "consider increasing the recursion limit by adding a `#![recursion_limit = \"{$suggested_limit}\"]`"
+)]
+pub(crate) struct RecursionLimitReachedSizeSkeleton<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
@@ -158,7 +155,7 @@ pub(crate) struct Reentrant;
 #[note(
     "an ideal reproduction consists of the code before and some patch that then triggers the bug when applied and compiled again"
 )]
-#[note("as a workaround, you can run {$run_cmd} to allow your project to compile")]
+#[note("as a workaround, you can {$run_cmd} to allow your project to compile")]
 pub(crate) struct IncrementCompilation {
     pub run_cmd: String,
     pub dep_node: String,

@@ -7,6 +7,7 @@ use rustc_ast::util::parser::ExprPrecedence;
 use rustc_data_structures::packed::Pu128;
 use rustc_errors::{Applicability, Diag, MultiSpan, listify, msg};
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
+use rustc_hir::intravisit::Visitor;
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{
     self as hir, Arm, CoroutineDesugaring, CoroutineKind, CoroutineSource, Expr, ExprKind,
@@ -17,22 +18,23 @@ use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_hir_analysis::suggest_impl_trait;
 use rustc_middle::middle::stability::EvalResult;
 use rustc_middle::span_bug;
-use rustc_middle::ty::print::with_no_trimmed_paths;
+use rustc_middle::ty::print::{with_no_trimmed_paths, with_types_for_suggestion};
 use rustc_middle::ty::{
-    self, Article, Binder, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Upcast,
+    self, Article, Binder, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
     suggest_constraining_type_params,
 };
 use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::{ExpnKind, Ident, MacroKind, Span, Spanned, Symbol, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::error_reporting::traits::DefIdOrName;
+use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use tracing::{debug, instrument};
 
 use super::FnCtxt;
-use crate::errors;
+use crate::errors::{self, SuggestBoxingForReturnImplTrait};
 use crate::fn_ctxt::rustc_span::BytePos;
 use crate::method::probe;
 use crate::method::probe::{IsSuggestion, Mode, ProbeScope};
@@ -246,6 +248,74 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         } else {
             false
         }
+    }
+
+    /// Suggests calling `.collect()` on an `Iterator` it can be collected in the return type
+    /// ```compile_fail
+    /// let x: String = "foo".chars().map(|c| c); // with a .collect() here the code compiles
+    /// ```
+    pub(crate) fn suggest_collect(
+        &self,
+        err: &mut Diag<'_>,
+        expr: &hir::Expr<'_>,
+        expected_type: Ty<'tcx>,
+        found_type: Ty<'tcx>,
+    ) -> bool {
+        let tcx = self.tcx;
+        let expected = self.resolve_vars_if_possible(expected_type);
+        let found = self.resolve_vars_if_possible(found_type);
+
+        if expected.references_error() || found.references_error() || expected.is_unit() {
+            return false;
+        }
+
+        let Some(iterator_trait_id) = tcx.get_diagnostic_item(sym::Iterator) else {
+            return false;
+        };
+
+        if !self
+            .infcx
+            .type_implements_trait(iterator_trait_id, [found], self.param_env)
+            .must_apply_modulo_regions()
+        {
+            return false;
+        }
+
+        let Some(from_iterator_trait_id) = tcx.get_diagnostic_item(sym::FromIterator) else {
+            return false;
+        };
+
+        let Some(iterator_item_id) = tcx
+            .associated_items(iterator_trait_id)
+            .in_definition_order()
+            .find(|item| item.name() == sym::Item)
+            .map(|item| item.def_id)
+        else {
+            return false;
+        };
+
+        let item_type = Ty::new_projection(tcx, iterator_item_id, [found]);
+        let item_type =
+            self.normalize(expr.span, rustc_middle::ty::Unnormalized::new_wip(item_type));
+
+        let can_collect = self
+            .infcx
+            .type_implements_trait(from_iterator_trait_id, [expected, item_type], self.param_env)
+            .may_apply();
+
+        if can_collect {
+            err.span_suggestion_verbose(
+                expr.span.shrink_to_hi(),
+                format!(
+                    "consider using `.collect()` to convert the `Iterator` into a `{expected}`"
+                ),
+                ".collect()",
+                rustc_errors::Applicability::MaybeIncorrect,
+            );
+            return true;
+        }
+
+        false
     }
 
     pub(crate) fn suggest_remove_last_method_call(
@@ -797,14 +867,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     && let hir::StmtKind::Expr(_) = stmt.kind
                     && self.is_next_stmt_expr_continuation(stmt.hir_id)
                 {
-                    err.multipart_suggestion(
-                        "parentheses are required to parse this as an expression",
-                        vec![
-                            (stmt.span.shrink_to_lo(), "(".to_string()),
-                            (stmt.span.shrink_to_hi(), ")".to_string()),
-                        ],
-                        Applicability::MachineApplicable,
-                    );
+                    err.subdiagnostic(ExprParenthesesNeeded::surrounding(stmt.span));
                 } else {
                     err.span_suggestion(
                         expression.span.shrink_to_hi(),
@@ -841,14 +904,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // wrapping in parentheses. We find the statement or expression following the
                     // `if` (`&& true`) and see if it is something that can reasonably be
                     // interpreted as a binop following an expression.
-                    err.multipart_suggestion(
-                        "parentheses are required to parse this as an expression",
-                        vec![
-                            (stmt.span.shrink_to_lo(), "(".to_string()),
-                            (stmt.span.shrink_to_hi(), ")".to_string()),
-                        ],
-                        Applicability::MachineApplicable,
-                    );
+                    err.subdiagnostic(ExprParenthesesNeeded::surrounding(stmt.span));
                 }
             }
         }
@@ -931,6 +987,76 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             hir::FnRetTy::Return(hir_ty) => {
                 if let hir::TyKind::OpaqueDef(op_ty, ..) = hir_ty.kind
+                    && let [hir::GenericBound::Trait(trait_ref)] = op_ty.bounds
+                    && !trait_ref
+                        .trait_ref
+                        .path
+                        .segments
+                        .last()
+                        .and_then(|seg| seg.args)
+                        .map_or(false, |args| !args.constraints.is_empty())
+                {
+                    // Use the path to get the trait name string
+                    let trait_name = trait_ref
+                        .trait_ref
+                        .path
+                        .segments
+                        .iter()
+                        .map(|seg| seg.ident.as_str())
+                        .collect::<Vec<_>>()
+                        .join("::");
+
+                    err.subdiagnostic(errors::ExpectedReturnTypeLabel::ImplTrait {
+                        span: hir_ty.span,
+                        trait_name,
+                    });
+
+                    if let Some(ret_coercion_span) = self.ret_coercion_span.get() {
+                        let expected_name = expected.to_string();
+                        err.span_label(
+                            ret_coercion_span,
+                            format!("return type resolved to be `{expected_name}`"),
+                        );
+                    }
+
+                    let trait_def_id = trait_ref.trait_ref.path.res.def_id();
+                    if self.tcx.is_dyn_compatible(trait_def_id) {
+                        err.subdiagnostic(SuggestBoxingForReturnImplTrait::ChangeReturnType {
+                            start_sp: hir_ty.span.with_hi(hir_ty.span.lo() + BytePos(4)),
+                            end_sp: hir_ty.span.shrink_to_hi(),
+                        });
+
+                        let body = self.tcx.hir_body_owned_by(fn_id);
+                        let mut visitor = ReturnsVisitor::default();
+                        visitor.visit_body(&body);
+
+                        if !visitor.returns.is_empty() {
+                            let starts: Vec<Span> = visitor
+                                .returns
+                                .iter()
+                                .filter(|expr| expr.span.can_be_used_for_suggestions())
+                                .map(|expr| expr.span.shrink_to_lo())
+                                .collect();
+                            let ends: Vec<Span> = visitor
+                                .returns
+                                .iter()
+                                .filter(|expr| expr.span.can_be_used_for_suggestions())
+                                .map(|expr| expr.span.shrink_to_hi())
+                                .collect();
+
+                            if !starts.is_empty() {
+                                err.subdiagnostic(SuggestBoxingForReturnImplTrait::BoxReturnExpr {
+                                    starts,
+                                    ends,
+                                });
+                            }
+                        }
+                    }
+
+                    self.try_suggest_return_impl_trait(err, expected, found, fn_id);
+                    self.try_note_caller_chooses_ty_for_ty_param(err, expected, found);
+                    return true;
+                } else if let hir::TyKind::OpaqueDef(op_ty, ..) = hir_ty.kind
                     // FIXME: account for RPITIT.
                     && let [hir::GenericBound::Trait(trait_ref)] = op_ty.bounds
                     && let Some(hir::PathSegment { args: Some(generic_args), .. }) =
@@ -965,7 +1091,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let bound_vars =
                         self.tcx.late_bound_vars(self.tcx.local_def_id_to_hir_id(fn_id));
                     let ty = Binder::bind_with_vars(ty, bound_vars);
-                    let ty = self.normalize(hir_ty.span, ty);
+                    let ty = self.normalize(hir_ty.span, Unnormalized::new_wip(ty));
                     let ty = self.tcx.instantiate_bound_regions_with_erased(ty);
                     if self.may_coerce(expected, ty) {
                         err.subdiagnostic(errors::ExpectedReturnTypeLabel::Other {
@@ -1231,7 +1357,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                     ty::Asyncness::No => ty,
                 };
-                let ty = self.normalize(expr.span, ty);
+                let ty = self.normalize(expr.span, Unnormalized::new_wip(ty));
                 self.may_coerce(found, ty)
             }
             hir::FnRetTy::DefaultReturn(_) if in_closure => {
@@ -1839,7 +1965,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // Same item
             return false;
         }
-        let item_ty = self.tcx.type_of(item.def_id).instantiate_identity();
+        let item_ty = self.tcx.type_of(item.def_id).instantiate_identity().skip_norm_wip();
         // FIXME(compiler-errors): This check is *so* rudimentary
         if item_ty.has_param() {
             return false;
@@ -2534,7 +2660,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // suggestions would be often wrong. So suppress the suggestion. See #145294.
                     if let (ty::Adt(exp_adt, _), ty::Adt(act_adt, _)) = (expected.kind(), expr_ty.kind())
                         && exp_adt.did() == act_adt.did()
-                        && sole_field.ty(self.tcx, args).is_ty_var() {
+                        && sole_field.ty(self.tcx, args).skip_norm_wip().is_ty_var() {
                             return None;
                     }
 
@@ -2551,10 +2677,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let note_about_variant_field_privacy = (field_is_local && !field_is_accessible)
                         .then(|| " (its field is private, but it's local to this crate and its privacy can be changed)".to_string());
 
-                    let sole_field_ty = sole_field.ty(self.tcx, args);
+                    let sole_field_ty = sole_field.ty(self.tcx, args).skip_norm_wip();
                     if self.may_coerce(expr_ty, sole_field_ty) {
-                        let variant_path =
-                            with_no_trimmed_paths!(self.tcx.def_path_str(variant.def_id));
+                        let variant_path = with_types_for_suggestion!(with_no_trimmed_paths!(
+                            self.tcx.def_path_str(variant.def_id)
+                        ));
                         // FIXME #56861: DRYer prelude filtering
                         if let Some(path) = variant_path.strip_prefix("std::prelude::")
                             && let Some((_, path)) = path.split_once("::")
@@ -2581,12 +2708,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     Some(CtorKind::Const) => unreachable!("unit variants don't have fields"),
                 };
 
-                // Suggest constructor as deep into the block tree as possible.
-                // This fixes https://github.com/rust-lang/rust/issues/101065,
-                // and also just helps make the most minimal suggestions.
+                // Suggest constructor as deep into the block tree as possible,
+                // but don't cross macro contexts. This fixes #101065 while
+                // keeping suggestions out of macro definitions (#142359).
                 let mut expr = expr;
                 while let hir::ExprKind::Block(block, _) = &expr.kind
                     && let Some(expr_) = &block.expr
+                    && expr_.span.eq_ctxt(expr.span)
                 {
                     expr = expr_
                 }
@@ -2729,7 +2857,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return None;
         };
 
-        let self_ty = self.typeck_results.borrow().expr_ty(receiver);
+        let self_ty = self.typeck_results.borrow().expr_ty_opt(receiver)?;
         let name = method_path.ident.name;
         let is_as_ref_able = match self_ty.peel_refs().kind() {
             ty::Adt(def, _) => {
@@ -3107,14 +3235,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     {
                         let deref_kind = if checked_ty.is_box() {
                             // detect Box::new(..)
-                            // FIXME: use `box_new` diagnostic item instead?
                             if let ExprKind::Call(box_new, [_]) = expr.kind
                                 && let ExprKind::Path(qpath) = &box_new.kind
                                 && let Res::Def(DefKind::AssocFn, fn_id) =
                                     self.typeck_results.borrow().qpath_res(qpath, box_new.hir_id)
-                                && let Some(impl_id) = self.tcx.inherent_impl_of_assoc(fn_id)
-                                && self.tcx.type_of(impl_id).skip_binder().is_box()
-                                && self.tcx.item_name(fn_id) == sym::new
+                                && self.tcx.is_diagnostic_item(sym::box_new, fn_id)
                             {
                                 let l_paren = self.tcx.sess.source_map().next_point(box_new.span);
                                 let r_paren = self.tcx.sess.source_map().end_point(expr.span);

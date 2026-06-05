@@ -275,8 +275,8 @@ fn get_lint_file_contents(lint: &LintData<'_>, enable_msrv: bool) -> String {
         let _: fmt::Result = writedoc!(
             result,
             r"
-            use clippy_utils::msrvs::{{self, {msrv_ty}}};
             use clippy_config::Conf;
+            use clippy_utils::msrvs::{{self, {msrv_ty}}};
             {pass_import}
             use rustc_lint::{{{context_import}, {pass_type}}};
             use rustc_session::impl_lint_pass;
@@ -319,7 +319,7 @@ fn get_lint_file_contents(lint: &LintData<'_>, enable_msrv: bool) -> String {
 
             impl {pass_type}{pass_lifetimes} for {name_camel} {{{extract_msrv}}}
 
-            // TODO: Add MSRV level to `clippy_config/src/msrvs.rs` if needed.
+            // TODO: Add MSRV level to `clippy_utils/src/msrvs.rs` if needed.
             // TODO: Update msrv config comment in `clippy_config/src/conf.rs`
         "
         );
@@ -502,7 +502,7 @@ fn setup_mod_file(path: &Path, lint: &LintData<'_>) -> io::Result<&'static str> 
     file_contents.replace_range(arr_start + 1..arr_end, &new_arr_content);
 
     // Just add the mod declaration at the top, it'll be fixed by rustfmt
-    file_contents.insert_str(0, &format!("mod {};\n", &lint.name));
+    file_contents.insert_str(0, &format!("mod {};\n", lint.name));
 
     let mut file = OpenOptions::new()
         .write(true)

@@ -15,6 +15,7 @@ use rustc_proc_macro::bridge::{
     DelimSpan, Diagnostic, ExpnGlobals, Group, Ident, LitKind, Literal, Punct, TokenTree, server,
 };
 use rustc_proc_macro::{Delimiter, Level};
+use rustc_session::Session;
 use rustc_session::parse::ParseSess;
 use rustc_span::def_id::CrateNum;
 use rustc_span::{BytePos, FileName, Pos, Span, Symbol, sym};
@@ -110,26 +111,22 @@ impl FromInternal<TokenStream> for Vec<TokenTree<TokenStream, Span, Symbol>> {
         // Estimate the capacity as `stream.len()` rounded up to the next power
         // of two to limit the number of required reallocations.
         let mut trees = Vec::with_capacity(stream.len().next_power_of_two());
-        let mut iter = stream.iter();
 
-        while let Some(tree) = iter.next() {
+        for tree in stream.iter() {
             let (Token { kind, span }, joint) = match tree.clone() {
                 tokenstream::TokenTree::Delimited(span, _, mut delim, mut stream) => {
                     // In `mk_delimited` we avoid nesting invisible delimited
                     // of the same `MetaVarKind`. Here we do the same but
                     // ignore the `MetaVarKind` because it is discarded when we
                     // convert it to a `Group`.
-                    while let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim {
-                        if stream.len() == 1
-                            && let tree = stream.iter().next().unwrap()
-                            && let tokenstream::TokenTree::Delimited(_, _, delim2, stream2) = tree
-                            && let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim2
-                        {
-                            delim = *delim2;
-                            stream = stream2.clone();
-                        } else {
-                            break;
-                        }
+                    while let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim
+                        && stream.len() == 1
+                        && let tree = stream.get(0).unwrap()
+                        && let tokenstream::TokenTree::Delimited(_, _, delim2, stream2) = tree
+                        && let Delimiter::Invisible(InvisibleOrigin::MetaVar(_)) = delim2
+                    {
+                        delim = *delim2;
+                        stream = stream2.clone();
                     }
 
                     trees.push(TokenTree::Group(Group {
@@ -442,6 +439,10 @@ impl<'a, 'b> Rustc<'a, 'b> {
             rebased_spans: FxHashMap::default(),
             ecx,
         }
+    }
+
+    fn sess(&self) -> &Session {
+        &self.ecx.sess
     }
 
     fn psess(&self) -> &ParseSess {
@@ -829,7 +830,7 @@ impl server::Server for Rustc<'_, '_> {
     /// since we've loaded `my_proc_macro` from disk in order to execute it).
     /// In this way, we have obtained a span pointing into `my_proc_macro`
     fn span_save_span(&mut self, span: Self::Span) -> usize {
-        self.psess().save_proc_macro_span(span)
+        self.sess().save_proc_macro_span(span)
     }
 
     fn span_recover_proc_macro_span(&mut self, id: usize) -> Self::Span {

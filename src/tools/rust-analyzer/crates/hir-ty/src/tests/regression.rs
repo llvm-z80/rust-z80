@@ -2,6 +2,8 @@ mod new_solver;
 
 use expect_test::expect;
 
+use crate::tests::check;
+
 use super::{check_infer, check_no_mismatches, check_types};
 
 #[test]
@@ -1956,7 +1958,7 @@ fn main() {
     Alias::Braced;
   //^^^^^^^^^^^^^ {unknown}
     let Alias::Braced = loop {};
-      //^^^^^^^^^^^^^ !
+      //^^^^^^^^^^^^^ {unknown}
   let Alias::Braced(..) = loop {};
     //^^^^^^^^^^^^^^^^^ Enum
 
@@ -2013,18 +2015,20 @@ where
 
 #[test]
 fn tait_async_stack_overflow_17199() {
-    check_types(
+    // The error here is because we don't support TAITs.
+    check(
         r#"
     //- minicore: fmt, future
     type Foo = impl core::fmt::Debug;
 
     async fn foo() -> Foo {
         ()
+     // ^^ expected impl Debug, got ()
     }
 
     async fn test() {
         let t = foo().await;
-         // ^ impl Debug
+         // ^ type: impl Debug
     }
 "#,
     );
@@ -2234,7 +2238,7 @@ type Bar = impl Foo;
 async fn f<A, B, C>() -> Bar {}
 "#,
         expect![[r#"
-            64..66 '{}': ()
+            64..66 '{}': impl Foo + ?Sized
         "#]],
     );
 }
@@ -2754,7 +2758,6 @@ where
             664..680 'filter...ter_fn': dyn Fn(&'? T) -> bool + 'static
             691..698 'loop {}': !
             696..698 '{}': ()
-            512..513 'N': usize
         "#]],
     );
 }
@@ -2839,5 +2842,76 @@ fn wrapped_abs<T: SelfAbs<Output = T>>(v: T) -> T {
     v.abs()
 }
     "#,
+    );
+}
+
+#[test]
+fn regression_21899() {
+    check_no_mismatches(
+        r#"
+trait B where
+    Self::T: B,
+{
+    type T;
+}
+
+fn foo<T: B>(v: T::T) {}
+    "#,
+    );
+}
+
+#[test]
+fn regression_22007() {
+    check_types(
+        r#"
+//- minicore: fn
+trait Super {
+    type Assoc;
+    fn foo(self) -> Self::Assoc
+    where
+        Self: Sub,
+    { loop {} }
+}
+trait Sub: Super {}
+
+struct Struct;
+impl Super for Struct {
+    type Assoc = u8;
+}
+impl Sub for Struct {}
+
+fn foo() {
+    Struct.foo();
+ // ^^^^^^^^^^^^ u8
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21885() {
+    check_no_mismatches(
+        r#"
+//- minicore: coerce_unsized, future, result
+use core::future::Future;
+
+trait Foo {
+    type Assoc;
+
+    fn foo() -> &dyn Future<Output = Result<Self::Assoc, ()>>;
+}
+
+struct Bar;
+
+impl Foo for Bar {
+    type Assoc = NotFound;
+
+    fn foo() -> &dyn Future<Output = Result<Self::Assoc, ()>> {
+        &async {
+            Err(())
+        }
+    }
+}
+"#,
     );
 }

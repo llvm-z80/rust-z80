@@ -11,7 +11,9 @@ use rustc_hir::{MatchSource, Node};
 use rustc_middle::traits::{MatchExpressionArmCause, ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self as ty, GenericArgKind, IsSuggestable, Ty, TypeVisitableExt};
+use rustc_middle::ty::{
+    self as ty, GenericArgKind, IsSuggestable, Ty, TypeVisitableExt, Unnormalized,
+};
 use rustc_span::{Span, sym};
 use tracing::debug;
 
@@ -102,7 +104,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 })
                 .filter_map(|variant| {
                     let sole_field = &variant.single_field();
-                    let sole_field_ty = sole_field.ty(self.tcx, args);
+                    let sole_field_ty = sole_field.ty(self.tcx, args).skip_norm_wip();
                     if self.same_type_modulo_infer(sole_field_ty, exp_found.found) {
                         let variant_path =
                             with_no_trimmed_paths!(self.tcx.def_path_str(variant.def_id));
@@ -207,7 +209,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                         second: exp_span.shrink_to_hi(),
                     })
                 }
-                ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
+                ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
                     prior_non_diverging_arms,
                     ..
                 }) => {
@@ -246,7 +248,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                     let then_span = self.find_block_span_from_hir_id(then_expr.hir_id);
                     Some(ConsiderAddingAwait::FutureSugg { span: then_span.shrink_to_hi() })
                 }
-                ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
+                ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
                     prior_non_diverging_arms,
                     ..
                 }) => Some({
@@ -286,7 +288,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 .fields
                 .iter()
                 .filter(|field| field.vis.is_accessible_from(field.did, self.tcx))
-                .map(|field| (field.name, field.ty(self.tcx, expected_args)))
+                .map(|field| (field.name, field.ty(self.tcx, expected_args).skip_norm_wip()))
                 .find(|(_, ty)| self.same_type_modulo_infer(*ty, exp_found.found))
                 && let ObligationCauseCode::Pattern { span: Some(span), .. } = *cause.code()
                 && let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(span)
@@ -410,7 +412,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         match (expected_inner.kind(), found_inner.kind()) {
             (ty::FnPtr(sig_tys, hdr), ty::FnDef(did, args)) => {
                 let sig = sig_tys.with(*hdr);
-                let expected_sig = &(self.normalize_fn_sig)(sig);
+                let expected_sig = &(self.normalize_fn_sig)(Unnormalized::new_wip(sig));
                 let found_sig =
                     &(self.normalize_fn_sig)(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
 
@@ -492,7 +494,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             (ty::FnDef(did, args), ty::FnPtr(sig_tys, hdr)) => {
                 let expected_sig =
                     &(self.normalize_fn_sig)(self.tcx.fn_sig(*did).instantiate(self.tcx, args));
-                let found_sig = &(self.normalize_fn_sig)(sig_tys.with(*hdr));
+                let found_sig = &(self.normalize_fn_sig)(Unnormalized::new_wip(sig_tys.with(*hdr)));
 
                 if !self.same_type_modulo_infer(*found_sig, *expected_sig) {
                     return;
@@ -767,12 +769,20 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 StatementAsExpression::CorrectType
             }
             (
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: last_def_id, .. }),
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: exp_def_id, .. }),
+                ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: last_def_id }, .. }),
+                ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: exp_def_id }, .. }),
             ) if last_def_id == exp_def_id => StatementAsExpression::CorrectType,
             (
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: last_def_id, args: last_bounds, .. }),
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: exp_def_id, args: exp_bounds, .. }),
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Opaque { def_id: last_def_id },
+                    args: last_bounds,
+                    ..
+                }),
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Opaque { def_id: exp_def_id },
+                    args: exp_bounds,
+                    ..
+                }),
             ) => {
                 debug!(
                     "both opaque, likely future {:?} {:?} {:?} {:?}",

@@ -11,7 +11,7 @@ use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
-use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt as _};
+use rustc_next_trait_solver::solve::{GoalEvaluation, MaybeInfo, SolverDelegateEvalExt as _};
 use tracing::{instrument, trace};
 
 use crate::solve::delegate::SolverDelegate;
@@ -34,9 +34,11 @@ pub(super) fn fulfillment_error_for_no_solution<'tcx>(
         }
         ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, expected_ty)) => {
             let ct_ty = match ct.kind() {
-                ty::ConstKind::Unevaluated(uv) => {
-                    infcx.tcx.type_of(uv.def).instantiate(infcx.tcx, uv.args)
-                }
+                ty::ConstKind::Unevaluated(uv) => infcx
+                    .tcx
+                    .type_of(uv.kind.def_id())
+                    .instantiate(infcx.tcx, uv.args)
+                    .skip_norm_wip(),
                 ty::ConstKind::Param(param_ct) => {
                     param_ct.find_const_ty_from_env(obligation.param_env)
                 }
@@ -96,16 +98,22 @@ pub(super) fn fulfillment_error_for_stalled<'tcx>(
             None,
         ) {
             Ok(GoalEvaluation {
-                certainty: Certainty::Maybe { cause: MaybeCause::Ambiguity, .. },
+                certainty:
+                    Certainty::Maybe(MaybeInfo {
+                        cause: MaybeCause::Ambiguity,
+                        opaque_types_jank: _,
+                        stalled_on_coroutines: _,
+                    }),
                 ..
             }) => (FulfillmentErrorCode::Ambiguity { overflow: None }, true),
             Ok(GoalEvaluation {
                 certainty:
-                    Certainty::Maybe {
+                    Certainty::Maybe(MaybeInfo {
                         cause:
                             MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: _ },
-                        ..
-                    },
+                        opaque_types_jank: _,
+                        stalled_on_coroutines: _,
+                    }),
                 ..
             }) => (
                 FulfillmentErrorCode::Ambiguity { overflow: Some(suggest_increasing_limit) },
@@ -271,7 +279,14 @@ impl<'tcx> BestObligation<'tcx> {
             );
             // Skip nested goals that aren't the *reason* for our goal's failure.
             match (self.consider_ambiguities, nested_goal.result()) {
-                (true, Ok(Certainty::Maybe { cause: MaybeCause::Ambiguity, .. }))
+                (
+                    true,
+                    Ok(Certainty::Maybe(MaybeInfo {
+                        cause: MaybeCause::Ambiguity,
+                        opaque_types_jank: _,
+                        stalled_on_coroutines: _,
+                    })),
+                )
                 | (false, Err(_)) => {}
                 _ => continue,
             }
@@ -380,7 +395,6 @@ impl<'tcx> BestObligation<'tcx> {
         &mut self,
         goal: &inspect::InspectGoal<'_, 'tcx>,
     ) -> ControlFlow<PredicateObligation<'tcx>> {
-        let tcx = goal.infcx().tcx;
         let pred_kind = goal.goal().predicate.kind();
 
         match pred_kind.no_bound_vars() {
@@ -388,8 +402,8 @@ impl<'tcx> BestObligation<'tcx> {
                 self.detect_error_in_self_ty_normalization(goal, pred.self_ty())?;
             }
             Some(ty::PredicateKind::NormalizesTo(pred))
-                if let ty::AliasTermKind::ProjectionTy | ty::AliasTermKind::ProjectionConst =
-                    pred.alias.kind(tcx) =>
+                if let ty::AliasTermKind::ProjectionTy { .. }
+                | ty::AliasTermKind::ProjectionConst { .. } = pred.alias.kind =>
             {
                 self.detect_error_in_self_ty_normalization(goal, pred.alias.self_ty())?;
                 self.detect_non_well_formed_assoc_item(goal, pred.alias)?;
@@ -413,8 +427,15 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
         let tcx = goal.infcx().tcx;
         // Skip goals that aren't the *reason* for our goal's failure.
         match (self.consider_ambiguities, goal.result()) {
-            (true, Ok(Certainty::Maybe { cause: MaybeCause::Ambiguity, .. })) | (false, Err(_)) => {
-            }
+            (
+                true,
+                Ok(Certainty::Maybe(MaybeInfo {
+                    cause: MaybeCause::Ambiguity,
+                    opaque_types_jank: _,
+                    stalled_on_coroutines: _,
+                })),
+            )
+            | (false, Err(_)) => {}
             _ => return ControlFlow::Continue(()),
         }
 
@@ -449,8 +470,9 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
             }
             ty::PredicateKind::NormalizesTo(normalizes_to)
                 if matches!(
-                    normalizes_to.alias.kind(tcx),
-                    ty::AliasTermKind::ProjectionTy | ty::AliasTermKind::ProjectionConst
+                    normalizes_to.alias.kind,
+                    ty::AliasTermKind::ProjectionTy { .. }
+                        | ty::AliasTermKind::ProjectionConst { .. }
                 ) =>
             {
                 ChildMode::Trait(pred.kind().rebind(ty::TraitPredicate {
@@ -539,12 +561,12 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
         // and therefore is treated as rigid.
         if let Some(ty::PredicateKind::AliasRelate(lhs, rhs, _)) = pred.kind().no_bound_vars() {
             goal.infcx().visit_proof_tree_at_depth(
-                goal.goal().with(tcx, ty::ClauseKind::WellFormed(lhs.into())),
+                goal.goal().with(tcx, ty::ClauseKind::WellFormed(lhs)),
                 goal.depth() + 1,
                 self,
             )?;
             goal.infcx().visit_proof_tree_at_depth(
-                goal.goal().with(tcx, ty::ClauseKind::WellFormed(rhs.into())),
+                goal.goal().with(tcx, ty::ClauseKind::WellFormed(rhs)),
                 goal.depth() + 1,
                 self,
             )?;

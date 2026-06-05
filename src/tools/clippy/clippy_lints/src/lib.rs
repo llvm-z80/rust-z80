@@ -168,6 +168,7 @@ mod inherent_impl;
 mod inherent_to_string;
 mod init_numbered_fields;
 mod inline_fn_without_body;
+mod inline_trait_bounds;
 mod int_plus_one;
 mod item_name_repetitions;
 mod items_after_statements;
@@ -196,6 +197,7 @@ mod macro_use;
 mod main_recursion;
 mod manual_abs_diff;
 mod manual_assert;
+mod manual_assert_eq;
 mod manual_async_fn;
 mod manual_bits;
 mod manual_checked_ops;
@@ -209,6 +211,7 @@ mod manual_is_power_of_two;
 mod manual_let_else;
 mod manual_main_separator_str;
 mod manual_non_exhaustive;
+mod manual_noop_waker;
 mod manual_option_as_slice;
 mod manual_pop_if;
 mod manual_range_patterns;
@@ -514,9 +517,9 @@ pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Co
         Box::new(|| Box::new(visibility::Visibility)),
         Box::new(|| Box::new(multiple_bound_locations::MultipleBoundLocations)),
         Box::new(|| Box::new(field_scoped_visibility_modifiers::FieldScopedVisibilityModifiers)),
-        Box::new(|| Box::new(byte_char_slices::ByteCharSlice)),
         Box::new(|| Box::new(cfg_not_test::CfgNotTest)),
         Box::new(|| Box::new(empty_line_after::EmptyLineAfter::new())),
+        Box::new(|| Box::new(inline_trait_bounds::InlineTraitBounds)),
         // add early passes here, used by `cargo dev new_lint`
     ];
     store.early_passes.extend(early_lints);
@@ -864,7 +867,10 @@ pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Co
         Box::new(move |tcx| Box::new(duration_suboptimal_units::DurationSuboptimalUnits::new(tcx, conf))),
         Box::new(move |_| Box::new(manual_take::ManualTake::new(conf))),
         Box::new(|_| Box::new(manual_checked_ops::ManualCheckedOps)),
-        Box::new(move |_| Box::new(manual_pop_if::ManualPopIf::new(conf))),
+        Box::new(move |tcx| Box::new(manual_pop_if::ManualPopIf::new(tcx, conf))),
+        Box::new(move |_| Box::new(manual_noop_waker::ManualNoopWaker::new(conf))),
+        Box::new(|_| Box::new(byte_char_slices::ByteCharSlice)),
+        Box::new(|_| Box::new(manual_assert_eq::ManualAssertEq)),
         // add late passes here, used by `cargo dev new_lint`
     ];
     store.late_passes.extend(late_lints);

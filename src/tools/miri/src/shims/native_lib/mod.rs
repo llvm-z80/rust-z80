@@ -381,7 +381,9 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let mut fields = vec![];
         for field in &adt_def.non_enum_variant().fields {
-            let layout = this.layout_of(field.ty(*this.tcx, args)).map_err(|_err| orig_ty)?;
+            let layout = this
+                .layout_of(field.ty(*this.tcx, args).skip_norm_wip())
+                .map_err(|_err| orig_ty)?;
             fields.push(this.ty_to_ffitype(layout)?);
         }
 
@@ -396,8 +398,9 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // matches what codegen does. This does mean that we support some types whose ABI is not
         // stable, but that's fine -- we are anyway quite conservative in native-lib mode.
         if let BackendRepr::Scalar(s) = layout.backend_repr {
-            // Simple sanity-check: this cannot be `repr(C)`.
-            assert!(!layout.ty.ty_adt_def().is_some_and(|adt| adt.repr().c()));
+            // Simple sanity-check: this cannot be a `repr(C)` struct or union. (It could be a
+            // repr(C) enum. Those indeed behave like integers in the ABI.)
+            assert!(!layout.ty.ty_adt_def().is_some_and(|adt| !adt.is_enum() && adt.repr().c()));
             return Ok(match s.primitive() {
                 Primitive::Int(Integer::I8, /* signed */ true) => FfiType::i8(),
                 Primitive::Int(Integer::I16, /* signed */ true) => FfiType::i16(),

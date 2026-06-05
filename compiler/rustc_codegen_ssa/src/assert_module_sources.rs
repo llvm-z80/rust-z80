@@ -31,7 +31,7 @@ use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_hir::attrs::{CguFields, CguKind};
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::{self as hir, find_attr};
-use rustc_middle::mir::mono::CodegenUnitNameBuilder;
+use rustc_middle::mono::CodegenUnitNameBuilder;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::{Span, Symbol};
@@ -171,7 +171,7 @@ impl<'tcx> AssertModuleSource<'tcx> {
     /// Scan for a `cfg="foo"` attribute and check whether we have a
     /// cfg flag called `foo`.
     fn check_config(&self, value: Symbol) -> bool {
-        let config = &self.tcx.sess.psess.config;
+        let config = &self.tcx.sess.config;
         debug!("check_config(config={:?}, value={:?})", config, value);
         if config.iter().any(|&(name, _)| name == value) {
             debug!("check_config: matched");

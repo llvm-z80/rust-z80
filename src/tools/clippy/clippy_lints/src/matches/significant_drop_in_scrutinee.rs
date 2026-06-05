@@ -204,7 +204,7 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
                 // if some field has significant drop,
                 adt.all_fields()
                     .map(|field| field.ty(self.cx.tcx, args))
-                    .any(|ty| self.has_sig_drop_attr_impl(ty))
+                    .any(|ty| self.has_sig_drop_attr_impl(ty.skip_norm_wip()))
                     // or if there is no generic lifetime and..
                     // (to avoid false positive on `Ref<'a, MutexGuard<Foo>>`)
                     || (args
@@ -344,7 +344,7 @@ impl<'a, 'tcx> SigDropHelper<'a, 'tcx> {
         };
 
         let fn_sig = if let Some(def_id) = self.cx.typeck_results().type_dependent_def_id(parent_expr.hir_id) {
-            self.cx.tcx.fn_sig(def_id).instantiate_identity()
+            self.cx.tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip()
         } else {
             return;
         };

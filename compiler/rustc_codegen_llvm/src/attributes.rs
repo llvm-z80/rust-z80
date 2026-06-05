@@ -3,16 +3,17 @@ use rustc_hir::attrs::{InlineAttr, InstructionSetAttr, OptimizeAttr, RtsanSettin
 use rustc_hir::def_id::DefId;
 use rustc_hir::find_attr;
 use rustc_middle::middle::codegen_fn_attrs::{
-    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry, SanitizerFnAttrs,
+    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry, SanitizerFnAttrs, TargetFeature,
 };
-use rustc_middle::ty::{self, TyCtxt};
+use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::{BranchProtection, FunctionReturn, OptLevel, PAuthKey, PacRet};
+use rustc_span::sym;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::{Arch, FramePointer, SanitizerSet, StackProbeType, StackProtector};
 use smallvec::SmallVec;
 
 use crate::context::SimpleCx;
-use crate::errors::SanitizerMemtagRequiresMte;
+use crate::errors::{PackedStackBackchainNeedsSoftfloat, SanitizerMemtagRequiresMte};
 use crate::llvm::AttributePlace::Function;
 use crate::llvm::{
     self, AllocKindFlags, Attribute, AttributeKind, AttributePlace, MemoryEffects, Value,
@@ -40,23 +41,25 @@ pub(crate) fn remove_string_attr_from_llfn(llfn: &Value, name: &str) {
 }
 
 /// Get LLVM attribute for the provided inline heuristic.
-pub(crate) fn inline_attr<'ll, 'tcx>(
+#[inline]
+pub(crate) fn inline_attr<'tcx, 'll>(
     cx: &SimpleCx<'ll>,
     tcx: TyCtxt<'tcx>,
-    instance: ty::Instance<'tcx>,
+    instance: Instance<'tcx>,
+    codegen_fn_attrs: &CodegenFnAttrs,
 ) -> Option<&'ll Attribute> {
+    if !tcx.sess.opts.unstable_opts.inline_llvm {
+        // disable LLVM inlining
+        return Some(AttributeKind::NoInline.create_attr(cx.llcx));
+    }
+
     // `optnone` requires `noinline`
-    let codegen_fn_attrs = tcx.codegen_fn_attrs(instance.def_id());
     let inline = match (codegen_fn_attrs.inline, &codegen_fn_attrs.optimize) {
         (_, OptimizeAttr::DoNotOptimize) => InlineAttr::Never,
         (InlineAttr::None, _) if instance.def.requires_inline(tcx) => InlineAttr::Hint,
         (inline, _) => inline,
     };
 
-    if !tcx.sess.opts.unstable_opts.inline_llvm {
-        // disable LLVM inlining
-        return Some(AttributeKind::NoInline.create_attr(cx.llcx));
-    }
     match inline {
         InlineAttr::Hint => Some(AttributeKind::InlineHint.create_attr(cx.llcx)),
         InlineAttr::Always | InlineAttr::Force { .. } => {
@@ -162,14 +165,13 @@ pub(crate) fn uwtable_attr(llcx: &llvm::Context, use_sync_unwind: Option<bool>) 
     // NOTE: We should determine if we even need async unwind tables, as they
     // take have more overhead and if we can use sync unwind tables we
     // probably should.
+    //
+    // Similar logic exists for the per-module uwtable annotation in `context.rs`.
     let async_unwind = !use_sync_unwind.unwrap_or(false);
     llvm::CreateUWTableAttr(llcx, async_unwind)
 }
 
-pub(crate) fn frame_pointer_type_attr<'ll>(
-    cx: &SimpleCx<'ll>,
-    sess: &Session,
-) -> Option<&'ll Attribute> {
+pub(crate) fn frame_pointer(sess: &Session) -> FramePointer {
     let mut fp = sess.target.frame_pointer;
     let opts = &sess.opts;
     // "mcount" function relies on stack pointer.
@@ -178,6 +180,14 @@ pub(crate) fn frame_pointer_type_attr<'ll>(
         fp.ratchet(FramePointer::Always);
     }
     fp.ratchet(opts.cg.force_frame_pointers);
+    fp
+}
+
+pub(crate) fn frame_pointer_type_attr<'ll>(
+    cx: &SimpleCx<'ll>,
+    sess: &Session,
+) -> Option<&'ll Attribute> {
+    let fp = frame_pointer(sess);
     let attr_value = match fp {
         FramePointer::Always => "all",
         FramePointer::NonLeaf => "non-leaf",
@@ -302,6 +312,36 @@ fn stackprotector_attr<'ll>(cx: &SimpleCx<'ll>, sess: &Session) -> Option<&'ll A
     Some(sspattr.create_attr(cx.llcx))
 }
 
+fn packed_stack_attr<'ll>(
+    cx: &SimpleCx<'ll>,
+    sess: &Session,
+    function_attributes: &Vec<TargetFeature>,
+) -> Option<&'ll Attribute> {
+    if sess.target.arch != Arch::S390x {
+        return None;
+    }
+    if !sess.opts.unstable_opts.packed_stack {
+        return None;
+    }
+
+    // The backchain and softfloat flags can be set via -Ctarget-features=...
+    // or via #[target_features(enable = ...)] so we have to check both possibilities
+    let have_backchain = sess.unstable_target_features.contains(&sym::backchain)
+        || function_attributes.iter().any(|feature| feature.name == sym::backchain);
+    let have_softfloat = sess.unstable_target_features.contains(&sym::soft_float)
+        || function_attributes.iter().any(|feature| feature.name == sym::soft_float);
+
+    // If both, backchain and packedstack, are enabled LLVM cannot generate valid function entry points
+    // with the default ABI. However if the softfloat flag is set LLVM will switch to the softfloat
+    // ABI, where this works.
+    if have_backchain && !have_softfloat {
+        sess.dcx().emit_err(PackedStackBackchainNeedsSoftfloat);
+        return None;
+    }
+
+    Some(llvm::CreateAttrString(cx.llcx, "packed-stack"))
+}
+
 pub(crate) fn target_cpu_attr<'ll>(cx: &SimpleCx<'ll>, sess: &Session) -> &'ll Attribute {
     let target_cpu = llvm_util::target_cpu(sess);
     llvm::CreateAttrStringValue(cx.llcx, "target-cpu", target_cpu)
@@ -385,6 +425,10 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
             to_add.push(llvm::AttributeKind::OptimizeForSize.create_attr(cx.llcx));
         }
         OptimizeAttr::Speed => {}
+    }
+
+    if let Some(instance) = instance {
+        to_add.extend(inline_attr(cx, tcx, instance, codegen_fn_attrs));
     }
 
     if sess.must_emit_unwind_tables() {
@@ -517,6 +561,9 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
     if let Some(align) = codegen_fn_attrs.alignment {
         llvm::set_alignment(llfn, align);
     }
+    if let Some(packed_stack) = packed_stack_attr(cx, sess, &codegen_fn_attrs.target_features) {
+        to_add.push(packed_stack);
+    }
     to_add.extend(patchable_function_entry_attrs(
         cx,
         sess,
@@ -533,16 +580,6 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
 
     let function_features =
         codegen_fn_attrs.target_features.iter().map(|f| f.name.as_str()).collect::<Vec<&str>>();
-
-    // Apply function attributes as per usual if there are no user defined
-    // target features otherwise this will get applied at the callsite.
-    if function_features.is_empty() {
-        if let Some(instance) = instance
-            && let Some(inline_attr) = inline_attr(cx, tcx, instance)
-        {
-            to_add.push(inline_attr);
-        }
-    }
 
     let function_features = function_features
         .iter()

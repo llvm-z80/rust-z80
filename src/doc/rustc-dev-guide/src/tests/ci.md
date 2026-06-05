@@ -150,7 +150,10 @@ Such a try build will not execute any tests, and it will allow compilation warni
 It is useful when you want to
 get an optimized toolchain as fast as possible, for a Crater run or performance benchmarks,
 even if it might not be working fully correctly.
-If you want to do a full build for the default try job,
+
+The CI job executed in fast try builds has a special suffix (`-quick`),
+to distinguish it from a full build of the default try job.
+If you want to do the full build instead,
 specify its job name in a job pattern (explained below).
 
 If you want to run custom CI jobs in a try build and make sure that they pass all tests and do
@@ -450,6 +453,23 @@ More information is available in the [toolstate documentation].
 
 [rust-toolstate]: https://rust-lang-nursery.github.io/rust-toolstate
 [toolstate documentation]: https://forge.rust-lang.org/infra/toolstate.html
+
+## Public CI dashboard
+
+To monitor the Rust CI, you can have a look at the [public dashboard] maintained by the infra team.
+
+These are some useful panels from the dashboard:
+
+- Pipeline duration: check how long the auto builds take to run.
+- Top slowest jobs: check which jobs are taking the longest to run.
+- Change in median job duration: check what jobs are slowest than before.
+  This is useful for detecting regressions.
+- Top failed jobs: check which jobs are failing the most.
+
+To learn more about the dashboard, see the [Datadog CI docs].
+
+[Datadog CI docs]: https://docs.datadoghq.com/continuous_integration/
+[public dashboard]: https://p.datadoghq.com/sb/3a172e20-e9e1-11ed-80e3-da7ad0900002-b5f7bb7e08b664a06b08527da85f7e30
 
 ## Determining the CI configuration
 

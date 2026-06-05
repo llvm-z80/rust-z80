@@ -109,7 +109,9 @@ impl Ty {
 /// Represents a pattern in the type system
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum Pattern {
-    Range { start: Option<TyConst>, end: Option<TyConst>, include_end: bool },
+    Range { start: TyConst, end: TyConst, include_end: bool },
+    NotNull,
+    Or(Vec<Pattern>),
 }
 
 /// Represents a constant in the type system
@@ -710,6 +712,16 @@ impl FnDef {
         self.as_intrinsic().is_some()
     }
 
+    /// Get the constness of this function definition.
+    pub fn constness(&self) -> Constness {
+        with(|cx| cx.constness(*self))
+    }
+
+    /// Get the asyncness of this function definition.
+    pub fn asyncness(&self) -> Asyncness {
+        with(|cx| cx.asyncness(*self))
+    }
+
     /// Get the function signature for this function definition.
     pub fn fn_sig(&self) -> PolyFnSig {
         let kind = self.ty().kind();
@@ -1103,6 +1115,30 @@ impl FnSig {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Constness {
+    Const,
+    NotConst,
+}
+
+impl Constness {
+    pub fn is_const(self) -> bool {
+        matches!(self, Constness::Const)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+pub enum Asyncness {
+    Async,
+    NotAsync,
+}
+
+impl Asyncness {
+    pub fn is_async(self) -> bool {
+        matches!(self, Asyncness::Async)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub enum Abi {
     Rust,
@@ -1135,6 +1171,7 @@ pub enum Abi {
     Custom,
     SdccCall0,
     Z80Interrupt,
+    Swift,
 }
 
 /// A binder represents a possibly generic type and its bound vars.

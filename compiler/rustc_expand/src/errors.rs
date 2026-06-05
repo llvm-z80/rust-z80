@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 
-use rustc_ast::ast;
 use rustc_errors::codes::*;
 use rustc_hir::limit::Limit;
 use rustc_macros::{Diagnostic, Subdiagnostic};
@@ -230,7 +229,7 @@ pub(crate) struct WrongFragmentKind<'a> {
     #[primary_span]
     pub span: Span,
     pub kind: &'a str,
-    pub name: &'a ast::Path,
+    pub name: String,
 }
 
 #[derive(Diagnostic)]
@@ -249,7 +248,7 @@ pub(crate) struct IncompleteParse<'a> {
     pub descr: String,
     #[label("caused by the macro expansion here")]
     pub label_span: Span,
-    pub macro_path: &'a ast::Path,
+    pub macro_path: String,
     pub kind_name: &'a str,
     #[note("macros cannot expand to match arms")]
     pub expands_to_match_arm: bool,
@@ -544,6 +543,49 @@ mod metavar_exprs {
         #[primary_span]
         pub span: Span,
         pub key: MacroRulesNormalizedIdent,
+    }
+
+    #[derive(Diagnostic)]
+    #[diag(r#"`${"{"}concat(..){"}"}` is not generating a valid identifier"#)]
+    pub(crate) struct ConcatInvalidIdent {
+        #[primary_span]
+        pub span: Span,
+        #[subdiagnostic]
+        pub reason: InvalidIdentReason,
+    }
+
+    #[derive(Subdiagnostic)]
+    pub(crate) enum InvalidIdentReason {
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated an empty ident"#)]
+        Empty,
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated `{$symbol}`, but {$start} is neither '_' nor XID_Start"#)]
+        #[note(
+            "see <https://doc.rust-lang.org/reference/identifiers.html> for the definition of valid identifiers"
+        )]
+        InvalidStart { symbol: Symbol, start: char },
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated `{$symbol}`, but {$not_continue} is not XID_Continue"#)]
+        #[note(
+            "see <https://doc.rust-lang.org/reference/identifiers.html> for the definition of valid identifiers"
+        )]
+        InvalidContinue { symbol: Symbol, not_continue: char },
+    }
+
+    impl InvalidIdentReason {
+        pub(crate) fn new(symbol: Symbol) -> Self {
+            let mut chars = symbol.as_str().chars();
+            if let Some(start) = chars.next() {
+                if rustc_lexer::is_id_start(start) {
+                    let not_continue = chars
+                        .find(|c| !rustc_lexer::is_id_continue(*c))
+                        .expect("InvalidIdentReason: cannot find invalid ident reason");
+                    InvalidIdentReason::InvalidContinue { symbol, not_continue }
+                } else {
+                    InvalidIdentReason::InvalidStart { symbol, start }
+                }
+            } else {
+                InvalidIdentReason::Empty
+            }
+        }
     }
 }
 

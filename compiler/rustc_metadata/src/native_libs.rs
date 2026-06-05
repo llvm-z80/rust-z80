@@ -62,12 +62,15 @@ pub fn walk_native_lib_search_dirs<R>(
         f(&sess.target_tlib_path.dir.join("self-contained"), false)?;
     }
 
+    let has_shared_llvm_apple_darwin =
+        sess.target.is_like_darwin && sess.target_tlib_path.dir.join("libLLVM.dylib").exists();
+
     // Toolchains for some targets may ship `libunwind.a`, but place it into the main sysroot
     // library directory instead of the self-contained directories.
     // Sanitizer libraries have the same issue and are also linked by name on Apple targets.
     // The targets here should be in sync with `copy_third_party_objects` in bootstrap.
-    // Finally there is shared LLVM library, which unlike compiler libraries, is linked by the name,
-    // therefore requiring the search path for the linker.
+    // On Apple targets, shared LLVM is linked by name, so when `libLLVM.dylib` is
+    // present in the target libdir, add that directory to the linker search path.
     // FIXME: implement `-Clink-self-contained=+/-unwind,+/-sanitizers`, move the shipped libunwind
     // and sanitizers to self-contained directory, and stop adding this search path.
     // FIXME: On AIX this also has the side-effect of making the list of library search paths
@@ -77,7 +80,8 @@ pub fn walk_native_lib_search_dirs<R>(
         || sess.target.os == Os::Linux
         || sess.target.os == Os::Fuchsia
         || sess.target.is_like_aix
-        || sess.target.is_like_darwin && !sess.sanitizers().is_empty()
+        || sess.target.is_like_darwin
+            && (!sess.sanitizers().is_empty() || has_shared_llvm_apple_darwin)
         || sess.target.os == Os::Windows
             && sess.target.env == Env::Gnu
             && sess.target.cfg_abi == CfgAbi::Llvm
@@ -224,7 +228,7 @@ impl<'tcx> Collector<'tcx> {
             let dll_imports = match attr.kind {
                 NativeLibKind::RawDylib { .. } => foreign_items
                     .iter()
-                    .map(|&child_item| {
+                    .filter_map(|&child_item| {
                         self.build_dll_import(
                             abi,
                             attr.import_name_type.map(|(import_name_type, _)| import_name_type),
@@ -363,6 +367,7 @@ impl<'tcx> Collector<'tcx> {
             self.tcx
                 .type_of(item)
                 .instantiate_identity()
+                .skip_norm_wip()
                 .fn_sig(self.tcx)
                 .inputs()
                 .map_bound(|slice| self.tcx.mk_type_list(slice)),
@@ -388,7 +393,7 @@ impl<'tcx> Collector<'tcx> {
         abi: ExternAbi,
         import_name_type: Option<PeImportNameType>,
         item: DefId,
-    ) -> DllImport {
+    ) -> Option<DllImport> {
         let span = self.tcx.def_span(item);
 
         // This `extern` block should have been checked for general ABI support before, but let's
@@ -408,8 +413,13 @@ impl<'tcx> Collector<'tcx> {
                 // `__stdcall` only applies on x86 and on non-variadic functions:
                 // https://learn.microsoft.com/en-us/cpp/cpp/stdcall?view=msvc-170
                 ExternAbi::System { .. } => {
-                    let c_variadic =
-                        self.tcx.type_of(item).instantiate_identity().fn_sig(self.tcx).c_variadic();
+                    let c_variadic = self
+                        .tcx
+                        .type_of(item)
+                        .instantiate_identity()
+                        .skip_norm_wip()
+                        .fn_sig(self.tcx)
+                        .c_variadic();
 
                     if c_variadic {
                         DllCallingConvention::C
@@ -465,6 +475,8 @@ impl<'tcx> Collector<'tcx> {
             } else {
                 DllImportSymbolType::Static
             }
+        } else if def_kind == DefKind::ForeignTy {
+            return None;
         } else {
             bug!("Unexpected type for raw-dylib: {}", def_kind.descr(item));
         };
@@ -473,7 +485,7 @@ impl<'tcx> Collector<'tcx> {
             // We cannot determine the size of a function at compile time, but it shouldn't matter anyway.
             DllImportSymbolType::Function => rustc_abi::Size::ZERO,
             DllImportSymbolType::Static | DllImportSymbolType::ThreadLocal => {
-                let ty = self.tcx.type_of(item).instantiate_identity();
+                let ty = self.tcx.type_of(item).instantiate_identity().skip_norm_wip();
                 self.tcx
                     .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))
                     .ok()
@@ -482,6 +494,6 @@ impl<'tcx> Collector<'tcx> {
             }
         };
 
-        DllImport { name, import_name_type, calling_convention, span, symbol_type, size }
+        Some(DllImport { name, import_name_type, calling_convention, span, symbol_type, size })
     }
 }

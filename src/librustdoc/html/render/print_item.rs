@@ -7,7 +7,7 @@ use rustc_abi::VariantIdx;
 use rustc_ast::join_path_syms;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_hir as hir;
-use rustc_hir::def::CtorKind;
+use rustc_hir::def::{CtorKind, MacroKinds};
 use rustc_hir::def_id::DefId;
 use rustc_index::IndexVec;
 use rustc_middle::ty::{self, TyCtxt};
@@ -129,6 +129,8 @@ pub(super) fn print_item(cx: &Context<'_>, item: &clean::Item) -> impl fmt::Disp
         let item_vars = ItemVars {
             typ,
             name: item.name.as_ref().unwrap().as_str(),
+            // It's fine to use `type_` here because, even if it's a decl macro with multiple kinds,
+            // since we're generating its documentation page, we can default to the macro type.
             item_type: &item.type_().to_string(),
             path_components,
             stability_since_raw: &stability_since_raw,
@@ -153,7 +155,7 @@ pub(super) fn print_item(cx: &Context<'_>, item: &clean::Item) -> impl fmt::Disp
             clean::TypeAliasItem(t) => {
                 write!(buf, "{}", item_type_alias(cx, item, t))
             }
-            clean::MacroItem(m) => write!(buf, "{}", item_macro(cx, item, m)),
+            clean::MacroItem(m, kinds) => write!(buf, "{}", item_macro(cx, item, m, *kinds)),
             clean::ProcMacroItem(m) => {
                 write!(buf, "{}", item_proc_macro(cx, item, m))
             }
@@ -228,7 +230,16 @@ fn item_module(cx: &Context<'_>, item: &clean::Item, items: &[clean::Item]) -> i
             FxIndexMap::default();
 
         for (index, item) in items.iter().filter(|i| !i.is_stripped()).enumerate() {
-            not_stripped_items.entry(item.type_()).or_default().push((index, item));
+            // To prevent having new "decl macro attribute/derive" sections in the module,
+            // we cheat by turning them into their "proc-macro equivalent".
+            for type_ in item.types() {
+                let type_ = match type_ {
+                    ItemType::DeclMacroAttribute => ItemType::ProcAttribute,
+                    ItemType::DeclMacroDerive => ItemType::ProcDerive,
+                    type_ => type_,
+                };
+                not_stripped_items.entry(type_).or_default().push((index, item));
+            }
         }
 
         // the order of item types in the listing
@@ -314,34 +325,18 @@ fn item_module(cx: &Context<'_>, item: &clean::Item, items: &[clean::Item]) -> i
         let mut types = not_stripped_items.keys().copied().collect::<Vec<_>>();
         types.sort_unstable_by(|a, b| reorder(*a).cmp(&reorder(*b)));
 
-        let mut last_section: Option<super::ItemSection> = None;
-
         for type_ in types {
             let my_section = item_ty_to_section(type_);
-
-            // Only render section heading if the section changed
-            if last_section != Some(my_section) {
-                // Close the previous section if there was one
-                if last_section.is_some() {
-                    w.write_str(ITEM_TABLE_CLOSE)?;
-                }
-                let tag = if my_section == super::ItemSection::Reexports {
-                    REEXPORTS_TABLE_OPEN
-                } else {
-                    ITEM_TABLE_OPEN
-                };
-                write!(
-                    w,
-                    "{}",
-                    write_section_heading(
-                        my_section.name(),
-                        &cx.derive_id(my_section.id()),
-                        None,
-                        tag
-                    )
-                )?;
-                last_section = Some(my_section);
-            }
+            let tag = if my_section == super::ItemSection::Reexports {
+                REEXPORTS_TABLE_OPEN
+            } else {
+                ITEM_TABLE_OPEN
+            };
+            write!(
+                w,
+                "{}",
+                write_section_heading(my_section.name(), &cx.derive_id(my_section.id()), None, tag)
+            )?;
 
             for (_, myitem) in &not_stripped_items[&type_] {
                 let visibility_and_hidden = |item: &clean::Item| match item.visibility(tcx) {
@@ -468,16 +463,13 @@ fn item_module(cx: &Context<'_>, item: &clean::Item, items: &[clean::Item]) -> i
                             stab_tags = print_extra_info_tags(tcx, myitem, item, None),
                             class = type_,
                             unsafety_flag = unsafety_flag,
-                            href = print_item_path(type_, item_name.as_str()),
+                            href = print_item_path(myitem),
                             title1 = myitem.type_(),
                             title2 = full_path(cx, myitem),
                         )?;
                     }
                 }
             }
-        }
-        // Close the final section
-        if last_section.is_some() {
             w.write_str(ITEM_TABLE_CLOSE)?;
         }
 
@@ -636,7 +628,11 @@ fn item_trait(cx: &Context<'_>, it: &clean::Item, t: &clean::Trait) -> impl fmt:
         let count_types = required_types.len() + provided_types.len();
         let count_consts = required_consts.len() + provided_consts.len();
         let count_methods = required_methods.len() + provided_methods.len();
-        let must_implement_one_of_functions = &tcx.trait_def(t.def_id).must_implement_one_of;
+        let &rustc_middle::ty::TraitDef {
+            must_implement_one_of: ref must_implement_one_of_functions,
+            impl_restriction,
+            ..
+        } = tcx.trait_def(t.def_id);
 
         // Output the trait definition
         wrap_item(w, |mut w| {
@@ -789,6 +785,25 @@ fn item_trait(cx: &Context<'_>, it: &clean::Item, t: &clean::Trait) -> impl fmt:
 
         // Trait documentation
         write!(w, "{}", document(cx, it, None, HeadingOffset::H2))?;
+
+        if let rustc_middle::ty::trait_def::ImplRestrictionKind::Restricted(def_id, _) =
+            impl_restriction
+        {
+            let v1;
+            let v2;
+            write!(
+                w,
+                "<div class=\"stab impl_restriction\">This trait cannot be implemented outside <code>{}</code>.</div>",
+                if cx.cache().document_private {
+                    v1 =
+                        rustc_middle::ty::print::with_resolve_crate_name!(tcx.def_path_str(def_id));
+                    v1.as_str()
+                } else {
+                    v2 = tcx.crate_name(def_id.krate);
+                    v2.as_str()
+                },
+            )?;
+        }
 
         fn trait_item(cx: &Context<'_>, m: &clean::Item, t: &clean::Item) -> impl fmt::Display {
             fmt::from_fn(|w| {
@@ -954,24 +969,22 @@ fn item_trait(cx: &Context<'_>, it: &clean::Item, t: &clean::Trait) -> impl fmt:
 
         let mut extern_crates = FxIndexSet::default();
 
-        if !t.is_dyn_compatible(cx.tcx()) {
-            write!(
-                w,
-                "{}",
-                write_section_heading(
-                    "Dyn Compatibility",
-                    "dyn-compatibility",
-                    None,
-                    format!(
-                        "<div class=\"dyn-compatibility-info\"><p>This trait is <b>not</b> \
-                        <a href=\"{base}/reference/items/traits.html#dyn-compatibility\">dyn compatible</a>.</p>\
-                        <p><i>In older versions of Rust, dyn compatibility was called \"object safety\", \
-                        so this trait is not object safe.</i></p></div>",
-                        base = crate::clean::utils::DOC_RUST_LANG_ORG_VERSION
-                    ),
+        write!(
+            w,
+            "{}",
+            write_section_heading(
+                "Dyn Compatibility",
+                "dyn-compatibility",
+                None,
+                format!(
+                    "<div class=\"dyn-compatibility-info\"><p>This trait {} \
+                    <a href=\"{base}/reference/items/traits.html#dyn-compatibility\">dyn compatible</a>.</p>\
+                    <p><i>In older versions of Rust, dyn compatibility was called \"object safety\".</i></p></div>",
+                    if t.is_dyn_compatible(cx.tcx()) { "<b>is</b>" } else { "is <b>not</b>" },
+                    base = crate::clean::utils::DOC_RUST_LANG_ORG_VERSION
                 ),
-            )?;
-        }
+            ),
+        )?;
 
         if let Some(implementors) = cx.shared.cache.implementors.get(&it.item_id.expect_def_id()) {
             // The DefId is for the first Type found with that name. The bool is
@@ -1275,7 +1288,11 @@ fn item_type_alias(cx: &Context<'_>, it: &clean::Item, t: &clean::TypeAlias) -> 
 
             match inner_type {
                 clean::TypeAliasInnerType::Enum { variants, is_non_exhaustive } => {
-                    let ty = cx.tcx().type_of(it.def_id().unwrap()).instantiate_identity();
+                    let ty = cx
+                        .tcx()
+                        .type_of(it.def_id().unwrap())
+                        .instantiate_identity()
+                        .skip_norm_wip();
                     let enum_def_id = ty.ty_adt_def().unwrap().did();
 
                     DisplayEnum {
@@ -1287,7 +1304,11 @@ fn item_type_alias(cx: &Context<'_>, it: &clean::Item, t: &clean::TypeAlias) -> 
                     .render_into(cx, it, true, w)?;
                 }
                 clean::TypeAliasInnerType::Union { fields } => {
-                    let ty = cx.tcx().type_of(it.def_id().unwrap()).instantiate_identity();
+                    let ty = cx
+                        .tcx()
+                        .type_of(it.def_id().unwrap())
+                        .instantiate_identity()
+                        .skip_norm_wip();
                     let union_def_id = ty.ty_adt_def().unwrap().did();
 
                     ItemUnion {
@@ -1301,7 +1322,11 @@ fn item_type_alias(cx: &Context<'_>, it: &clean::Item, t: &clean::TypeAlias) -> 
                     .render_into(w)?;
                 }
                 clean::TypeAliasInnerType::Struct { ctor_kind, fields } => {
-                    let ty = cx.tcx().type_of(it.def_id().unwrap()).instantiate_identity();
+                    let ty = cx
+                        .tcx()
+                        .type_of(it.def_id().unwrap())
+                        .instantiate_identity()
+                        .skip_norm_wip();
                     let struct_def_id = ty.ty_adt_def().unwrap().did();
 
                     DisplayStruct {
@@ -1512,9 +1537,8 @@ fn item_union(cx: &Context<'_>, it: &clean::Item, s: &clean::Union) -> impl fmt:
 fn print_tuple_struct_fields(cx: &Context<'_>, s: &[clean::Item]) -> impl Display {
     fmt::from_fn(|f| {
         if !s.is_empty()
-            && s.iter().all(|field| {
-                matches!(field.kind, clean::StrippedItem(box clean::StructFieldItem(..)))
-            })
+            && s.iter()
+                .all(|field| matches!(field.kind, clean::StrippedItem(clean::StructFieldItem(..))))
         {
             return f.write_str("<span class=\"comment\">/* private fields */</span>");
         }
@@ -1522,7 +1546,7 @@ fn print_tuple_struct_fields(cx: &Context<'_>, s: &[clean::Item]) -> impl Displa
         s.iter()
             .map(|ty| {
                 fmt::from_fn(|f| match ty.kind {
-                    clean::StrippedItem(box clean::StructFieldItem(_)) => f.write_str("_"),
+                    clean::StrippedItem(clean::StructFieldItem(_)) => f.write_str("_"),
                     clean::StructFieldItem(ref ty) => write!(f, "{}", print_type(ty, cx)),
                     _ => unreachable!(),
                 })
@@ -1840,7 +1864,7 @@ fn item_variants(
                 )?;
                 for field in fields {
                     match field.kind {
-                        clean::StrippedItem(box clean::StructFieldItem(_)) => {}
+                        clean::StrippedItem(clean::StructFieldItem(_)) => {}
                         clean::StructFieldItem(ref ty) => {
                             let id = cx.derive_id(format!(
                                 "variant.{}.field.{}",
@@ -1876,8 +1900,13 @@ fn item_variants(
     })
 }
 
-fn item_macro(cx: &Context<'_>, it: &clean::Item, t: &clean::Macro) -> impl fmt::Display {
-    fmt::from_fn(|w| {
+fn item_macro(
+    cx: &Context<'_>,
+    it: &clean::Item,
+    t: &clean::Macro,
+    kinds: MacroKinds,
+) -> impl fmt::Display {
+    fmt::from_fn(move |w| {
         wrap_item(w, |w| {
             render_attributes_in_code(w, it, "", cx)?;
             if !t.macro_rules {
@@ -1885,6 +1914,14 @@ fn item_macro(cx: &Context<'_>, it: &clean::Item, t: &clean::Macro) -> impl fmt:
             }
             write!(w, "{}", Escape(&t.source))
         })?;
+        if kinds != MacroKinds::BANG {
+            write!(
+                w,
+                "<h3 class='macro-info'>ⓘ This is {} {}</h3>",
+                kinds.article(),
+                kinds.descr(),
+            )?;
+        }
         write!(w, "{}", document(cx, it, None, HeadingOffset::H2))
     })
 }
@@ -2260,7 +2297,16 @@ pub(super) fn full_path(cx: &Context<'_>, item: &clean::Item) -> String {
     s
 }
 
-pub(super) fn print_item_path(ty: ItemType, name: &str) -> impl Display {
+pub(super) fn print_item_path(item: &clean::Item) -> impl Display {
+    fmt::from_fn(move |f| match item.kind {
+        clean::ItemKind::ModuleItem(..) => {
+            write!(f, "{}index.html", ensure_trailing_slash(item.name.unwrap().as_str()))
+        }
+        _ => f.write_str(&item.html_filename()),
+    })
+}
+
+pub(super) fn print_ty_path(ty: ItemType, name: &str) -> impl Display {
     fmt::from_fn(move |f| match ty {
         ItemType::Module => write!(f, "{}index.html", ensure_trailing_slash(name)),
         _ => write!(f, "{ty}.{name}.html"),
@@ -2301,17 +2347,15 @@ where
 
 #[derive(PartialEq, Eq)]
 struct ImplString {
-    rendered: String,
-    is_negative: bool,
+    // Plain text (not HTML text) because this is only used for sorting purposes, and the plain
+    // text is much shorter and thus faster to compare.
+    cmp_text: String,
 }
 
 impl ImplString {
     fn new(i: &Impl, cx: &Context<'_>) -> ImplString {
         let impl_ = i.inner_impl();
-        ImplString {
-            is_negative: impl_.is_negative_trait_impl(),
-            rendered: format!("{}", print_impl(impl_, false, cx)),
-        }
+        ImplString { cmp_text: format!("{:#}", print_impl(impl_, false, cx)) }
     }
 }
 
@@ -2323,12 +2367,9 @@ impl PartialOrd for ImplString {
 
 impl Ord for ImplString {
     fn cmp(&self, other: &Self) -> Ordering {
-        // We sort negative impls first.
-        match (self.is_negative, other.is_negative) {
-            (false, true) => Ordering::Greater,
-            (true, false) => Ordering::Less,
-            _ => compare_names(&self.rendered, &other.rendered),
-        }
+        // Negative impls are naturally sorted first, because `impl !A` is less than `impl B` for
+        // any value of `B`, because `!` is less than any identifier-starting char.
+        compare_names(&self.cmp_text, &other.cmp_text)
     }
 }
 
@@ -2343,7 +2384,7 @@ fn render_implementor(
     // full path, for example in `std::iter::ExactSizeIterator`
     let use_absolute = match implementor.inner_impl().for_ {
         clean::Type::Path { ref path, .. }
-        | clean::BorrowedRef { type_: box clean::Type::Path { ref path, .. }, .. }
+        | clean::BorrowedRef { type_: clean::Type::Path { ref path, .. }, .. }
             if !path.is_assoc_ty() =>
         {
             implementor_dups[&path.last()].1
@@ -2539,7 +2580,7 @@ fn render_struct_fields(
                 w.write_str("(")?;
                 if !fields.is_empty()
                     && fields.iter().all(|field| {
-                        matches!(field.kind, clean::StrippedItem(box clean::StructFieldItem(..)))
+                        matches!(field.kind, clean::StrippedItem(clean::StructFieldItem(..)))
                     })
                 {
                     write!(w, "<span class=\"comment\">/* private fields */</span>")?;
@@ -2549,7 +2590,7 @@ fn render_struct_fields(
                             w.write_str(", ")?;
                         }
                         match field.kind {
-                            clean::StrippedItem(box clean::StructFieldItem(..)) => {
+                            clean::StrippedItem(clean::StructFieldItem(..)) => {
                                 write!(w, "_")?;
                             }
                             clean::StructFieldItem(ref ty) => {

@@ -413,7 +413,10 @@ fn completion_item(
         item.import_to_add
             .clone()
             .into_iter()
-            .map(|import_path| lsp_ext::CompletionImport { full_import_path: import_path })
+            .map(|import| lsp_ext::CompletionImport {
+                full_import_path: import.path,
+                as_underscore: import.as_underscore,
+            })
             .collect()
     } else {
         Vec::new()
@@ -913,9 +916,9 @@ pub(crate) fn folding_range(
     text: &str,
     line_index: &LineIndex,
     line_folding_only: bool,
-    fold: Fold,
+    Fold { range: text_range, kind, collapsed_text }: Fold,
 ) -> lsp_types::FoldingRange {
-    let kind = match fold.kind {
+    let kind = match kind {
         FoldKind::Comment => Some(lsp_types::FoldingRangeKind::Comment),
         FoldKind::Imports => Some(lsp_types::FoldingRangeKind::Imports),
         FoldKind::Region => Some(lsp_types::FoldingRangeKind::Region),
@@ -930,17 +933,19 @@ pub(crate) fn folding_range(
         | FoldKind::Array
         | FoldKind::ExternCrates
         | FoldKind::MatchArm
-        | FoldKind::Function => None,
+        | FoldKind::Function
+        | FoldKind::Stmt(_)
+        | FoldKind::TailExpr(_) => None,
     };
 
-    let range = range(line_index, fold.range);
+    let range = range(line_index, text_range);
 
     if line_folding_only {
         // Clients with line_folding_only == true (such as VSCode) will fold the whole end line
         // even if it contains text not in the folding range. To prevent that we exclude
         // range.end.line from the folding region if there is more text after range.end
         // on the same line.
-        let has_more_text_on_end_line = text[TextRange::new(fold.range.end(), TextSize::of(text))]
+        let has_more_text_on_end_line = text[TextRange::new(text_range.end(), TextSize::of(text))]
             .chars()
             .take_while(|it| *it != '\n')
             .any(|it| !it.is_whitespace());
@@ -951,13 +956,20 @@ pub(crate) fn folding_range(
             range.end.line
         };
 
+        let collapsed_text = collapsed_text.map(|collapsed_text| {
+            let range_start = text_range.start();
+            let line_start = range_start - TextSize::from(range.start.character);
+            let text_before_range = &text[TextRange::new(line_start, range_start)];
+            format!("{text_before_range}{collapsed_text}")
+        });
+
         lsp_types::FoldingRange {
             start_line: range.start.line,
             start_character: None,
             end_line,
             end_character: None,
             kind,
-            collapsed_text: None,
+            collapsed_text,
         }
     } else {
         lsp_types::FoldingRange {
@@ -966,7 +978,7 @@ pub(crate) fn folding_range(
             end_line: range.end.line,
             end_character: Some(range.end.character),
             kind,
-            collapsed_text: None,
+            collapsed_text,
         }
     }
 }
@@ -1596,7 +1608,6 @@ pub(crate) fn runnable(
                     Some((program, args)) => Some(lsp_ext::Runnable {
                         label,
                         location: Some(location),
-                        kind: lsp_ext::RunnableKind::Shell,
                         args: lsp_ext::RunnableArgs::Shell(lsp_ext::ShellRunnableArgs {
                             environment,
                             cwd: cwd.into(),
@@ -1609,7 +1620,6 @@ pub(crate) fn runnable(
                 None => Some(lsp_ext::Runnable {
                     label,
                     location: Some(location),
-                    kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
                         workspace_root: Some(workspace_root.into()),
                         override_cargo: config.override_cargo,
@@ -1636,7 +1646,6 @@ pub(crate) fn runnable(
                     Ok(Some(lsp_ext::Runnable {
                         label,
                         location: Some(location),
-                        kind: lsp_ext::RunnableKind::Shell,
                         args: lsp_ext::RunnableArgs::Shell(runnable_args),
                     }))
                 }
@@ -1656,7 +1665,6 @@ pub(crate) fn runnable(
             Ok(Some(lsp_ext::Runnable {
                 label,
                 location: Some(location),
-                kind: lsp_ext::RunnableKind::Cargo,
                 args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
                     workspace_root: None,
                     override_cargo: config.override_cargo,
@@ -2016,6 +2024,7 @@ pub(crate) fn rename_error(err: RenameError) -> LspError {
 mod tests {
     use expect_test::{Expect, expect};
     use ide::{Analysis, FilePosition};
+    use ide_db::base_db::AbsPathBuf;
     use ide_db::source_change::Snippet;
     use test_utils::extract_offset;
     use triomphe::Arc;
@@ -2036,9 +2045,12 @@ fn main() {
     }
 }"#;
 
-        let (analysis, file_id) = Analysis::from_single_file(text.to_owned());
-        let folds = analysis.folding_ranges(file_id).unwrap();
-        assert_eq!(folds.len(), 4);
+        let (analysis, file_id) = Analysis::from_single_file(
+            text.to_owned(),
+            Arc::new(AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+        );
+        let folds = analysis.folding_ranges(file_id, true).unwrap();
+        assert_eq!(folds.len(), 5);
 
         let line_index = LineIndex {
             index: Arc::new(ide::LineIndex::new(text)),
@@ -2048,7 +2060,7 @@ fn main() {
         let converted: Vec<lsp_types::FoldingRange> =
             folds.into_iter().map(|it| folding_range(text, &line_index, true, it)).collect();
 
-        let expected_lines = [(0, 2), (4, 10), (5, 6), (7, 9)];
+        let expected_lines = [(0, 2), (4, 10), (5, 9), (5, 6), (7, 9)];
         assert_eq!(converted.len(), expected_lines.len());
         for (folding_range, (start_line, end_line)) in converted.iter().zip(expected_lines.iter()) {
             assert_eq!(folding_range.start_line, *start_line);
@@ -2072,7 +2084,10 @@ fn bar(_: usize) {}
 "#;
 
         let (offset, text) = extract_offset(text);
-        let (analysis, file_id) = Analysis::from_single_file(text);
+        let (analysis, file_id) = Analysis::from_single_file(
+            text,
+            Arc::new(AbsPathBuf::assert_utf8(std::env::current_dir().unwrap())),
+        );
         let help = signature_help(
             analysis.signature_help(FilePosition { file_id, offset }).unwrap().unwrap(),
             CallInfoConfig { params_only: false, docs: true },

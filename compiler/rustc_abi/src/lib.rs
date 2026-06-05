@@ -40,16 +40,23 @@ use std::fmt;
 #[cfg(feature = "nightly")]
 use std::iter::Step;
 use std::num::{NonZeroUsize, ParseIntError};
-use std::ops::{Add, AddAssign, Deref, Mul, RangeFull, RangeInclusive, Sub};
+use std::ops::{Add, AddAssign, Deref, Mul, RangeFull, Sub};
+use std::range::RangeInclusive;
 use std::str::FromStr;
 
 use bitflags::bitflags;
 #[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::StableOrd;
+use rustc_data_structures::stable_hash::StableOrd;
+#[cfg(feature = "nightly")]
+use rustc_error_messages::{DiagArgValue, IntoDiagArg};
+#[cfg(feature = "nightly")]
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, msg};
 use rustc_hashes::Hash64;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
+#[cfg(feature = "nightly")]
+use rustc_span::{Symbol, sym};
 
 mod callconv;
 mod canon_abi;
@@ -67,17 +74,8 @@ pub use layout::{FIRST_VARIANT, FieldIdx, LayoutCalculator, LayoutCalculatorErro
 #[cfg(feature = "nightly")]
 pub use layout::{Layout, TyAbiInterface, TyAndLayout};
 
-/// Requirements for a `StableHashingContext` to be used in this crate.
-/// This is a hack to allow using the `HashStable_Generic` derive macro
-/// instead of implementing everything in `rustc_middle`.
-#[cfg(feature = "nightly")]
-pub trait HashStableContext {}
-
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub struct ReprFlags(u8);
 
 bitflags! {
@@ -114,10 +112,7 @@ impl std::fmt::Debug for ReprFlags {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum IntegerType {
     /// Pointer-sized integer type, i.e. `isize` and `usize`. The field shows signedness, e.g.
     /// `Pointer(true)` means `isize`.
@@ -137,10 +132,7 @@ impl IntegerType {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum ScalableElt {
     /// `N` in `rustc_scalable_vector(N)` - the element count of the scalable vector
     ElementCount(u16),
@@ -151,10 +143,7 @@ pub enum ScalableElt {
 
 /// Represents the repr options provided by the user.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub struct ReprOptions {
     pub int: Option<IntegerType>,
     pub align: Option<Align>,
@@ -338,7 +327,7 @@ impl Default for TargetDataLayout {
     }
 }
 
-pub enum TargetDataLayoutErrors<'a> {
+pub enum TargetDataLayoutError<'a> {
     InvalidAddressSpace { addr_space: &'a str, cause: &'a str, err: ParseIntError },
     InvalidBits { kind: &'a str, bit: &'a str, cause: &'a str, err: ParseIntError },
     MissingAlignment { cause: &'a str },
@@ -347,6 +336,51 @@ pub enum TargetDataLayoutErrors<'a> {
     InconsistentTargetPointerWidth { pointer_size: u64, target: u16 },
     InvalidBitsSize { err: String },
     UnknownPointerSpecification { err: String },
+}
+
+#[cfg(feature = "nightly")]
+impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetDataLayoutError<'_> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+        match self {
+            TargetDataLayoutError::InvalidAddressSpace { addr_space, err, cause } => {
+                Diag::new(dcx, level, msg!("invalid address space `{$addr_space}` for `{$cause}` in \"data-layout\": {$err}"))
+                    .with_arg("addr_space", addr_space)
+                    .with_arg("cause", cause)
+                    .with_arg("err", err)
+            }
+            TargetDataLayoutError::InvalidBits { kind, bit, cause, err } => {
+                Diag::new(dcx, level, msg!("invalid {$kind} `{$bit}` for `{$cause}` in \"data-layout\": {$err}"))
+                    .with_arg("kind", kind)
+                    .with_arg("bit", bit)
+                    .with_arg("cause", cause)
+                    .with_arg("err", err)
+            }
+            TargetDataLayoutError::MissingAlignment { cause } => {
+                Diag::new(dcx, level, msg!("missing alignment for `{$cause}` in \"data-layout\""))
+                    .with_arg("cause", cause)
+            }
+            TargetDataLayoutError::InvalidAlignment { cause, err } => {
+                Diag::new(dcx, level, msg!("invalid alignment for `{$cause}` in \"data-layout\": {$err}"))
+                    .with_arg("cause", cause)
+                    .with_arg("err", err.to_string())
+            }
+            TargetDataLayoutError::InconsistentTargetArchitecture { dl, target } => {
+                Diag::new(dcx, level, msg!("inconsistent target specification: \"data-layout\" claims architecture is {$dl}-endian, while \"target-endian\" is `{$target}`"))
+                    .with_arg("dl", dl).with_arg("target", target)
+            }
+            TargetDataLayoutError::InconsistentTargetPointerWidth { pointer_size, target } => {
+                Diag::new(dcx, level, msg!("inconsistent target specification: \"data-layout\" claims pointers are {$pointer_size}-bit, while \"target-pointer-width\" is `{$target}`"))
+                    .with_arg("pointer_size", pointer_size).with_arg("target", target)
+            }
+            TargetDataLayoutError::InvalidBitsSize { err } => {
+                Diag::new(dcx, level, msg!("{$err}")).with_arg("err", err)
+            }
+            TargetDataLayoutError::UnknownPointerSpecification { err } => {
+                Diag::new(dcx, level, msg!("unknown pointer specification `{$err}` in datalayout string"))
+                    .with_arg("err", err)
+            }
+        }
+    }
 }
 
 impl TargetDataLayout {
@@ -358,17 +392,17 @@ impl TargetDataLayout {
     pub fn parse_from_llvm_datalayout_string<'a>(
         input: &'a str,
         default_address_space: AddressSpace,
-    ) -> Result<TargetDataLayout, TargetDataLayoutErrors<'a>> {
+    ) -> Result<TargetDataLayout, TargetDataLayoutError<'a>> {
         // Parse an address space index from a string.
         let parse_address_space = |s: &'a str, cause: &'a str| {
             s.parse::<u32>().map(AddressSpace).map_err(|err| {
-                TargetDataLayoutErrors::InvalidAddressSpace { addr_space: s, cause, err }
+                TargetDataLayoutError::InvalidAddressSpace { addr_space: s, cause, err }
             })
         };
 
         // Parse a bit count from a string.
         let parse_bits = |s: &'a str, kind: &'a str, cause: &'a str| {
-            s.parse::<u64>().map_err(|err| TargetDataLayoutErrors::InvalidBits {
+            s.parse::<u64>().map_err(|err| TargetDataLayoutError::InvalidBits {
                 kind,
                 bit: s,
                 cause,
@@ -384,7 +418,7 @@ impl TargetDataLayout {
         let parse_align_str = |s: &'a str, cause: &'a str| {
             let align_from_bits = |bits| {
                 Align::from_bits(bits)
-                    .map_err(|err| TargetDataLayoutErrors::InvalidAlignment { cause, err })
+                    .map_err(|err| TargetDataLayoutError::InvalidAlignment { cause, err })
             };
             let abi = parse_bits(s, "alignment", cause)?;
             Ok(align_from_bits(abi)?)
@@ -394,7 +428,7 @@ impl TargetDataLayout {
         // ignoring the secondary alignment specifications.
         let parse_align_seq = |s: &[&'a str], cause: &'a str| {
             if s.is_empty() {
-                return Err(TargetDataLayoutErrors::MissingAlignment { cause });
+                return Err(TargetDataLayoutError::MissingAlignment { cause });
             }
             parse_align_str(s[0], cause)
         };
@@ -432,7 +466,7 @@ impl TargetDataLayout {
                     // However, we currently don't take into account further specifications:
                     // an error is emitted instead.
                     if p.starts_with(char::is_alphabetic) {
-                        return Err(TargetDataLayoutErrors::UnknownPointerSpecification {
+                        return Err(TargetDataLayoutError::UnknownPointerSpecification {
                             err: p.to_string(),
                         });
                     }
@@ -477,7 +511,7 @@ impl TargetDataLayout {
                     // However, we currently don't take into account further specifications:
                     // an error is emitted instead.
                     if p.starts_with(char::is_alphabetic) {
-                        return Err(TargetDataLayoutErrors::UnknownPointerSpecification {
+                        return Err(TargetDataLayoutError::UnknownPointerSpecification {
                             err: p.to_string(),
                         });
                     }
@@ -729,6 +763,14 @@ impl Endian {
             Self::Big => "big",
         }
     }
+
+    #[cfg(feature = "nightly")]
+    pub fn desc_symbol(&self) -> Symbol {
+        match self {
+            Self::Little => sym::little,
+            Self::Big => sym::big,
+        }
+    }
 }
 
 impl fmt::Debug for Endian {
@@ -751,10 +793,7 @@ impl FromStr for Endian {
 
 /// Size of a type in bytes.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub struct Size {
     raw: u64,
 }
@@ -979,10 +1018,7 @@ impl Step for Size {
 
 /// Alignment of a type in bytes (always a power of two).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub struct Align {
     pow2: u8,
 }
@@ -1115,7 +1151,7 @@ impl Align {
 /// An example of a rare thing actually affected by preferred alignment is aligning of statics.
 /// It is of effectively no consequence for layout in structs and on the stack.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct AbiAlign {
     pub abi: Align,
 }
@@ -1147,10 +1183,7 @@ impl Deref for AbiAlign {
 
 /// Integers, also used for enum discriminants.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum Integer {
     I8,
     I16,
@@ -1310,7 +1343,7 @@ impl Integer {
 
 /// Floating-point types.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Float {
     F16,
     F32,
@@ -1345,7 +1378,7 @@ impl Float {
 
 /// Fundamental unit of memory access and layout.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Primitive {
     /// The `bool` is the signedness of the `Integer` type.
     ///
@@ -1393,7 +1426,7 @@ impl Primitive {
 ///
 /// This is intended specifically to mirror LLVM’s `!range` metadata semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct WrappingRange {
     pub start: u128,
     pub end: u128,
@@ -1505,7 +1538,7 @@ impl fmt::Debug for WrappingRange {
 
 /// Information about one scalar component of a Rust type.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Scalar {
     Initialized {
         value: Primitive,
@@ -1609,7 +1642,7 @@ impl Scalar {
 // NOTE: This struct is generic over the FieldIdx for rust-analyzer usage.
 /// Describes how the fields of a type are located in memory.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum FieldsShape<FieldIdx: Idx> {
     /// Scalar primitives and `!`, which never have fields.
     Primitive,
@@ -1694,12 +1727,55 @@ impl<FieldIdx: Idx> FieldsShape<FieldIdx> {
 /// should operate on. Special address spaces have an effect on code generation,
 /// depending on the target and the address spaces it implements.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct AddressSpace(pub u32);
 
 impl AddressSpace {
     /// LLVM's `0` address space.
     pub const ZERO: Self = AddressSpace(0);
+    /// The address space for workgroup memory on nvptx and amdgpu.
+    /// See e.g. the `gpu_launch_sized_workgroup_mem` intrinsic for details.
+    pub const GPU_WORKGROUP: Self = AddressSpace(3);
+}
+
+/// How many scalable vectors are in a `BackendRepr::ScalableVector`?
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
+pub struct NumScalableVectors(pub u8);
+
+impl NumScalableVectors {
+    /// Returns a `NumScalableVector` for a non-tuple scalable vector (e.g. a single vector).
+    pub fn for_non_tuple() -> Self {
+        NumScalableVectors(1)
+    }
+
+    // Returns `NumScalableVectors` for values of two through eight, which are a valid number of
+    // fields for a tuple of scalable vectors to have. `1` is a valid value of `NumScalableVectors`
+    // but not for a tuple which would have a field count.
+    pub fn from_field_count(count: usize) -> Option<Self> {
+        match count {
+            2..8 => Some(NumScalableVectors(count as u8)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "nightly")]
+impl IntoDiagArg for NumScalableVectors {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        DiagArgValue::Str(std::borrow::Cow::Borrowed(match self.0 {
+            0 => panic!("`NumScalableVectors(0)` is illformed"),
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            _ => panic!("`NumScalableVectors(N)` for N>8 is illformed"),
+        }))
+    }
 }
 
 /// The way we represent values to the backend
@@ -1713,13 +1789,14 @@ impl AddressSpace {
 /// Generally, a codegen backend will prefer to handle smaller values as a scalar or short vector,
 /// and larger values will usually prefer to be represented as memory.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum BackendRepr {
     Scalar(Scalar),
     ScalarPair(Scalar, Scalar),
     SimdScalableVector {
         element: Scalar,
         count: u64,
+        number_of_vectors: NumScalableVectors,
     },
     SimdVector {
         element: Scalar,
@@ -1826,8 +1903,12 @@ impl BackendRepr {
                 BackendRepr::SimdVector { element: element.to_union(), count }
             }
             BackendRepr::Memory { .. } => BackendRepr::Memory { sized: true },
-            BackendRepr::SimdScalableVector { element, count } => {
-                BackendRepr::SimdScalableVector { element: element.to_union(), count }
+            BackendRepr::SimdScalableVector { element, count, number_of_vectors } => {
+                BackendRepr::SimdScalableVector {
+                    element: element.to_union(),
+                    count,
+                    number_of_vectors,
+                }
             }
         }
     }
@@ -1852,7 +1933,7 @@ impl BackendRepr {
 
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
     /// A type with no valid variants. Must be uninhabited.
     Empty,
@@ -1873,13 +1954,13 @@ pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
         tag: Scalar,
         tag_encoding: TagEncoding<VariantIdx>,
         tag_field: FieldIdx,
-        variants: IndexVec<VariantIdx, LayoutData<FieldIdx, VariantIdx>>,
+        variants: IndexVec<VariantIdx, VariantLayout<FieldIdx>>,
     },
 }
 
 // NOTE: This struct is generic over the VariantIdx for rust-analyzer usage.
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum TagEncoding<VariantIdx: Idx> {
     /// The tag directly stores the discriminant, but possibly with a smaller layout
     /// (so converting the tag to the discriminant can require sign extension).
@@ -1920,7 +2001,7 @@ pub enum TagEncoding<VariantIdx: Idx> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct Niche {
     pub offset: Size,
     pub value: Primitive,
@@ -1953,8 +2034,7 @@ impl Niche {
         assert!(size.bits() <= 128);
         let max_value = size.unsigned_int_max();
 
-        let niche = v.end.wrapping_add(1)..v.start;
-        let available = niche.end.wrapping_sub(niche.start) & max_value;
+        let available = v.start.wrapping_sub(v.end).wrapping_sub(1) & max_value;
         if count > available {
             return None;
         }
@@ -1982,7 +2062,18 @@ impl Niche {
             Some((start, Scalar::Initialized { value, valid_range: v.with_end(end) }))
         };
         let distance_end_zero = max_value - v.end;
-        if v.start > v.end {
+        // FIXME: this ought to work for `bool` too, but that seems to be hitting a miscompilation
+        // <https://github.com/rust-lang/rust/pull/155473#issuecomment-4302036343>
+        let is_bool = size.bytes() == 1 && v == WrappingRange { start: 0, end: 1 };
+        if count == 1 && !is_bool {
+            // We only need one, so just pick the one closest to zero.
+            // Not only does that obviously use zero if it's possible, but it also
+            // simplifies testing things like `Option<char>`, since looking for `-1`
+            // is easier than looking for `1114112` (and matches clang's `WEOF`).
+            let next_up = size.sign_extend(v.end.wrapping_add(1)).unsigned_abs();
+            let next_down = size.sign_extend(v.start.wrapping_sub(1)).unsigned_abs();
+            if next_down <= next_up { move_start(v) } else { move_end(v) }
+        } else if v.start > v.end {
             // zero is unavailable because wrapping occurs
             move_end(v)
         } else if v.start <= distance_end_zero {
@@ -2007,7 +2098,7 @@ impl Niche {
 
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
     /// Says where the fields are located within the layout.
     pub fields: FieldsShape<FieldIdx>,
@@ -2167,7 +2258,7 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     }
 
     /// Returns `true` if the size of the type is only known at runtime.
-    pub fn is_runtime_sized(&self) -> bool {
+    pub fn is_scalable_vector(&self) -> bool {
         matches!(self.backend_repr, BackendRepr::SimdScalableVector { .. })
     }
 
@@ -2228,4 +2319,41 @@ pub enum AbiFromStrErr {
     Unknown,
     /// no "-unwind" variant can be used here
     NoExplicitUnwind,
+}
+
+// NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
+pub struct VariantLayout<FieldIdx: Idx> {
+    pub size: Size,
+    pub backend_repr: BackendRepr,
+    pub field_offsets: IndexVec<FieldIdx, Size>,
+    fields_in_memory_order: IndexVec<u32, FieldIdx>,
+    largest_niche: Option<Niche>,
+    uninhabited: bool,
+}
+
+impl<FieldIdx: Idx> VariantLayout<FieldIdx> {
+    pub fn from_layout(layout: LayoutData<FieldIdx, impl Idx>) -> Self {
+        let FieldsShape::Arbitrary { offsets, in_memory_order } = layout.fields else {
+            panic!("Layout of fields should be Arbitrary for variants");
+        };
+
+        Self {
+            size: layout.size,
+            backend_repr: layout.backend_repr,
+            field_offsets: offsets,
+            fields_in_memory_order: in_memory_order,
+            largest_niche: layout.largest_niche,
+            uninhabited: layout.uninhabited,
+        }
+    }
+
+    pub fn is_uninhabited(&self) -> bool {
+        self.uninhabited
+    }
+
+    pub fn has_fields(&self) -> bool {
+        self.field_offsets.len() > 0
+    }
 }

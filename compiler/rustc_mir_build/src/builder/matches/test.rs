@@ -44,10 +44,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 TestKind::ScalarEq { value }
             }
 
-            TestableCase::Range(ref range) => {
-                assert_eq!(range.ty, match_pair.pattern_ty);
-                TestKind::Range(Arc::clone(range))
-            }
+            TestableCase::Range(ref range) => TestKind::Range(Arc::clone(range)),
 
             TestableCase::Slice { len, op } => TestKind::SliceLen { len, op },
 
@@ -281,7 +278,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
                 // actual = len(place)
                 let length_op = self.len_of_slice_or_array(block, place, test.span, source_info);
-                self.cfg.push_assign(block, source_info, actual, Rvalue::Use(length_op));
+                self.cfg.push_assign(
+                    block,
+                    source_info,
+                    actual,
+                    Rvalue::Use(length_op, WithRetag::Yes),
+                );
 
                 // expected = <N>
                 let expected = self.push_usize(block, source_info, len);

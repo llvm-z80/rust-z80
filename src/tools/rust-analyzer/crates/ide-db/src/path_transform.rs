@@ -1,6 +1,6 @@
 //! See [`PathTransform`].
 
-use crate::helpers::mod_path_to_ast;
+use crate::helpers::mod_path_to_ast_with_factory;
 use either::Either;
 use hir::{
     AsAssocItem, FindPathConfig, HirDisplay, HirFileId, ModuleDef, SemanticsScope,
@@ -151,7 +151,7 @@ impl<'a> PathTransform<'a> {
                 prettify_macro_expansion(
                     db,
                     node,
-                    &db.expansion_span_map(file_id),
+                    db.expansion_span_map(file_id),
                     self.target_scope.module().krate(db).into(),
                 )
             }
@@ -197,7 +197,7 @@ impl<'a> PathTransform<'a> {
                         && let Some(default) =
                             &default.display_source_code(db, source_module.into(), false).ok()
                     {
-                        type_substs.insert(k, make::ty(default).clone_for_update());
+                        type_substs.insert(k, make::ty(default));
                         defaulted_params.push(Either::Left(k));
                     }
                 }
@@ -218,11 +218,10 @@ impl<'a> PathTransform<'a> {
                     }
                 }
                 (Either::Left(k), None) => {
-                    if let Some(default) =
-                        k.default(db, target_module.krate(db).to_display_target(db))
+                    if let Some(default) = k.default_source_code(db, target_module)
                         && let Some(default) = default.expr()
                     {
-                        const_substs.insert(k, default.syntax().clone_for_update());
+                        const_substs.insert(k, default.syntax().clone());
                         defaulted_params.push(Either::Right(k));
                     }
                 }
@@ -278,12 +277,10 @@ impl Ctx<'_> {
         // `transform_path` may update a node's parent and that would break the
         // tree traversal. Thus all paths in the tree are collected into a vec
         // so that such operation is safe.
-        let item = self.transform_path(item).clone_subtree();
-        let mut editor = SyntaxEditor::new(item.clone());
+        let (editor, item) = SyntaxEditor::new(self.transform_path(item));
         preorder_rev(&item).filter_map(ast::Lifetime::cast).for_each(|lifetime| {
             if let Some(subst) = self.lifetime_substs.get(&lifetime.syntax().text().to_string()) {
-                editor
-                    .replace(lifetime.syntax(), subst.clone_subtree().clone_for_update().syntax());
+                editor.replace(lifetime.syntax(), subst.clone().syntax());
             }
         });
 
@@ -331,26 +328,22 @@ impl Ctx<'_> {
             result
         }
 
-        let root_path = path.clone_subtree();
-
+        let (editor, root_path) = SyntaxEditor::new(path.clone());
         let result = find_child_paths_and_ident_pats(&root_path);
-        let mut editor = SyntaxEditor::new(root_path.clone());
         for sub_path in result {
             let new = self.transform_path(sub_path.syntax());
             editor.replace(sub_path.syntax(), new);
         }
-
-        let update_sub_item = editor.finish().new_root().clone().clone_subtree();
+        let (editor, update_sub_item) = SyntaxEditor::new(editor.finish().new_root().clone());
         let item = find_child_paths_and_ident_pats(&update_sub_item);
-        let mut editor = SyntaxEditor::new(update_sub_item);
         for sub_path in item {
-            self.transform_path_or_ident_pat(&mut editor, &sub_path);
+            self.transform_path_or_ident_pat(&editor, &sub_path);
         }
         editor.finish().new_root().clone()
     }
     fn transform_path_or_ident_pat(
         &self,
-        editor: &mut SyntaxEditor,
+        editor: &SyntaxEditor,
         item: &Either<ast::Path, ast::IdentPat>,
     ) -> Option<()> {
         match item {
@@ -359,7 +352,8 @@ impl Ctx<'_> {
         }
     }
 
-    fn transform_path_(&self, editor: &mut SyntaxEditor, path: &ast::Path) -> Option<()> {
+    fn transform_path_(&self, editor: &SyntaxEditor, path: &ast::Path) -> Option<()> {
+        let make = editor.make();
         if path.qualifier().is_some() {
             return None;
         }
@@ -403,7 +397,14 @@ impl Ctx<'_> {
                                 hir::ModuleDef::Trait(trait_ref),
                                 cfg,
                             )?;
-                            match make::ty_path(mod_path_to_ast(&found_path, self.target_edition)) {
+                            match make
+                                .ty_path(mod_path_to_ast_with_factory(
+                                    make,
+                                    &found_path,
+                                    self.target_edition,
+                                ))
+                                .into()
+                            {
                                 ast::Type::PathType(path_ty) => Some(path_ty),
                                 _ => None,
                             }
@@ -411,33 +412,27 @@ impl Ctx<'_> {
 
                         let segment = make::path_segment_ty(subst.clone(), trait_ref);
                         let qualified = make::path_from_segments(std::iter::once(segment), false);
-                        editor.replace(path.syntax(), qualified.clone_for_update().syntax());
+                        editor.replace(path.syntax(), qualified.clone().syntax());
                     } else if let Some(path_ty) = ast::PathType::cast(parent) {
                         let old = path_ty.syntax();
 
                         if old.parent().is_some() {
-                            editor.replace(old, subst.clone_subtree().clone_for_update().syntax());
+                            editor.replace(old, subst.clone().syntax());
                         } else {
-                            // Some `path_ty` has no parent, especially ones made for default value
-                            // of type parameters.
-                            // In this case, `ted` cannot replace `path_ty` with `subst` directly.
-                            // So, just replace its children as long as the `subst` is the same type.
-                            let new = subst.clone_subtree().clone_for_update();
-                            if !matches!(new, ast::Type::PathType(..)) {
-                                return None;
-                            }
                             let start = path_ty.syntax().first_child().map(NodeOrToken::Node)?;
                             let end = path_ty.syntax().last_child().map(NodeOrToken::Node)?;
                             editor.replace_all(
                                 start..=end,
-                                new.syntax().children().map(NodeOrToken::Node).collect::<Vec<_>>(),
+                                subst
+                                    .clone()
+                                    .syntax()
+                                    .children()
+                                    .map(NodeOrToken::Node)
+                                    .collect::<Vec<_>>(),
                             );
                         }
                     } else {
-                        editor.replace(
-                            path.syntax(),
-                            subst.clone_subtree().clone_for_update().syntax(),
-                        );
+                        editor.replace(path.syntax(), subst.clone().syntax());
                     }
                 }
             }
@@ -459,18 +454,17 @@ impl Ctx<'_> {
                     allow_unstable: true,
                 };
                 let found_path = self.target_module.find_path(self.source_scope.db, def, cfg)?;
-                let res = mod_path_to_ast(&found_path, self.target_edition).clone_for_update();
-                let mut res_editor = SyntaxEditor::new(res.syntax().clone_subtree());
+                let res = mod_path_to_ast_with_factory(make, &found_path, self.target_edition);
+                let (res_editor, res) = SyntaxEditor::with_ast_node(&res);
                 if let Some(args) = path.segment().and_then(|it| it.generic_arg_list())
                     && let Some(segment) = res.segment()
                 {
                     if let Some(old) = segment.generic_arg_list() {
-                        res_editor
-                            .replace(old.syntax(), args.clone_subtree().syntax().clone_for_update())
+                        res_editor.replace(old.syntax(), args.syntax().clone())
                     } else {
                         res_editor.insert(
                             syntax_editor::Position::last_child_of(segment.syntax()),
-                            args.clone_subtree().syntax().clone_for_update(),
+                            args.syntax().clone(),
                         );
                     }
                 }
@@ -479,7 +473,7 @@ impl Ctx<'_> {
             }
             hir::PathResolution::ConstParam(cp) => {
                 if let Some(subst) = self.const_substs.get(&cp) {
-                    editor.replace(path.syntax(), subst.clone_subtree().clone_for_update());
+                    editor.replace(path.syntax(), subst.clone());
                 }
             }
             hir::PathResolution::SelfType(imp) => {
@@ -496,7 +490,7 @@ impl Ctx<'_> {
                         true,
                     )
                     .ok()?;
-                let ast_ty = make::ty(ty_str).clone_for_update();
+                let ast_ty = make::ty(ty_str);
 
                 if let Some(adt) = ty.as_adt()
                     && let ast::Type::PathType(path_ty) = &ast_ty
@@ -514,10 +508,13 @@ impl Ctx<'_> {
                     )?;
 
                     if let Some(qual) =
-                        mod_path_to_ast(&found_path, self.target_edition).qualifier()
+                        mod_path_to_ast_with_factory(make, &found_path, self.target_edition)
+                            .qualifier()
                     {
-                        let res = make::path_concat(qual, path_ty.path()?).clone_for_update();
-                        editor.replace(path.syntax(), res.syntax());
+                        editor.replace(
+                            path.syntax(),
+                            make::path_concat(qual, path_ty.path()?).syntax(),
+                        );
                         return Some(());
                     }
                 }
@@ -533,14 +530,11 @@ impl Ctx<'_> {
         Some(())
     }
 
-    fn transform_ident_pat(
-        &self,
-        editor: &mut SyntaxEditor,
-        ident_pat: &ast::IdentPat,
-    ) -> Option<()> {
+    fn transform_ident_pat(&self, editor: &SyntaxEditor, ident_pat: &ast::IdentPat) -> Option<()> {
         let name = ident_pat.name()?;
+        let make = editor.make();
 
-        let temp_path = make::path_from_text(&name.text());
+        let temp_path = make.path_from_text(&name.text());
 
         let resolution = self.source_scope.speculative_resolve(&temp_path)?;
 
@@ -593,8 +587,10 @@ impl Ctx<'_> {
                     allow_unstable: true,
                 };
                 let found_path = self.target_module.find_path(self.source_scope.db, def, cfg)?;
-                let res = mod_path_to_ast(&found_path, self.target_edition).clone_for_update();
-                editor.replace(ident_pat.syntax(), res.syntax());
+                editor.replace(
+                    ident_pat.syntax(),
+                    mod_path_to_ast_with_factory(make, &found_path, self.target_edition).syntax(),
+                );
                 Some(())
             }
             _ => None,

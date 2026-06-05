@@ -59,6 +59,10 @@ where
         return None;
     }
 
+    if !tcx.opaque_types_defined_by(def).is_empty() {
+        return None;
+    }
+
     let body = body_provider();
 
     if body.has_opaque_types() {
@@ -78,7 +82,7 @@ where
         return None;
     }
 
-    let StatementKind::Assign(box (place, rvalue)) = &block.statements[0].kind else {
+    let StatementKind::Assign((place, rvalue)) = &block.statements[0].kind else {
         return None;
     };
 
@@ -86,7 +90,7 @@ where
         return None;
     }
 
-    let Rvalue::Use(Operand::Constant(c)) = rvalue else {
+    let Rvalue::Use(Operand::Constant(c), _) = rvalue else {
         return None;
     };
     match c.const_ {

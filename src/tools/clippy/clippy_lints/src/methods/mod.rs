@@ -58,11 +58,13 @@ mod join_absolute_paths;
 mod lib;
 mod lines_filter_map_ok;
 mod manual_c_str_literals;
+mod manual_clear;
 mod manual_contains;
 mod manual_inspect;
 mod manual_is_variant_and;
 mod manual_next_back;
 mod manual_ok_or;
+mod manual_option_zip;
 mod manual_repeat_n;
 mod manual_saturating_arithmetic;
 mod manual_str_repeat;
@@ -73,6 +75,7 @@ mod map_collect_result_unit;
 mod map_err_ignore;
 mod map_flatten;
 mod map_identity;
+mod map_or_identity;
 mod map_unwrap_or;
 mod map_unwrap_or_else;
 mod map_with_unused_argument_over_ranges;
@@ -110,6 +113,7 @@ mod should_implement_trait;
 mod single_char_add_str;
 mod skip_while_next;
 mod sliced_string_as_bytes;
+mod some_filter;
 mod stable_sort_primitive;
 mod str_split;
 mod str_splitn;
@@ -154,13 +158,17 @@ use clippy_utils::macros::FormatArgsStorage;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
 use clippy_utils::{contains_return, iter_input_pats, peel_blocks, sym};
-pub use path_ends_with_ext::DEFAULT_ALLOWED_DOTFILES;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::{self as hir, Expr, ExprKind, Node, Stmt, StmtKind, TraitItem, TraitItemKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::ty::TraitRef;
 use rustc_session::impl_lint_pass;
 use rustc_span::{Span, Symbol};
+
+use crate::matches::manual_filter;
+
+pub use implicit_clone::is_clone_like;
+pub use path_ends_with_ext::DEFAULT_ALLOWED_DOTFILES;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -1766,6 +1774,31 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for `.truncate(0)` calls on standard library types where it can be replaced with `.clear()`.
+    ///
+    /// Currently this includes `Vec`, `VecDeque`, `String`, and `OsString`.
+    ///
+    /// ### Why is this bad?
+    /// `clear()` expresses the intent better and is likely to be more efficient than `truncate(0)`.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let mut v = vec![1, 2, 3];
+    /// v.truncate(0);
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// let mut v = vec![1, 2, 3];
+    /// v.clear();
+    /// ```
+    #[clippy::version = "1.97.0"]
+    pub MANUAL_CLEAR,
+    perf,
+    "using `truncate(0)` instead of `clear()`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// Checks for usage of `iter().any()` on slices when it can be replaced with `contains()` and suggests doing so.
     ///
     /// ### Why is this bad?
@@ -1948,6 +1981,34 @@ declare_clippy_lint! {
     pub MANUAL_OK_OR,
     style,
     "finds patterns that can be encoded more concisely with `Option::ok_or`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for usage of `a.and_then(|a| b.map(|b| (a, b)))` which can be
+    /// more concisely expressed as `a.zip(b)`.
+    ///
+    /// ### Why is this bad?
+    /// `Option::zip` is more concise and directly expresses the intent of
+    /// combining two `Option` values into a tuple.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let a: Option<i32> = Some(1);
+    /// let b: Option<i32> = Some(2);
+    /// let _ = a.and_then(|x| b.map(|y| (x, y)));
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// let a: Option<i32> = Some(1);
+    /// let b: Option<i32> = Some(2);
+    /// let _ = a.zip(b);
+    /// ```
+    #[clippy::version = "1.95.0"]
+    pub MANUAL_OPTION_ZIP,
+    complexity,
+    "manual reimplementation of `Option::zip`"
 }
 
 declare_clippy_lint! {
@@ -2267,27 +2328,34 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usage of `_.map(_).flatten(_)` on `Iterator` and `Option`
+    /// Checks for usage of `_.map(_).flatten(_)` on `Iterator`, `Option`, and `Result`.
     ///
     /// ### Why is this bad?
-    /// Readability, this can be written more concisely as
-    /// `_.flat_map(_)` for `Iterator` or `_.and_then(_)` for `Option`
+    /// Readability. This can be written more concisely with `Iterator::flat_map`, `Option::and_then`, and
+    /// `Result::and_then`.
     ///
     /// ### Example
     /// ```no_run
     /// let vec = vec![vec![1]];
-    /// let opt = Some(5);
-    ///
     /// vec.iter().map(|x| x.iter()).flatten();
+    ///
+    /// let opt = Some(5);
     /// opt.map(|x| Some(x * 2)).flatten();
+    ///
+    /// let res: Result<i32, String> = Ok(5);
+    /// res.map(|x| Ok(x * 2)).flatten();
     /// ```
     ///
     /// Use instead:
     /// ```no_run
-    /// # let vec = vec![vec![1]];
-    /// # let opt = Some(5);
+    /// let vec = vec![vec![1]];
     /// vec.iter().flat_map(|x| x.iter());
+    ///
+    /// let opt = Some(5);
     /// opt.and_then(|x| Some(x * 2));
+    ///
+    /// let res: Result<i32, String> = Ok(5);
+    /// res.and_then(|x| Ok(x * 2));
     /// ```
     #[clippy::version = "1.31.0"]
     pub MAP_FLATTEN,
@@ -2316,6 +2384,29 @@ declare_clippy_lint! {
     pub MAP_IDENTITY,
     complexity,
     "using iterator.map(|x| x)"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks the usage of `.map_or(...)` with an identity function for `Option` and `Result` types.
+    ///
+    /// ### Why is this bad?
+    /// This can be written more concisely by using `unwrap_or()`.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let opt = Some(1);
+    /// opt.map_or(42, |v| v);
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// let opt = Some(1);
+    /// opt.unwrap_or(42);
+    /// ```
+    #[clippy::version = "1.97.0"]
+    pub MAP_OR_IDENTITY,
+    complexity,
+    "using an identity function when mapping with `.map_or(|err| ..., |x| x)`"
 }
 
 declare_clippy_lint! {
@@ -3546,6 +3637,29 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for usage of `Some(x).filter(|_| predicate)`.
+    ///
+    /// ### Why is this bad?
+    /// Readability, this can be written more concisely as `predicate.then_some(x)`.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let x = false;
+    /// Some(0).filter(|_| x);
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// let x = false;
+    /// x.then_some(0);
+    /// ```
+    #[clippy::version = "1.97.0"]
+    pub SOME_FILTER,
+    complexity,
+    "using `Some(x).filter(|_| predicate)`, which is more succinctly expressed as `predicate.then(x)`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// When sorting primitive values (integers, bools, chars, as well
     /// as arrays, slices, and tuples of such items), it is typically better to
     /// use an unstable sort than a stable sort.
@@ -4184,7 +4298,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.78.0"]
     pub UNNECESSARY_GET_THEN_CHECK,
-    suspicious,
+    complexity,
     "calling `.get().is_some()` or `.get().is_none()` instead of `.contains()` or `.contains_key()`"
 }
 
@@ -4806,6 +4920,7 @@ impl_lint_pass!(Methods => [
     ITER_WITH_DRAIN,
     JOIN_ABSOLUTE_PATHS,
     LINES_FILTER_MAP_OK,
+    MANUAL_CLEAR,
     MANUAL_CONTAINS,
     MANUAL_C_STR_LITERALS,
     MANUAL_FILTER_MAP,
@@ -4814,6 +4929,7 @@ impl_lint_pass!(Methods => [
     MANUAL_IS_VARIANT_AND,
     MANUAL_NEXT_BACK,
     MANUAL_OK_OR,
+    MANUAL_OPTION_ZIP,
     MANUAL_REPEAT_N,
     MANUAL_SATURATING_ARITHMETIC,
     MANUAL_SPLIT_ONCE,
@@ -4825,6 +4941,7 @@ impl_lint_pass!(Methods => [
     MAP_ERR_IGNORE,
     MAP_FLATTEN,
     MAP_IDENTITY,
+    MAP_OR_IDENTITY,
     MAP_UNWRAP_OR,
     MAP_WITH_UNUSED_ARGUMENT_OVER_RANGES,
     MUT_MUTEX_LOCK,
@@ -4866,6 +4983,7 @@ impl_lint_pass!(Methods => [
     SINGLE_CHAR_ADD_STR,
     SKIP_WHILE_NEXT,
     SLICED_STRING_AS_BYTES,
+    SOME_FILTER,
     STABLE_SORT_PRIMITIVE,
     STRING_EXTEND_CHARS,
     STRING_LIT_CHARS_ANY,
@@ -5024,15 +5142,15 @@ impl<'tcx> LateLintPass<'tcx> for Methods {
         if let hir::ImplItemKind::Fn(ref sig, id) = impl_item.kind {
             let parent = cx.tcx.hir_get_parent_item(impl_item.hir_id()).def_id;
             let item = cx.tcx.hir_expect_item(parent);
-            let self_ty = cx.tcx.type_of(item.owner_id).instantiate_identity();
+            let self_ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
             let implements_trait = matches!(item.kind, hir::ItemKind::Impl(hir::Impl { of_trait: Some(_), .. }));
 
-            let method_sig = cx.tcx.fn_sig(impl_item.owner_id).instantiate_identity();
+            let method_sig = cx.tcx.fn_sig(impl_item.owner_id).instantiate_identity().skip_norm_wip();
             let method_sig = cx.tcx.instantiate_bound_regions_with_erased(method_sig);
             let first_arg_ty_opt = method_sig.inputs().iter().next().copied();
             should_implement_trait::check_impl_item(cx, impl_item, self_ty, implements_trait, first_arg_ty_opt, sig);
 
-            if sig.decl.implicit_self.has_implicit_self()
+            if sig.decl.implicit_self().has_implicit_self()
                 && !(self.avoid_breaking_exported_api
                     && cx.effective_visibilities.is_exported(impl_item.owner_id.def_id))
                 && let Some(first_arg) = iter_input_pats(sig.decl, cx.tcx.hir_body(id)).next()
@@ -5059,12 +5177,13 @@ impl<'tcx> LateLintPass<'tcx> for Methods {
         }
 
         if let TraitItemKind::Fn(ref sig, _) = item.kind {
-            if sig.decl.implicit_self.has_implicit_self()
+            if sig.decl.implicit_self().has_implicit_self()
                 && let Some(first_arg_hir_ty) = sig.decl.inputs.first()
                 && let Some(&first_arg_ty) = cx
                     .tcx
                     .fn_sig(item.owner_id)
                     .instantiate_identity()
+                    .skip_norm_wip()
                     .inputs()
                     .skip_binder()
                     .first()
@@ -5115,6 +5234,7 @@ impl Methods {
                     }
                 },
                 (sym::and_then, [arg]) => {
+                    manual_option_zip::check(cx, expr, recv, arg, self.msrv);
                     let biom_option_linted = bind_instead_of_map::check_and_then_some(cx, expr, recv, arg);
                     let biom_result_linted = bind_instead_of_map::check_and_then_ok(cx, expr, recv, arg);
                     if !biom_option_linted && !biom_result_linted {
@@ -5123,6 +5243,8 @@ impl Methods {
                             return_and_then::check(cx, expr, recv, arg);
                         }
                     }
+
+                    manual_filter::check_and_then_method(cx, recv, arg, call_span, expr);
                 },
                 (sym::any, [arg]) => {
                     needless_character_iteration::check(cx, expr, recv, arg, false);
@@ -5186,7 +5308,6 @@ impl Methods {
                             format_collect::check(cx, expr, m_arg, m_ident_span);
                         },
                         Some((sym::take, take_self_arg, [take_arg], _, _)) => {
-                            #[expect(clippy::collapsible_match)]
                             if self.msrv.meets(cx, msrvs::STR_REPEAT) {
                                 manual_str_repeat::check(cx, expr, recv, take_self_arg, take_arg);
                             }
@@ -5270,6 +5391,7 @@ impl Methods {
                         // use the sourcemap to get the span of the closure
                         iter_filter::check(cx, expr, arg, span);
                     }
+                    some_filter::check(cx, expr, recv, arg, self.msrv);
                 },
                 (sym::find, [arg]) => {
                     if let Some((sym::cloned, recv2, [], _span2, _)) = method_call(recv) {
@@ -5511,9 +5633,7 @@ impl Methods {
                 (sym::open, [_]) => {
                     open_options::check(cx, expr, recv);
                 },
-                (sym::or_else, [arg]) =>
-                {
-                    #[expect(clippy::collapsible_match)]
+                (sym::or_else, [arg]) => {
                     if !bind_instead_of_map::check_or_else_err(cx, expr, recv, arg) {
                         unnecessary_lazy_eval::check(cx, expr, recv, arg, "or");
                     }
@@ -5618,9 +5738,7 @@ impl Methods {
                 (sym::try_into, []) if cx.ty_based_def(expr).opt_parent(cx).is_diag_item(cx, sym::TryInto) => {
                     unnecessary_fallible_conversions::check_method(cx, expr);
                 },
-                (sym::to_owned, []) =>
-                {
-                    #[expect(clippy::collapsible_match)]
+                (sym::to_owned, []) => {
                     if !suspicious_to_owned::check(cx, expr, span) {
                         implicit_clone::check(cx, name, expr, recv);
                     }
@@ -5727,7 +5845,7 @@ impl Methods {
             }
         }
         // Handle method calls whose receiver and arguments may come from expansion
-        if let ExprKind::MethodCall(path, recv, args, _call_span) = expr.kind {
+        if let ExprKind::MethodCall(path, recv, args, call_span) = expr.kind {
             let method_span = path.ident.span;
 
             // Those methods do their own method name checking as they deal with multiple methods.
@@ -5772,8 +5890,15 @@ impl Methods {
                 (sym::into_iter, []) => {
                     into_iter_on_ref::check(cx, expr, method_span, recv);
                 },
+                (sym::map_or, [def, map]) => {
+                    map_or_identity::check(cx, expr, recv, call_span, def, map);
+                },
+
                 (sym::to_string, []) => {
                     inefficient_to_string::check(cx, expr, recv, self.msrv);
+                },
+                (sym::truncate, [arg]) => {
+                    manual_clear::check(cx, expr, recv, arg, method_span);
                 },
                 (sym::unwrap, []) => {
                     unwrap_expect_used::check(

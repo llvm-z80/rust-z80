@@ -22,7 +22,7 @@ use itertools::izip;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use span::{Edition, FileAstId, SyntaxContext};
+use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
 use stdx::always;
 use syntax::ast;
 use triomphe::Arc;
@@ -316,7 +316,7 @@ impl<'db> DefCollector<'db> {
                                 _ => None,
                             },
                         );
-                    crate_data.unstable_features.extend(features);
+                    features.for_each(|feature| crate_data.unstable_features.enable(feature));
                 }
                 () if *attr_name == sym::register_tool => {
                     if let Some(ident) = attr.single_ident_value() {
@@ -369,7 +369,14 @@ impl<'db> DefCollector<'db> {
 
         self.inject_prelude();
 
-        if matches!(item_tree.top_level_attrs(), AttrsOrCfg::CfgDisabled(_)) {
+        if let AttrsOrCfg::CfgDisabled(attrs) = item_tree.top_level_attrs() {
+            let (cfg_expr, _) = &**attrs;
+            self.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
+                self.def_map.root,
+                InFile::new(file_id.into(), ROOT_ERASED_FILE_AST_ID),
+                cfg_expr.clone(),
+                self.cfg_options.clone(),
+            ));
             return;
         }
 
@@ -2833,6 +2840,6 @@ foo!(KABOOM);
         assert_eq!(def_map.recursion_limit(), 4);
         assert!(def_map.is_no_core());
         assert!(def_map.is_no_std());
-        assert!(def_map.is_unstable_feature_enabled(&sym::register_tool));
+        assert!(def_map.features().is_enabled(&sym::register_tool));
     }
 }

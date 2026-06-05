@@ -381,8 +381,7 @@ fn signature_help_for_generics(
                 }
             }
             GenericParam::ConstParam(param) => {
-                if let Some(expr) = param.default(db, display_target).and_then(|konst| konst.expr())
-                {
+                if let Some(expr) = param.default(db, display_target) {
                     format_to!(buf, " = {}", expr);
                 }
             }
@@ -1975,8 +1974,8 @@ trait Sub: Super + Super {
 fn f() -> impl Sub<$0
             "#,
             expect![[r#"
-                trait Sub<SuperTy = …, SubTy = …>
-                          ^^^^^^^^^^^  ---------
+                trait Sub<SubTy = …, SuperTy = …>
+                          ^^^^^^^^^  -----------
             "#]],
         );
     }

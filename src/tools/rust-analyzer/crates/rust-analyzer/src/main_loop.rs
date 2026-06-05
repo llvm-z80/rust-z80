@@ -144,12 +144,11 @@ impl fmt::Debug for Event {
         };
 
         match self {
-            Event::Lsp(lsp_server::Message::Notification(not)) => {
-                if notification_is::<lsp_types::notification::DidOpenTextDocument>(not)
-                    || notification_is::<lsp_types::notification::DidChangeTextDocument>(not)
-                {
-                    return debug_non_verbose(not, f);
-                }
+            Event::Lsp(lsp_server::Message::Notification(not))
+                if (notification_is::<lsp_types::notification::DidOpenTextDocument>(not)
+                    || notification_is::<lsp_types::notification::DidChangeTextDocument>(not)) =>
+            {
+                return debug_non_verbose(not, f);
             }
             Event::Task(Task::Response(resp)) => {
                 return f
@@ -661,8 +660,20 @@ impl GlobalState {
                 let subscriptions = subscriptions.clone();
                 // Do not fetch semantic diagnostics (and populate query results) if we haven't even
                 // loaded the initial workspace yet.
-                let fetch_semantic =
-                    self.vfs_done && self.fetch_workspaces_queue.last_op_result().is_some();
+                //
+                // Only fetch semantic diagnostics when
+                // - we have fully populated the VFS
+                // - have a workspace
+                // - have finished fetching the build data once
+                // - and have finished loading the proc-macros once
+                let fetch_semantic = self.vfs_done
+                    && self.fetch_workspaces_queue.last_op_result().is_some()
+                    && (!self.config.run_build_scripts(None)
+                        || (self.fetch_build_data_queue.last_op_result().is_none()
+                            && !self.fetch_build_data_queue.op_in_progress()))
+                    && (!self.config.expand_proc_macros()
+                        || (self.fetch_proc_macros_queue.last_op_result().is_none()
+                            && !self.fetch_proc_macros_queue.op_in_progress()));
                 move |sender| {
                     // We aren't observing the semantics token cache here
                     let snapshot = AssertUnwindSafe(&snapshot);
@@ -830,12 +841,19 @@ impl GlobalState {
                     let command = cfg.command.clone();
                     let discover = DiscoverCommand::new(self.discover_sender.clone(), command);
 
+                    let discover_path = match &arg {
+                        DiscoverProjectParam::Buildfile(it) => it,
+                        DiscoverProjectParam::Path(it) => it,
+                    };
+                    let current_dir =
+                        self.config.workspace_root_for(discover_path.as_path()).clone();
+
                     let arg = match arg {
                         DiscoverProjectParam::Buildfile(it) => DiscoverArgument::Buildfile(it),
                         DiscoverProjectParam::Path(it) => DiscoverArgument::Path(it),
                     };
 
-                    match discover.spawn(arg, self.config.root_path().as_ref()) {
+                    match discover.spawn(arg, current_dir.as_ref()) {
                         Ok(handle) => {
                             if self.discover_jobs_active == 0 {
                                 let title = &cfg.progress_label.clone();
@@ -953,7 +971,7 @@ impl GlobalState {
                 if let Some(dir) = dir {
                     message += &format!(
                         ": {}",
-                        match dir.strip_prefix(self.config.root_path()) {
+                        match dir.strip_prefix(self.config.workspace_root_for(&dir)) {
                             Some(relative_path) => relative_path.as_utf8_path(),
                             None => dir.as_ref(),
                         }

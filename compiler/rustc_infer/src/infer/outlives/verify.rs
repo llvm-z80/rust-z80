@@ -3,7 +3,7 @@ use std::assert_matches;
 use rustc_middle::ty::outlives::{Component, compute_alias_components_recursive};
 use rustc_middle::ty::{self, OutlivesPredicate, Ty, TyCtxt};
 use smallvec::smallvec;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument};
 
 use crate::infer::outlives::env::RegionBoundPairs;
 use crate::infer::region_constraints::VerifyIfEq;
@@ -105,7 +105,7 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         // Search the env for where clauses like `P: 'a`.
         let env_bounds = self.approx_declared_bounds_from_env(alias_ty).into_iter().map(|binder| {
             if let Some(ty::OutlivesPredicate(ty, r)) = binder.no_bound_vars()
-                && let ty::Alias(_, alias_ty_from_bound) = *ty.kind()
+                && let ty::Alias(alias_ty_from_bound) = *ty.kind()
                 && alias_ty_from_bound == alias_ty
             {
                 // Micro-optimize if this is an exact match (this
@@ -121,13 +121,13 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
 
         // Extend with bounds that we can find from the definition.
         let definition_bounds =
-            self.declared_bounds_from_definition(alias_ty).map(|r| VerifyBound::OutlivedBy(r));
+            rustc_type_ir::outlives::declared_bounds_from_definition(self.tcx, alias_ty)
+                .map(|r| VerifyBound::OutlivedBy(r));
 
         // see the extensive comment in projection_must_outlive
         let recursive_bound = {
             let mut components = smallvec![];
-            let kind = alias_ty.kind(self.tcx);
-            compute_alias_components_recursive(self.tcx, kind, alias_ty, &mut components);
+            compute_alias_components_recursive(self.tcx, alias_ty, &mut components);
             self.bound_from_components(&components)
         };
 
@@ -236,7 +236,8 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
                 // And therefore we can safely use structural equality for alias types.
                 (GenericKind::Param(p1), ty::Param(p2)) if p1 == p2 => {}
                 (GenericKind::Placeholder(p1), ty::Placeholder(p2)) if p1 == p2 => {}
-                (GenericKind::Alias(a1), ty::Alias(_, a2)) if a1.def_id == a2.def_id => {}
+                (GenericKind::Alias(a1), ty::Alias(a2)) if a1.kind.def_id() == a2.kind.def_id() => {
+                }
                 _ => return None,
             }
 
@@ -246,47 +247,5 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         }));
 
         bounds
-    }
-
-    /// Given a projection like `<T as Foo<'x>>::Bar`, returns any bounds
-    /// declared in the trait definition. For example, if the trait were
-    ///
-    /// ```rust
-    /// trait Foo<'a> {
-    ///     type Bar: 'a;
-    /// }
-    /// ```
-    ///
-    /// If we were given the `DefId` of `Foo::Bar`, we would return
-    /// `'a`. You could then apply the instantiations from the
-    /// projection to convert this into your namespace. This also
-    /// works if the user writes `where <Self as Foo<'a>>::Bar: 'a` on
-    /// the trait. In fact, it works by searching for just such a
-    /// where-clause.
-    ///
-    /// It will not, however, work for higher-ranked bounds like:
-    ///
-    /// ```ignore(this does compile today, previously was marked as `compile_fail,E0311`)
-    /// trait Foo<'a, 'b>
-    /// where for<'x> <Self as Foo<'x, 'b>>::Bar: 'x
-    /// {
-    ///     type Bar;
-    /// }
-    /// ```
-    ///
-    /// This is for simplicity, and because we are not really smart
-    /// enough to cope with such bounds anywhere.
-    pub(crate) fn declared_bounds_from_definition(
-        &self,
-        alias_ty: ty::AliasTy<'tcx>,
-    ) -> impl Iterator<Item = ty::Region<'tcx>> {
-        let tcx = self.tcx;
-        let bounds = tcx.item_self_bounds(alias_ty.def_id);
-        trace!("{:#?}", bounds.skip_binder());
-        bounds
-            .iter_instantiated(tcx, alias_ty.args)
-            .filter_map(|p| p.as_type_outlives_clause())
-            .filter_map(|p| p.no_bound_vars())
-            .map(|OutlivesPredicate(_, r)| r)
     }
 }

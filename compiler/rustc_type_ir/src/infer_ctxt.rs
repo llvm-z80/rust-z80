@@ -1,12 +1,36 @@
+use core::fmt;
+use std::hash::{Hash, Hasher};
+
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash_NoContext};
 
 use crate::fold::TypeFoldable;
 use crate::inherent::*;
 use crate::relate::RelateResult;
 use crate::relate::combine::PredicateEmittingRelation;
+use crate::solve::VisibleForLeakCheck;
 use crate::{self as ty, Interner, TyVid};
+
+mod private {
+    pub trait Sealed {}
+
+    impl Sealed for super::CantBeErased {}
+    impl Sealed for super::MayBeErased {}
+}
+pub trait TypingModeErasedStatus: private::Sealed + Clone + Copy + Hash + fmt::Debug {}
+
+#[derive(Clone, Copy, Hash, Debug)]
+pub enum CantBeErased {}
+#[derive(Clone, Copy, Hash, Debug)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub struct MayBeErased;
+
+impl TypingModeErasedStatus for CantBeErased {}
+impl TypingModeErasedStatus for MayBeErased {}
 
 /// The current typing mode of an inference context. We unfortunately have some
 /// slightly different typing rules depending on the current context. See the
@@ -18,12 +42,29 @@ use crate::{self as ty, Interner, TyVid};
 ///
 /// If neither of these functions are available, feel free to reach out to
 /// t-types for help.
-#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
+///
+/// Because typing rules get subtly different based on what typing mode we're in,
+/// subtle enough that changing the behavior of typing modes can sometimes cause
+/// changes that we don't even have tests for, we'd like to enforce the rule that
+/// any place where we specialize behavior based on the typing mode, we match
+/// *exhaustively* on the typing mode. That way, it's easy to determine all the
+/// places that must change when anything about typing modes changes.
+///
+/// Hence, `TypingMode` does not implement `Eq`, though [`TypingModeEqWrapper`] is available
+/// in the rare case that you do need this. Most cases where this currently matters is
+/// where we pass typing modes through the query system and want to cache based on it.
+/// See also `#[rustc_must_match_exhaustively]`, which tries to detect non-exhaustive
+/// matches.
+///
+/// Since matching on typing mode to single out `Coherence` is so common, and `Coherence`
+/// is so different from the other modes: see also [`is_coherence`](TypingMode::is_coherence)
+#[derive_where(Clone, Copy, Hash, Debug; I: Interner)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
-pub enum TypingMode<I: Interner> {
+#[cfg_attr(feature = "nightly", rustc_must_match_exhaustively)]
+pub enum TypingMode<I: Interner, S: TypingModeErasedStatus = MayBeErased> {
     /// When checking whether impls overlap, we check whether any obligations
     /// are guaranteed to never hold when unifying the impls. This requires us
     /// to be complete: we must never fail to prove something which may actually
@@ -79,20 +120,153 @@ pub enum TypingMode<I: Interner> {
     /// This is currently only used by the new solver, but should be implemented in
     /// the old solver as well.
     PostBorrowckAnalysis { defined_opaque_types: I::LocalDefIds },
-    /// After analysis, mostly during codegen and MIR optimizations, we're able to
+    /// After analysis, mostly during MIR optimizations, we're able to
     /// reveal all opaque types. As the hidden type should *never* be observable
     /// directly by the user, this should not be used by checks which may expose
     /// such details to the user.
     ///
-    /// There are some exceptions to this as for example `layout_of` and const-evaluation
-    /// always run in `PostAnalysis` mode, even when used during analysis. This exposes
-    /// some information about the underlying type to users, but not the type itself.
+    /// However, we restrict `layout_of` and const-evaluation from exposing some information like
+    /// coroutine layout which requires optimized MIR.
     PostAnalysis,
+
+    /// During codegen and MIR optimizations, we're able to reveal all opaque types and compute all
+    /// layouts.
+    Codegen,
+
+    /// The typing modes above (except coherence) only differ in how they handle
+    ///
+    /// - Generators
+    /// - Opaque types
+    /// - Specialization (in `PostAnalysis`)
+    ///
+    /// We replace all of them with this `TypingMode` in the first attempt at canonicalization.
+    /// If, during that attempt, we try to access information about opaques or generators
+    /// we bail out, setting a field on `EvalCtxt` that indicates the canonicalization must be
+    /// rerun in the original typing mode.
+    ///
+    /// `TypingMode::Coherence` is not replaced by this and is always kept as-is.
+    ErasedNotCoherence(S),
 }
 
-impl<I: Interner> Eq for TypingMode<I> {}
+/// We want to highly discourage using equality checks on typing modes.
+/// Instead you should match, **exhaustively**, so when we ever modify the enum we get a compile
+/// error. Only use `TypingModeEqWrapper` when you really really really have to.
+/// Prefer unwrapping `TypingModeEqWrapper` in apis that should return a `TypingMode` whenever
+/// possible, and if you ever get an `TypingModeEqWrapper`, prefer unwrapping it and matching on it **exhaustively**.
+#[derive_where(Clone, Copy, Debug; I: Interner)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub struct TypingModeEqWrapper<I: Interner>(pub TypingMode<I, MayBeErased>);
 
-impl<I: Interner> TypingMode<I> {
+impl<I: Interner> Hash for TypingModeEqWrapper<I> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl<I: Interner> PartialEq for TypingModeEqWrapper<I> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (TypingMode::Coherence, TypingMode::Coherence) => true,
+            (
+                TypingMode::Analysis { defining_opaque_types_and_generators: l },
+                TypingMode::Analysis { defining_opaque_types_and_generators: r },
+            ) => l == r,
+            (
+                TypingMode::Borrowck { defining_opaque_types: l },
+                TypingMode::Borrowck { defining_opaque_types: r },
+            ) => l == r,
+            (
+                TypingMode::PostBorrowckAnalysis { defined_opaque_types: l },
+                TypingMode::PostBorrowckAnalysis { defined_opaque_types: r },
+            ) => l == r,
+            (TypingMode::PostAnalysis, TypingMode::PostAnalysis) => true,
+            (TypingMode::Codegen, TypingMode::Codegen) => true,
+            (
+                TypingMode::ErasedNotCoherence(MayBeErased),
+                TypingMode::ErasedNotCoherence(MayBeErased),
+            ) => true,
+            (
+                TypingMode::Coherence
+                | TypingMode::Analysis { .. }
+                | TypingMode::Borrowck { .. }
+                | TypingMode::PostBorrowckAnalysis { .. }
+                | TypingMode::PostAnalysis
+                | TypingMode::Codegen
+                | TypingMode::ErasedNotCoherence(MayBeErased),
+                _,
+            ) => false,
+        }
+    }
+}
+
+impl<I: Interner> Eq for TypingModeEqWrapper<I> {}
+
+impl<I: Interner, S: TypingModeErasedStatus> TypingMode<I, S> {
+    /// There are a bunch of places in the compiler where we single out `Coherence`,
+    /// and alter behavior. We'd like to *always* match on `TypingMode` exhaustively,
+    /// but not having this method leads to a bunch of noisy code.
+    ///
+    /// See also the documentation on [`TypingMode`] about exhaustive matching.
+    pub fn is_coherence(&self) -> bool {
+        match self {
+            TypingMode::Coherence => true,
+            TypingMode::Analysis { .. }
+            | TypingMode::Borrowck { .. }
+            | TypingMode::PostBorrowckAnalysis { .. }
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen
+            | TypingMode::ErasedNotCoherence(_) => false,
+        }
+    }
+
+    /// There are a bunch of places in the trait solver where we single out `Coherence`,
+    /// and alter behavior. We'd like to *always* match on `TypingMode` exhaustively,
+    /// but not having this method leads to a bunch of noisy code.
+    ///
+    /// See also the documentation on [`TypingMode`] about exhaustive matching.
+    pub fn is_erased_not_coherence(&self) -> bool {
+        match self {
+            TypingMode::ErasedNotCoherence(_) => true,
+            TypingMode::Coherence
+            | TypingMode::Analysis { .. }
+            | TypingMode::Borrowck { .. }
+            | TypingMode::PostBorrowckAnalysis { .. }
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen => false,
+        }
+    }
+}
+
+impl<I: Interner> TypingMode<I, MayBeErased> {
+    /// Only call this when you're sure you're outside the next trait solver!
+    /// That means either not in the trait solver, or in code that is old-solver only.
+    ///
+    /// See the comment on `InferCtxt::typing_mode_raw`
+    pub fn assert_not_erased(self) -> TypingMode<I, CantBeErased> {
+        match self {
+            TypingMode::Coherence => TypingMode::Coherence,
+            TypingMode::Analysis { defining_opaque_types_and_generators } => {
+                TypingMode::Analysis { defining_opaque_types_and_generators }
+            }
+            TypingMode::Borrowck { defining_opaque_types } => {
+                TypingMode::Borrowck { defining_opaque_types }
+            }
+            TypingMode::PostBorrowckAnalysis { defined_opaque_types } => {
+                TypingMode::PostBorrowckAnalysis { defined_opaque_types }
+            }
+            TypingMode::PostAnalysis => TypingMode::PostAnalysis,
+            TypingMode::Codegen => TypingMode::Codegen,
+            TypingMode::ErasedNotCoherence(MayBeErased) => panic!(
+                "Called `assert_not_erased` from a place that can be called by the trait solver in `TypingMode::ErasedNotCoherence`. `TypingMode` is `ErasedNotCoherence` in a place where that should be impossible"
+            ),
+        }
+    }
+}
+
+impl<I: Interner> TypingMode<I, CantBeErased> {
     /// Analysis outside of a body does not define any opaque types.
     pub fn non_body_analysis() -> TypingMode<I> {
         TypingMode::Analysis { defining_opaque_types_and_generators: Default::default() }
@@ -135,6 +309,25 @@ impl<I: Interner> TypingMode<I> {
     }
 }
 
+impl<I: Interner> From<TypingMode<I, CantBeErased>> for TypingMode<I, MayBeErased> {
+    fn from(value: TypingMode<I, CantBeErased>) -> Self {
+        match value {
+            TypingMode::Coherence => TypingMode::Coherence,
+            TypingMode::Analysis { defining_opaque_types_and_generators } => {
+                TypingMode::Analysis { defining_opaque_types_and_generators }
+            }
+            TypingMode::Borrowck { defining_opaque_types } => {
+                TypingMode::Borrowck { defining_opaque_types }
+            }
+            TypingMode::PostBorrowckAnalysis { defined_opaque_types } => {
+                TypingMode::PostBorrowckAnalysis { defined_opaque_types }
+            }
+            TypingMode::PostAnalysis => TypingMode::PostAnalysis,
+            TypingMode::Codegen => TypingMode::Codegen,
+        }
+    }
+}
+
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_infer_ctxt_like")]
 pub trait InferCtxtLike: Sized {
     type Interner: Interner;
@@ -148,10 +341,29 @@ pub trait InferCtxtLike: Sized {
         true
     }
 
-    fn typing_mode(&self) -> TypingMode<Self::Interner>;
+    fn disable_trait_solver_fast_paths(&self) -> bool;
+
+    fn typing_mode_raw(&self) -> TypingMode<Self::Interner>;
 
     fn universe(&self) -> ty::UniverseIndex;
     fn create_next_universe(&self) -> ty::UniverseIndex;
+
+    fn insert_placeholder_assumptions(
+        &self,
+        u: ty::UniverseIndex,
+        assumptions: Option<crate::region_constraint::Assumptions<Self::Interner>>,
+    );
+    fn get_placeholder_assumptions(
+        &self,
+        u: ty::UniverseIndex,
+    ) -> Option<crate::region_constraint::Assumptions<Self::Interner>>;
+    fn get_solver_region_constraint(
+        &self,
+    ) -> crate::region_constraint::RegionConstraint<Self::Interner>;
+    fn overwrite_solver_region_constraint(
+        &self,
+        constraint: crate::region_constraint::RegionConstraint<Self::Interner>,
+    );
 
     fn universe_of_ty(&self, ty: ty::TyVid) -> Option<ty::UniverseIndex>;
     fn universe_of_lt(&self, lt: ty::RegionVid) -> Option<ty::UniverseIndex>;
@@ -242,6 +454,7 @@ pub trait InferCtxtLike: Sized {
         &self,
         sub: <Self::Interner as Interner>::Region,
         sup: <Self::Interner as Interner>::Region,
+        vis: VisibleForLeakCheck,
         span: <Self::Interner as Interner>::Span,
     );
 
@@ -249,7 +462,13 @@ pub trait InferCtxtLike: Sized {
         &self,
         a: <Self::Interner as Interner>::Region,
         b: <Self::Interner as Interner>::Region,
+        vis: VisibleForLeakCheck,
         span: <Self::Interner as Interner>::Span,
+    );
+
+    fn register_solver_region_constraint(
+        &self,
+        c: crate::region_constraint::RegionConstraint<Self::Interner>,
     );
 
     fn register_ty_outlives(
@@ -322,6 +541,12 @@ where
     // Note: `feature_bound_holds_in_crate` does not consider a feature to be enabled
     // if we are in std/core even if there is a corresponding `feature` attribute on the crate.
 
-    (infcx.typing_mode() == TypingMode::PostAnalysis)
-        || infcx.cx().features().feature_bound_holds_in_crate(symbol)
+    match infcx.typing_mode_raw().assert_not_erased() {
+        TypingMode::Coherence
+        | TypingMode::Analysis { .. }
+        | TypingMode::Borrowck { .. }
+        | TypingMode::PostBorrowckAnalysis { .. }
+        | TypingMode::PostAnalysis => infcx.cx().features().feature_bound_holds_in_crate(symbol),
+        TypingMode::Codegen => true,
+    }
 }

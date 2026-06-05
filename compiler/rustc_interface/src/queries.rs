@@ -36,7 +36,7 @@ impl Linker {
         Linker {
             dep_graph: tcx.dep_graph.clone(),
             output_filenames: Arc::clone(tcx.output_filenames(())),
-            crate_hash: if tcx.needs_crate_hash() {
+            crate_hash: if tcx.sess.opts.incremental.is_some() {
                 Some(tcx.crate_hash(LOCAL_CRATE))
             } else {
                 None
@@ -53,9 +53,12 @@ impl Linker {
                 // This was a check only build
                 Ok(compiled_modules) => (*compiled_modules, IndexMap::default()),
 
-                Err(ongoing_codegen) => {
-                    codegen_backend.join_codegen(ongoing_codegen, sess, &self.output_filenames)
-                }
+                Err(ongoing_codegen) => codegen_backend.join_codegen(
+                    ongoing_codegen,
+                    sess,
+                    &self.output_filenames,
+                    &self.crate_info,
+                ),
             }
         });
 
@@ -65,6 +68,22 @@ impl Linker {
 
         if sess.print_llvm_stats() {
             codegen_backend.print_statistics()
+        }
+
+        if let Some(out_path) = sess.print_llvm_stats_json() {
+            let llvm_stats_json = codegen_backend.print_statistics_json();
+
+            if !llvm_stats_json.is_empty() {
+                if let Err(e) = std::fs::write(&out_path, llvm_stats_json) {
+                    sess.dcx().err(format!("failed to write stats to {}: {}", out_path, e));
+                }
+            } else {
+                sess.dcx().warn(format!(
+                    "requested to print LLVM statistics to JSON file {}, but the codegen backend \
+                    did not provide any statistics",
+                    out_path,
+                ));
+            }
         }
 
         sess.timings.end_section(sess.dcx(), TimingSection::Codegen);

@@ -6,7 +6,7 @@ use std::str;
 use rustc_abi::Align;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::profiling::TimePassesFormat;
-use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_errors::{ColorConfig, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hashes::Hash64;
@@ -51,14 +51,14 @@ macro_rules! hash_substruct {
     ($opt_name:ident, $opt_expr:expr, $error_format:expr, $for_crate_hash:expr, $hasher:expr, [UNTRACKED]) => {{}};
     ($opt_name:ident, $opt_expr:expr, $error_format:expr, $for_crate_hash:expr, $hasher:expr, [TRACKED]) => {{}};
     ($opt_name:ident, $opt_expr:expr, $error_format:expr, $for_crate_hash:expr, $hasher:expr, [TRACKED_NO_CRATE_HASH]) => {{}};
-    ($opt_name:ident, $opt_expr:expr, $error_format:expr, $for_crate_hash:expr, $hasher:expr, [SUBSTRUCT]) => {
+    ($opt_name:ident, $opt_expr:expr, $error_format:expr, $for_crate_hash:expr, $hasher:expr, [SUBSTRUCT]) => {{
         use crate::config::dep_tracking::DepTrackingHash;
         $opt_expr.dep_tracking_hash($for_crate_hash, $error_format).hash(
             $hasher,
             $error_format,
             $for_crate_hash,
         );
-    };
+    }};
 }
 
 /// Extended target modifier info.
@@ -83,6 +83,8 @@ pub struct TargetModifier {
     /// User-provided option value (before parsing)
     pub value_name: String,
 }
+
+pub mod mitigation_coverage;
 
 mod target_modifier_consistency_check {
     use super::*;
@@ -139,10 +141,10 @@ impl TargetModifier {
         assert!(other.is_none() || self.opt == other.unwrap().opt);
         match self.opt {
             OptionsTargetModifiers::UnstableOptions(unstable) => match unstable {
-                UnstableOptionsTargetModifiers::sanitizer => {
+                UnstableOptionsTargetModifiers::Sanitizer => {
                     return target_modifier_consistency_check::sanitizer(self, other);
                 }
-                UnstableOptionsTargetModifiers::sanitizer_cfi_normalize_integers => {
+                UnstableOptionsTargetModifiers::SanitizerCfiNormalizeIntegers => {
                     return target_modifier_consistency_check::sanitizer_cfi_normalize_integers(
                         sess, self, other,
                     );
@@ -168,199 +170,110 @@ fn tmod_push_impl(
     }
 }
 
-macro_rules! tmod_push {
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr) => {
-        if *$opt_expr != $init {
-            tmod_push_impl(
-                OptionsTargetModifiers::$struct_name($tmod_enum_name::$opt_name),
-                $tmod_vals,
-                $mods,
-            );
-        }
-    };
-}
-
-macro_rules! gather_tmods {
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [SUBSTRUCT], [TARGET_MODIFIER]) => {
-        compile_error!("SUBSTRUCT can't be target modifier");
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [UNTRACKED], [TARGET_MODIFIER]) => {
-        tmod_push!($struct_name, $tmod_enum_name, $opt_name, $opt_expr, $init, $mods, $tmod_vals)
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [TRACKED], [TARGET_MODIFIER]) => {
-        tmod_push!($struct_name, $tmod_enum_name, $opt_name, $opt_expr, $init, $mods, $tmod_vals)
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [TRACKED_NO_CRATE_HASH], [TARGET_MODIFIER]) => {
-        tmod_push!($struct_name, $tmod_enum_name, $opt_name, $opt_expr, $init, $mods, $tmod_vals)
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [SUBSTRUCT], []) => {
-        $opt_expr.gather_target_modifiers($mods, $tmod_vals);
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [UNTRACKED], []) => {{}};
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [TRACKED], []) => {{}};
-    ($struct_name:ident, $tmod_enum_name:ident, $opt_name:ident, $opt_expr:expr, $init:expr, $mods:expr, $tmod_vals:expr,
-        [TRACKED_NO_CRATE_HASH], []) => {{}};
-}
-
-macro_rules! gather_tmods_top_level {
-    ($_opt_name:ident, $opt_expr:expr, $mods:expr, $tmod_vals:expr, [SUBSTRUCT $substruct_enum:ident]) => {
-        $opt_expr.gather_target_modifiers($mods, $tmod_vals);
-    };
-    ($opt_name:ident, $opt_expr:expr, $mods:expr, $tmod_vals:expr, [$non_substruct:ident TARGET_MODIFIER]) => {
-        compile_error!("Top level option can't be target modifier");
-    };
-    ($opt_name:ident, $opt_expr:expr, $mods:expr, $tmod_vals:expr, [$non_substruct:ident]) => {};
-}
-
-/// Macro for generating OptionsTargetsModifiers top-level enum with impl.
-/// Will generate something like:
-/// ```rust,ignore (illustrative)
-/// pub enum OptionsTargetModifiers {
-///     CodegenOptions(CodegenOptionsTargetModifiers),
-///     UnstableOptions(UnstableOptionsTargetModifiers),
-/// }
-/// impl OptionsTargetModifiers {
-///     pub fn reparse(&self, user_value: &str) -> ExtendedTargetModifierInfo {
-///         match self {
-///             Self::CodegenOptions(v) => v.reparse(user_value),
-///             Self::UnstableOptions(v) => v.reparse(user_value),
-///         }
-///     }
-///     pub fn is_target_modifier(flag_name: &str) -> bool {
-///         CodegenOptionsTargetModifiers::is_target_modifier(flag_name) ||
-///         UnstableOptionsTargetModifiers::is_target_modifier(flag_name)
-///     }
-/// }
-/// ```
-macro_rules! top_level_tmod_enum {
-    ($( {$($optinfo:tt)*} ),* $(,)*) => {
-        top_level_tmod_enum! { @parse {}, (user_value){}; $($($optinfo)*|)* }
-    };
-    // Termination
-    (
-        @parse
-        {$($variant:tt($substruct_enum:tt))*},
-        ($user_value:ident){$($pout:tt)*};
-    ) => {
-        #[allow(non_camel_case_types)]
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Encodable, BlobDecodable)]
-        pub enum OptionsTargetModifiers {
-            $($variant($substruct_enum)),*
-        }
-        impl OptionsTargetModifiers {
-            #[allow(unused_variables)]
-            pub fn reparse(&self, $user_value: &str) -> ExtendedTargetModifierInfo {
-                #[allow(unreachable_patterns)]
-                match self {
-                    $($pout)*
-                    _ => panic!("unknown target modifier option: {:?}", *self)
-                }
-            }
-            pub fn is_target_modifier(flag_name: &str) -> bool {
-                $($substruct_enum::is_target_modifier(flag_name))||*
-            }
-        }
-    };
-    // Adding SUBSTRUCT option group into $eout
-    (
-        @parse {$($eout:tt)*}, ($puser_value:ident){$($pout:tt)*};
-            [SUBSTRUCT $substruct_enum:ident $variant:ident] |
-        $($tail:tt)*
-    ) => {
-        top_level_tmod_enum! {
-            @parse
-            {
-                $($eout)*
-                $variant($substruct_enum)
-            },
-            ($puser_value){
-                $($pout)*
-                Self::$variant(v) => v.reparse($puser_value),
-            };
-            $($tail)*
-        }
-    };
-    // Skipping non-target-modifier and non-substruct
-    (
-        @parse {$($eout:tt)*}, ($puser_value:ident){$($pout:tt)*};
-            [$non_substruct:ident] |
-        $($tail:tt)*
-    ) => {
-        top_level_tmod_enum! {
-            @parse
-            {
-                $($eout)*
-            },
-            ($puser_value){
-                $($pout)*
-            };
-            $($tail)*
-        }
-    };
-}
-
 macro_rules! top_level_options {
-    ( $( #[$top_level_attr:meta] )* pub struct Options { $(
-        $( #[$attr:meta] )*
-        $opt:ident : $t:ty [$dep_tracking_marker:ident $( $tmod:ident $variant:ident )?],
-    )* } ) => (
-        top_level_tmod_enum!( {$([$dep_tracking_marker $($tmod $variant),*])|*} );
-
-        #[derive(Clone)]
-        $( #[$top_level_attr] )*
+    (
+        $(#[$top_level_attr:meta])*
         pub struct Options {
             $(
-                $( #[$attr] )*
-                pub $opt: $t
-            ),*,
+                $(#[$attr:meta])*
+                $opt:ident : $t:ty
+                [$dep_tracking_marker:ident]
+                $( { TARGET_MODIFIER: $tmod_variant:ident($tmod_enum:ident) } )?
+                ,
+            )*
+        }
+    ) => {
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Encodable, BlobDecodable)]
+        pub enum OptionsTargetModifiers {
+            $(
+                $(
+                    $tmod_variant($tmod_enum),
+                )?
+            )*
+        }
+
+        impl OptionsTargetModifiers {
+            pub fn reparse(&self, user_value: &str) -> ExtendedTargetModifierInfo {
+                match self {
+                    $(
+                        $(
+                            Self::$tmod_variant(v) => v.reparse(user_value),
+                        )?
+                    )*
+                    #[allow(unreachable_patterns)]
+                    _ => panic!("unknown target modifier option: {self:?}"),
+                }
+            }
+
+            pub fn is_target_modifier(flag_name: &str) -> bool {
+                $(
+                    $(
+                        if $tmod_enum::is_target_modifier(flag_name) {
+                            return true
+                        }
+                    )?
+                )*
+                false
+            }
+        }
+
+        #[derive(Clone)]
+        $(#[$top_level_attr])*
+        pub struct Options {
+            $(
+                $(#[$attr])*
+                pub $opt: $t,
+            )*
             pub target_modifiers: BTreeMap<OptionsTargetModifiers, String>,
+            pub mitigation_coverage_map: mitigation_coverage::MitigationCoverageMap,
         }
 
         impl Options {
             pub fn dep_tracking_hash(&self, for_crate_hash: bool) -> Hash64 {
                 let mut sub_hashes = BTreeMap::new();
-                $({
-                    hash_opt!($opt,
-                                &self.$opt,
-                                &mut sub_hashes,
-                                for_crate_hash,
-                                [$dep_tracking_marker]);
-                })*
+                $(
+                    hash_opt!(
+                        $opt,
+                        &self.$opt,
+                        &mut sub_hashes,
+                        for_crate_hash,
+                        [$dep_tracking_marker]
+                    );
+                )*
                 let mut hasher = StableHasher::new();
-                dep_tracking::stable_hash(sub_hashes,
-                                          &mut hasher,
-                                          self.error_format,
-                                          for_crate_hash);
-                $({
-                    hash_substruct!($opt,
+                dep_tracking::stable_hash(
+                    sub_hashes,
+                    &mut hasher,
+                    self.error_format,
+                    for_crate_hash,
+                );
+                $(
+                    hash_substruct!(
+                        $opt,
                         &self.$opt,
                         self.error_format,
                         for_crate_hash,
                         &mut hasher,
-                        [$dep_tracking_marker]);
-                })*
+                        [$dep_tracking_marker]
+                    );
+                )*
                 hasher.finish()
             }
 
             pub fn gather_target_modifiers(&self) -> Vec<TargetModifier> {
                 let mut mods = Vec::<TargetModifier>::new();
-                $({
-                    gather_tmods_top_level!($opt,
-                        &self.$opt, &mut mods, &self.target_modifiers,
-                        [$dep_tracking_marker $($tmod),*]);
-                })*
+                $(
+                    $(
+                        // Only expand for flags that have `TARGET_MODIFIER`.
+                        ${ignore($tmod_enum)}
+                        self.$opt.gather_target_modifiers(&mut mods, &self.target_modifiers);
+                    )?
+                )*
                 mods.sort_by(|a, b| a.opt.cmp(&b.opt));
                 mods
             }
         }
-    );
+    }
 }
 
 top_level_options!(
@@ -419,14 +332,10 @@ top_level_options!(
         /// If `Some`, enable incremental compilation, using the given
         /// directory to store intermediate results.
         incremental: Option<PathBuf> [UNTRACKED],
-        /// Set based on the result of the `Config::track_state` callback
-        /// for custom drivers to invalidate the incremental cache.
-        #[rustc_lint_opt_deny_field_access("should only be used via `Config::track_state`")]
-        untracked_state_hash: Hash64 [TRACKED_NO_CRATE_HASH],
 
-        unstable_opts: UnstableOptions [SUBSTRUCT UnstableOptionsTargetModifiers UnstableOptions],
+        unstable_opts: UnstableOptions [SUBSTRUCT] { TARGET_MODIFIER: UnstableOptions(UnstableOptionsTargetModifiers) },
         prints: Vec<PrintRequest> [UNTRACKED],
-        cg: CodegenOptions [SUBSTRUCT CodegenOptionsTargetModifiers CodegenOptions],
+        cg: CodegenOptions [SUBSTRUCT] { TARGET_MODIFIER: CodegenOptions(CodegenOptionsTargetModifiers) },
         externs: Externs [UNTRACKED],
         crate_name: Option<String> [TRACKED],
         /// Indicates how the compiler should treat unstable features.
@@ -503,95 +412,43 @@ top_level_options!(
     }
 );
 
-macro_rules! tmod_enum_opt {
-    ($struct_name:ident, $tmod_enum_name:ident, $opt:ident, $v:ident) => {
-        Some(OptionsTargetModifiers::$struct_name($tmod_enum_name::$opt))
-    };
-    ($struct_name:ident, $tmod_enum_name:ident, $opt:ident, ) => {
-        None
-    };
+#[derive(Default)]
+pub struct CollectedOptions {
+    pub target_modifiers: BTreeMap<OptionsTargetModifiers, String>,
+    pub mitigations: mitigation_coverage::MitigationCoverageMap,
 }
 
-macro_rules! tmod_enum {
-    ($tmod_enum_name:ident, $prefix:expr, $( {$($optinfo:tt)*} ),* $(,)*) => {
-        tmod_enum! { $tmod_enum_name, $prefix, @parse {}, (user_value){}; $($($optinfo)*|)* }
-    };
-    // Termination
-    (
-        $tmod_enum_name:ident, $prefix:expr,
-        @parse
-        {$($eout:tt)*},
-        ($user_value:ident){$($pout:tt)*};
-    ) => {
-        #[allow(non_camel_case_types)]
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Encodable, BlobDecodable)]
-        pub enum $tmod_enum_name {
-            $($eout),*
-        }
-        impl $tmod_enum_name {
-            #[allow(unused_variables)]
-            pub fn reparse(&self, $user_value: &str) -> ExtendedTargetModifierInfo {
-                #[allow(unreachable_patterns)]
-                match self {
-                    $($pout)*
-                    _ => panic!("unknown target modifier option: {:?}", *self)
-                }
-            }
-            pub fn is_target_modifier(flag_name: &str) -> bool {
-                match flag_name.replace('-', "_").as_str() {
-                    $(stringify!($eout) => true,)*
-                    _ => false,
-                }
-            }
+macro_rules! setter_for {
+    // the allow/deny-mitigations options use collected/index instead of the cg, since they
+    // work across option groups
+    (allow_partial_mitigations, $struct_name:ident, $parse:ident) => {
+        pub(super) fn allow_partial_mitigations(
+            _cg: &mut super::$struct_name,
+            collected: &mut super::CollectedOptions,
+            v: Option<&str>,
+            index: usize,
+        ) -> bool {
+            collected.mitigations.handle_allowdeny_mitigation_option(v, index, true)
         }
     };
-    // Adding target-modifier option into $eout
-    (
-        $tmod_enum_name:ident, $prefix:expr,
-        @parse {$($eout:tt)*}, ($puser_value:ident){$($pout:tt)*};
-            $opt:ident, $parse:ident, $t:ty, [TARGET_MODIFIER] |
-        $($tail:tt)*
-    ) => {
-        tmod_enum! {
-            $tmod_enum_name, $prefix,
-            @parse
-            {
-                $($eout)*
-                $opt
-            },
-            ($puser_value){
-                $($pout)*
-                Self::$opt => {
-                    let mut parsed : $t = Default::default();
-                    let val = if $puser_value.is_empty() { None } else { Some($puser_value) };
-                    parse::$parse(&mut parsed, val);
-                    ExtendedTargetModifierInfo {
-                        prefix: $prefix.to_string(),
-                        name: stringify!($opt).to_string().replace('_', "-"),
-                        tech_value: format!("{:?}", parsed),
-                    }
-                },
-            };
-            $($tail)*
+    (deny_partial_mitigations, $struct_name:ident, $parse:ident) => {
+        pub(super) fn deny_partial_mitigations(
+            _cg: &mut super::$struct_name,
+            collected: &mut super::CollectedOptions,
+            v: Option<&str>,
+            index: usize,
+        ) -> bool {
+            collected.mitigations.handle_allowdeny_mitigation_option(v, index, false)
         }
     };
-    // Skipping non-target-modifier
-    (
-        $tmod_enum_name:ident, $prefix:expr,
-        @parse {$($eout:tt)*}, ($puser_value:ident){$($pout:tt)*};
-            $opt:ident, $parse:ident, $t:ty, [] |
-        $($tail:tt)*
-    ) => {
-        tmod_enum! {
-            $tmod_enum_name, $prefix,
-            @parse
-            {
-                $($eout)*
-            },
-            ($puser_value){
-                $($pout)*
-            };
-            $($tail)*
+    ($opt:ident, $struct_name:ident, $parse:ident) => {
+        pub(super) fn $opt(
+            cg: &mut super::$struct_name,
+            _collected: &mut super::CollectedOptions,
+            v: Option<&str>,
+            _index: usize,
+        ) -> bool {
+            super::parse::$parse(&mut redirect_field!(cg.$opt), v)
         }
     };
 }
@@ -605,80 +462,169 @@ macro_rules! tmod_enum {
 /// generated code to parse an option into its respective field in the struct. There are a few
 /// hand-written parsers for parsing specific types of values in this module.
 macro_rules! options {
-    ($struct_name:ident, $tmod_enum_name:ident, $stat:ident, $optmod:ident, $prefix:expr, $outputname:expr,
-     $($( #[$attr:meta] )* $opt:ident : $t:ty = (
-        $init:expr,
-        $parse:ident,
-        [$dep_tracking_marker:ident $( $tmod:ident )?],
-        $desc:expr
-        $(, removed: $removed:ident )?)
-     ),* ,) =>
-(
-    #[derive(Clone)]
-    #[rustc_lint_opt_ty]
-    pub struct $struct_name { $( $( #[$attr] )* pub $opt: $t),* }
+    (
+        $struct_name:ident,
+        $tmod_enum:ident,
+        $stat:ident,
+        $optmod:ident,
+        $prefix:expr,
+        $outputname:expr,
 
-    tmod_enum!( $tmod_enum_name, $prefix, {$($opt, $parse, $t, [$($tmod),*])|*} );
+        $(
+            $(#[$attr:meta])*
+            $opt:ident : $t:ty = (
+                $init:expr,
+                $parse:ident,
+                [$dep_tracking_marker:ident]
+                $( { TARGET_MODIFIER: $tmod_variant:ident } )?
+                $( { MITIGATION: $mitigation_variant:ident } )?
+                ,
+                $desc:literal
+                $(, removed: $removed:ident )?
+            ),
+        )*
+    ) => {
+        #[derive(Clone)]
+        #[rustc_lint_opt_ty]
+        pub struct $struct_name {
+            $(
+                $(#[$attr])*
+                pub $opt: $t,
+            )*
+        }
 
-    impl Default for $struct_name {
-        fn default() -> $struct_name {
-            $struct_name { $($opt: $init),* }
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Copy, Clone, Encodable, BlobDecodable)]
+        pub enum $tmod_enum {
+            $(
+                $( $tmod_variant, )?
+            )*
+        }
+
+        impl $tmod_enum {
+            pub fn reparse(&self, _user_value: &str) -> ExtendedTargetModifierInfo {
+                match self {
+                    $(
+                        $(
+                            Self::$tmod_variant => {
+                                let mut parsed: $t = Default::default();
+                                let val = if _user_value.is_empty() { None } else { Some(_user_value) };
+                                parse::$parse(&mut parsed, val);
+                                ExtendedTargetModifierInfo {
+                                    prefix: $prefix.to_string(),
+                                    name: stringify!($opt).to_string().replace('_', "-"),
+                                    tech_value: format!("{:?}", parsed),
+                                }
+                            }
+                        )?
+                    )*
+
+                    #[allow(unreachable_patterns)]
+                    _ => panic!("unknown target modifier option: {:?}", *self)
+                }
+            }
+
+            pub fn is_target_modifier(flag_name: &str) -> bool {
+                match flag_name.replace('-', "_").as_str() {
+                    $(
+                        $(
+                            // Only expand for flags that have `TARGET_MODIFIER`.
+                            ${ignore($tmod_variant)}
+                            stringify!($opt) => true,
+                        )?
+                    )*
+                    _ => false,
+                }
+            }
+        }
+
+        impl Default for $struct_name {
+            fn default() -> $struct_name {
+                $struct_name {
+                    $(
+                        $opt: $init,
+                    )*
+                }
+            }
+        }
+
+        impl $struct_name {
+            pub fn build(
+                early_dcx: &EarlyDiagCtxt,
+                matches: &getopts::Matches,
+                target_modifiers: &mut CollectedOptions,
+            ) -> $struct_name {
+                build_options(early_dcx, matches, target_modifiers, $stat, $prefix, $outputname)
+            }
+
+            fn dep_tracking_hash(
+                &self,
+                for_crate_hash: bool,
+                error_format: ErrorOutputType,
+            ) -> Hash64 {
+                let mut sub_hashes = BTreeMap::new();
+                $(
+                    hash_opt!(
+                        $opt,
+                        &self.$opt,
+                        &mut sub_hashes,
+                        for_crate_hash,
+                        [$dep_tracking_marker]
+                    );
+                )*
+                let mut hasher = StableHasher::new();
+                dep_tracking::stable_hash(
+                    sub_hashes,
+                    &mut hasher,
+                    error_format,
+                    for_crate_hash,
+                );
+                hasher.finish()
+            }
+
+            pub fn gather_target_modifiers(
+                &self,
+                _mods: &mut Vec<TargetModifier>,
+                _tmod_vals: &BTreeMap<OptionsTargetModifiers, String>,
+            ) {
+                $(
+                    $(
+                        if self.$opt != $init {
+                            tmod_push_impl(
+                                OptionsTargetModifiers::$struct_name($tmod_enum::$tmod_variant),
+                                _tmod_vals,
+                                _mods,
+                            );
+                        }
+                    )?
+                )*
+            }
+        }
+
+        pub const $stat: OptionDescrs<$struct_name> = &[
+            $(
+                OptionDesc {
+                    name: stringify!($opt),
+                    setter: $optmod::$opt,
+                    type_desc: desc::$parse,
+                    desc: $desc,
+                    removed: None $( .or(Some(RemovedOption::$removed)) )?,
+                    tmod: None $( .or(Some(
+                        OptionsTargetModifiers::$struct_name($tmod_enum::$tmod_variant)
+                    )))?,
+                    mitigation: None $( .or(Some(
+                        mitigation_coverage::DeniedPartialMitigationKind::$mitigation_variant
+                    )))?,
+                },
+            )*
+        ];
+
+        mod $optmod {
+            $(
+                setter_for!($opt, $struct_name, $parse);
+            )*
         }
     }
-
-    impl $struct_name {
-        pub fn build(
-            early_dcx: &EarlyDiagCtxt,
-            matches: &getopts::Matches,
-            target_modifiers: &mut BTreeMap<OptionsTargetModifiers, String>,
-        ) -> $struct_name {
-            build_options(early_dcx, matches, target_modifiers, $stat, $prefix, $outputname)
-        }
-
-        fn dep_tracking_hash(&self, for_crate_hash: bool, error_format: ErrorOutputType) -> Hash64 {
-            let mut sub_hashes = BTreeMap::new();
-            $({
-                hash_opt!($opt,
-                            &self.$opt,
-                            &mut sub_hashes,
-                            for_crate_hash,
-                            [$dep_tracking_marker]);
-            })*
-            let mut hasher = StableHasher::new();
-            dep_tracking::stable_hash(sub_hashes,
-                                        &mut hasher,
-                                        error_format,
-                                        for_crate_hash
-                                        );
-            hasher.finish()
-        }
-
-        pub fn gather_target_modifiers(
-            &self,
-            _mods: &mut Vec<TargetModifier>,
-            _tmod_vals: &BTreeMap<OptionsTargetModifiers, String>,
-        ) {
-            $({
-                gather_tmods!($struct_name, $tmod_enum_name, $opt, &self.$opt, $init, _mods, _tmod_vals,
-                    [$dep_tracking_marker], [$($tmod),*]);
-            })*
-        }
-    }
-
-    pub const $stat: OptionDescrs<$struct_name> =
-        &[ $( OptionDesc{ name: stringify!($opt), setter: $optmod::$opt,
-            type_desc: desc::$parse, desc: $desc, removed: None $( .or(Some(RemovedOption::$removed)) )?,
-            tmod: tmod_enum_opt!($struct_name, $tmod_enum_name, $opt, $($tmod),*) } ),* ];
-
-    mod $optmod {
-    $(
-        pub(super) fn $opt(cg: &mut super::$struct_name, v: Option<&str>) -> bool {
-            super::parse::$parse(&mut redirect_field!(cg.$opt), v)
-        }
-    )*
-    }
-
-) }
+}
 
 impl CodegenOptions {
     // JUSTIFICATION: defn of the suggested wrapper fn
@@ -702,11 +648,12 @@ macro_rules! redirect_field {
     };
 }
 
-type OptionSetter<O> = fn(&mut O, v: Option<&str>) -> bool;
+type OptionSetter<O> = fn(&mut O, &mut CollectedOptions, v: Option<&str>, pos: usize) -> bool;
 type OptionDescrs<O> = &'static [OptionDesc<O>];
 
 /// Indicates whether a removed option should warn or error.
 enum RemovedOption {
+    #[allow(unused)] // we might want deprecated options that warn again in the future
     Warn,
     Err,
 }
@@ -720,6 +667,7 @@ pub struct OptionDesc<O> {
     desc: &'static str,
     removed: Option<RemovedOption>,
     tmod: Option<OptionsTargetModifiers>,
+    mitigation: Option<mitigation_coverage::DeniedPartialMitigationKind>,
 }
 
 impl<O> OptionDesc<O> {
@@ -735,13 +683,13 @@ impl<O> OptionDesc<O> {
 fn build_options<O: Default>(
     early_dcx: &EarlyDiagCtxt,
     matches: &getopts::Matches,
-    target_modifiers: &mut BTreeMap<OptionsTargetModifiers, String>,
+    collected_options: &mut CollectedOptions,
     descrs: OptionDescrs<O>,
     prefix: &str,
     outputname: &str,
 ) -> O {
     let mut op = O::default();
-    for option in matches.opt_strs(prefix) {
+    for (index, option) in matches.opt_strs_pos(prefix) {
         let (key, value) = match option.split_once('=') {
             None => (option, None),
             Some((k, v)) => (k.to_string(), Some(v)),
@@ -749,7 +697,7 @@ fn build_options<O: Default>(
 
         let option_to_lookup = key.replace('-', "_");
         match descrs.iter().find(|opt_desc| opt_desc.name == option_to_lookup) {
-            Some(OptionDesc { name: _, setter, type_desc, desc, removed, tmod }) => {
+            Some(OptionDesc { name: _, setter, type_desc, desc, removed, tmod, mitigation }) => {
                 if let Some(removed) = removed {
                     // deprecation works for prefixed options only
                     assert!(!prefix.is_empty());
@@ -762,7 +710,7 @@ fn build_options<O: Default>(
                         }
                     }
                 }
-                if !setter(&mut op, value) {
+                if !setter(&mut op, collected_options, value, index) {
                     match value {
                         None => early_dcx.early_fatal(
                             format!(
@@ -778,7 +726,10 @@ fn build_options<O: Default>(
                 }
                 if let Some(tmod) = *tmod {
                     let v = value.map_or(String::new(), ToOwned::to_owned);
-                    target_modifiers.insert(tmod, v);
+                    collected_options.target_modifiers.insert(tmod, v);
+                }
+                if let Some(mitigation) = mitigation {
+                    collected_options.mitigations.reset_mitigation(*mitigation, index);
                 }
             }
             None => early_dcx.early_fatal(format!("unknown {outputname} option: `{key}`")),
@@ -809,7 +760,7 @@ mod desc {
     pub(crate) const parse_number: &str = "a number";
     pub(crate) const parse_opt_number: &str = parse_number;
     pub(crate) const parse_frame_pointer: &str = "one of `true`/`yes`/`on`, `false`/`no`/`off`, or (with -Zunstable-options) `non-leaf` or `always`";
-    pub(crate) const parse_threads: &str = parse_number;
+    pub(crate) const parse_threads: &str = "a number or `sync`";
     pub(crate) const parse_time_passes_format: &str = "`text` (default) or `json`";
     pub(crate) const parse_passes: &str = "a space-separated list of passes, or `all`";
     pub(crate) const parse_panic_strategy: &str = "either `unwind`, `abort`, or `immediate-abort`";
@@ -832,6 +783,8 @@ mod desc {
     pub(crate) const parse_dump_mono_stats: &str = "`markdown` (default) or `json`";
     pub(crate) const parse_instrument_coverage: &str = parse_bool;
     pub(crate) const parse_coverage_options: &str = "`block` | `branch` | `condition`";
+    pub(crate) const parse_codegen_retag_options: &str =
+        "either no value or a comma-separated list of settings: `no-precise-im`, `no-precise-pin`";
     pub(crate) const parse_instrument_xray: &str = "either a boolean (`yes`, `no`, `on`, `off`, etc), or a comma separated list of settings: `always` or `never` (mutually exclusive), `ignore-loops`, `instruction-threshold=N`, `skip-entry`, `skip-exit`";
     pub(crate) const parse_unpretty: &str = "`string` or `string=string`";
     pub(crate) const parse_treat_err_as_bug: &str = "either no value or a non-negative number";
@@ -889,6 +842,10 @@ mod desc {
         "either a boolean (`yes`, `no`, `on`, `off`, etc), or `nll` (default: `nll`)";
     pub(crate) const parse_align: &str = "a number that is a power of 2 between 1 and 2^29";
     pub(crate) const parse_assert_incr_state: &str = "one of: `loaded`, `not-loaded`";
+    pub(crate) const parse_allow_partial_mitigations: &str =
+        super::mitigation_coverage::DeniedPartialMitigationKind::KINDS;
+    pub(crate) const parse_deny_partial_mitigations: &str =
+        super::mitigation_coverage::DeniedPartialMitigationKind::KINDS;
 }
 
 pub mod parse {
@@ -1113,22 +1070,23 @@ pub mod parse {
         }
     }
 
-    pub(crate) fn parse_threads(slot: &mut usize, v: Option<&str>) -> bool {
-        let ret = match v.and_then(|s| s.parse().ok()) {
-            Some(0) => {
-                *slot = std::thread::available_parallelism().map_or(1, NonZero::<usize>::get);
-                true
-            }
-            Some(i) => {
-                *slot = i;
-                true
-            }
-            None => false,
+    pub(crate) fn parse_threads(slot: &mut Option<usize>, v: Option<&str>) -> bool {
+        let Some(s) = v else { return false };
+        if s == "sync" {
+            // Enable synchronization despite only using one thread.
+            *slot = Some(1);
+            return true;
+        }
+        let n = match s.parse().ok() {
+            Some(0) => std::thread::available_parallelism().map_or(1, NonZero::<usize>::get),
+            Some(i) => i,
+            None => return false,
         };
         // We want to cap the number of threads here to avoid large numbers like 999999 and compiler panics.
         // This solution was suggested here https://github.com/rust-lang/rust/issues/117638#issuecomment-1800925067
-        *slot = slot.clone().min(MAX_THREADS_CAP);
-        ret
+        let n = n.min(MAX_THREADS_CAP);
+        *slot = (n > 1).then_some(n); // Enable synchronization if we're using more than one thread.
+        true
     }
 
     /// Use this for any numeric option that has a static default.
@@ -1564,6 +1522,29 @@ pub mod parse {
             "0" => InstrumentCoverage::No,
             _ => return false,
         };
+        true
+    }
+
+    pub(crate) fn parse_codegen_retag_options(
+        slot: &mut Option<CodegenRetagOptions>,
+        v: Option<&str>,
+    ) -> bool {
+        let mut no_precise_im = false;
+        let mut no_precise_pin = false;
+        if let Some(opt_list) = v.map(|s| s.split(',')) {
+            for opt in opt_list {
+                match opt {
+                    "no-precise-im" => {
+                        no_precise_im = true;
+                    }
+                    "no-precise-pin" => {
+                        no_precise_pin = true;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        *slot = Some(CodegenRetagOptions { no_precise_im, no_precise_pin });
         true
     }
 
@@ -2083,10 +2064,9 @@ options! {
     // - src/doc/rustc/src/codegen-options/index.md
 
     // tidy-alphabetical-start
-    #[rustc_lint_opt_deny_field_access("documented to do nothing")]
-    ar: String = (String::new(), parse_string, [UNTRACKED],
-        "this option is deprecated and does nothing",
-        removed: Warn),
+    ar: () = ((), parse_ignore, [UNTRACKED],
+        "this option has been removed",
+        removed: Err),
     #[rustc_lint_opt_deny_field_access("use `Session::code_model` instead of this field")]
     code_model: Option<CodeModel> = (None, parse_code_model, [TRACKED],
         "choose the code model to use (`rustc --print code-models` for details)"),
@@ -2095,7 +2075,7 @@ options! {
     collapse_macro_debuginfo: CollapseMacroDebuginfo = (CollapseMacroDebuginfo::Unspecified,
         parse_collapse_macro_debuginfo, [TRACKED],
         "set option to collapse debuginfo for macros"),
-    control_flow_guard: CFGuard = (CFGuard::Disabled, parse_cfguard, [TRACKED],
+    control_flow_guard: CFGuard = (CFGuard::Disabled, parse_cfguard, [TRACKED] { MITIGATION: ControlFlowGuard },
         "use Windows Control Flow Guard (default: no)"),
     debug_assertions: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "explicitly enable the `cfg(debug_assertions)` directive"),
@@ -2121,11 +2101,10 @@ options! {
     help: bool = (false, parse_no_value, [UNTRACKED], "Print codegen options"),
     incremental: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "enable incremental compilation"),
-    #[rustc_lint_opt_deny_field_access("documented to do nothing")]
-    inline_threshold: Option<u32> = (None, parse_opt_number, [UNTRACKED],
-        "this option is deprecated and does nothing \
+    inline_threshold: () = ((), parse_ignore, [UNTRACKED],
+        "this option has been removed \
         (consider using `-Cllvm-args=--inline-threshold=...`)",
-        removed: Warn),
+        removed: Err),
     #[rustc_lint_opt_deny_field_access("use `Session::instrument_coverage` instead of this field")]
     instrument_coverage: InstrumentCoverage = (InstrumentCoverage::No, parse_instrument_coverage, [TRACKED],
         "instrument the generated code to support LLVM source-based code coverage reports \
@@ -2163,10 +2142,9 @@ options! {
         "give an empty list of passes to the pass manager"),
     no_redzone: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "disable the use of the redzone"),
-    #[rustc_lint_opt_deny_field_access("documented to do nothing")]
-    no_stack_check: bool = (false, parse_no_value, [UNTRACKED],
-        "this option is deprecated and does nothing",
-        removed: Warn),
+    no_stack_check: () = ((), parse_ignore, [UNTRACKED],
+        "this option has been removed",
+        removed: Err),
     no_vectorize_loops: bool = (false, parse_no_value, [TRACKED],
         "disable loop vectorization optimization passes"),
     no_vectorize_slp: bool = (false, parse_no_value, [TRACKED],
@@ -2200,7 +2178,6 @@ options! {
         "set rpath values in libs/exes (default: no)"),
     save_temps: bool = (false, parse_bool, [UNTRACKED],
         "save all temporary output files during compilation (default: no)"),
-    #[rustc_lint_opt_deny_field_access("documented to do nothing")]
     soft_float: () = ((), parse_ignore, [UNTRACKED],
         "this option has been removed \
         (use a corresponding *eabi target instead)",
@@ -2212,7 +2189,7 @@ options! {
         "tell the linker which information to strip (`none` (default), `debuginfo` or `symbols`)"),
     symbol_mangling_version: Option<SymbolManglingVersion> = (None,
         parse_symbol_mangling_version, [TRACKED],
-        "which mangling version to use for symbol names ('legacy' (default), 'v0', or 'hashed')"),
+        "which mangling version to use for symbol names ('legacy', 'v0' (default), or 'hashed')"),
     target_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
         "select target processor (`rustc --print target-cpus` for details)"),
     target_feature: String = (String::new(), parse_target_feature, [TRACKED],
@@ -2237,6 +2214,10 @@ options! {
     // tidy-alphabetical-start
     allow_features: Option<Vec<String>> = (None, parse_opt_comma_list, [TRACKED],
         "only allow the listed language features to be enabled in code (comma separated)"),
+    // the real parser is at the `setter_for` macro, to allow `-Z` and `-C` options to
+    // work together.
+    allow_partial_mitigations: () = ((), parse_allow_partial_mitigations, [UNTRACKED],
+        "Allow mitigations not enabled for all dependency crates (comma separated list)"),
     always_encode_mir: bool = (false, parse_bool, [TRACKED],
         "encode MIR of all functions into the crate metadata (default: no)"),
     annotate_moves: AnnotateMoves = (AnnotateMoves::Disabled, parse_annotate_moves, [TRACKED],
@@ -2247,6 +2228,8 @@ options! {
          either `loaded` or `not-loaded`."),
     assume_incomplete_release: bool = (false, parse_bool, [TRACKED],
         "make cfg(version) treat the current version as incomplete (default: no)"),
+    assumptions_on_binders: bool = (false, parse_bool, [TRACKED],
+        "allow deducing higher-ranked outlives assumptions from all binders (`for<'a>`)"),
     autodiff: Vec<crate::config::AutoDiff> = (Vec::new(), parse_autodiff, [TRACKED],
         "a list of autodiff flags to enable
         Mandatory setting:
@@ -2270,7 +2253,7 @@ options! {
         (default: no)"),
     box_noalias: bool = (true, parse_bool, [TRACKED],
         "emit noalias metadata for box (default: yes)"),
-    branch_protection: Option<BranchProtection> = (None, parse_branch_protection, [TRACKED TARGET_MODIFIER],
+    branch_protection: Option<BranchProtection> = (None, parse_branch_protection, [TRACKED] { TARGET_MODIFIER: BranchProtection },
         "set options for branch target identification and pointer authentication on AArch64"),
     build_sdylib_interface: bool = (false, parse_bool, [UNTRACKED],
         "whether the stable interface is being built"),
@@ -2284,6 +2267,8 @@ options! {
         "hash algorithm of source files used to check freshness in cargo (`blake3` or `sha256`)"),
     codegen_backend: Option<String> = (None, parse_opt_string, [TRACKED],
         "the backend to use"),
+    codegen_emit_retag: Option<CodegenRetagOptions> = (None, parse_codegen_retag_options, [TRACKED],
+        "emit retag function calls in generated code"),
     codegen_source_order: bool = (false, parse_bool, [UNTRACKED],
         "emit mono items in the order of spans in source files (default: no)"),
     contract_checks: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -2294,21 +2279,27 @@ options! {
         "inject the given attribute in the crate"),
     cross_crate_inline_threshold: InliningThreshold = (InliningThreshold::Sometimes(100), parse_inlining_threshold, [TRACKED],
         "threshold to allow cross crate inlining of functions"),
-    debug_info_for_profiling: bool = (false, parse_bool, [TRACKED],
-        "emit discriminators and other data necessary for AutoFDO"),
     debug_info_type_line_numbers: bool = (false, parse_bool, [TRACKED],
         "emit type and line information for additional data types (default: no)"),
     debuginfo_compression: DebugInfoCompression = (DebugInfoCompression::None, parse_debuginfo_compression, [TRACKED],
         "compress debug info sections (none, zlib, zstd, default: none)"),
+    debuginfo_for_profiling: bool = (false, parse_bool, [TRACKED],
+        "emit discriminators and other data necessary for AutoFDO"),
     deduplicate_diagnostics: bool = (true, parse_bool, [UNTRACKED],
         "deduplicate identical diagnostics (default: yes)"),
     default_visibility: Option<SymbolVisibility> = (None, parse_opt_symbol_visibility, [TRACKED],
         "overrides the `default_visibility` setting of the target"),
+    deny_partial_mitigations: () = ((), parse_deny_partial_mitigations, [UNTRACKED],
+        "Deny mitigations not enabled for all dependency crates (comma separated list)"),
     dep_info_omit_d_target: bool = (false, parse_bool, [TRACKED],
         "in dep-info output, omit targets for tracking dependencies of the dep-info files \
         themselves (default: no)"),
     direct_access_external_data: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "Direct or use GOT indirect to reference external data symbols"),
+    disable_fast_paths: bool = (false, parse_bool, [TRACKED],
+        "disable various performance optimizations in trait solving"),
+    disable_incr_comp_backend_caching: bool = (false, parse_bool, [TRACKED],
+        "disable caching of compiled objects by the codegen backend during incremental compilation"),
     dual_proc_macros: bool = (false, parse_bool, [TRACKED],
         "load proc macros for both target and host, but only link to the target (default: no)"),
     dump_dep_graph: bool = (false, parse_bool, [UNTRACKED],
@@ -2353,8 +2344,6 @@ options! {
         "embed source text in DWARF debug sections (default: no)"),
     emit_stack_sizes: bool = (false, parse_bool, [UNTRACKED],
         "emit a section containing stack size metadata (default: no)"),
-    emscripten_wasm_eh: bool = (true, parse_bool, [TRACKED],
-        "Use WebAssembly error handling for wasm32-unknown-emscripten"),
     enforce_type_length_limit: bool = (false, parse_bool, [TRACKED],
         "enforce the type length limit when monomorphizing instances in codegen"),
     experimental_default_bounds: bool = (false, parse_bool, [TRACKED],
@@ -2369,7 +2358,7 @@ options! {
     fewer_names: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR) \
         (default: no)"),
-    fixed_x18: bool = (false, parse_bool, [TRACKED TARGET_MODIFIER],
+    fixed_x18: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: FixedX18 },
         "make the x18 register reserved on AArch64 (default: no)"),
     flatten_format_args: bool = (true, parse_bool, [TRACKED],
         "flatten nested format_args!() and literals into a simplified format_args!() call \
@@ -2413,7 +2402,7 @@ options! {
         - hashes of green query instances
         - hash collisions of query keys
         - hash collisions when creating dep-nodes"),
-    indirect_branch_cs_prefix: bool = (false, parse_bool, [TRACKED TARGET_MODIFIER],
+    indirect_branch_cs_prefix: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: IndirectBranchCsPrefix },
         "add `cs` prefix to `call` and `jmp` to indirect thunks (default: no)"),
     inline_llvm: bool = (true, parse_bool, [TRACKED],
         "enable LLVM inlining (default: yes)"),
@@ -2463,6 +2452,8 @@ options! {
         "a list LLVM plugins to enable (space separated)"),
     llvm_time_trace: bool = (false, parse_bool, [UNTRACKED],
         "generate JSON tracing data file from LLVM data (default: no)"),
+    llvm_writable: bool = (false, parse_bool, [TRACKED],
+        "emit the LLVM writable attribute for mutable reference arguments (default: no)"),
     location_detail: LocationDetail = (LocationDetail::all(), parse_location_detail, [TRACKED],
         "what location details should be tracked when using caller_location, either \
         `none`, or a comma separated list of location details, for which \
@@ -2488,9 +2479,6 @@ options! {
         "align all functions to at least this many bytes. Must be a power of 2"),
     min_recursion_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
         "set a minimum recursion limit (final limit = max(this, recursion_limit_from_crate))"),
-    mir_emit_retag: bool = (false, parse_bool, [TRACKED],
-        "emit Retagging MIR statements, interpreted e.g., by miri; implies -Zmir-opt-level=0 \
-        (default: no)"),
     mir_enable_passes: Vec<(String, bool)> = (Vec::new(), parse_list_with_polarity, [TRACKED],
         "use like `-Zmir-enable-passes=+DestinationPropagation,-InstSimplify`. Forces the \
         specified passes to be enabled, overriding all other checks. In particular, this will \
@@ -2557,6 +2545,8 @@ options! {
         "pass `-install_name @rpath/...` to the macOS linker (default: no)"),
     packed_bundled_libs: bool = (false, parse_bool, [TRACKED],
         "change rlib format to store native libraries as archives"),
+    packed_stack: bool = (false, parse_bool, [TRACKED],
+        "use packed stack frames (s390x only) (default: no)"),
     panic_abort_tests: bool = (false, parse_bool, [TRACKED],
         "support compiling tests with panic=abort (default: no)"),
     panic_in_drop: PanicStrategy = (PanicStrategy::Unwind, parse_panic_strategy, [TRACKED],
@@ -2583,6 +2573,9 @@ options! {
     #[rustc_lint_opt_deny_field_access("use `Session::print_codegen_stats` instead of this field")]
     print_codegen_stats: bool = (false, parse_bool, [UNTRACKED],
         "print codegen statistics (default: no)"),
+    #[rustc_lint_opt_deny_field_access("use `Session::print_llvm_stats_json` instead of this field")]
+    print_codegen_stats_json: Option<String> = (None, parse_opt_string, [UNTRACKED],
+        "print codegen statistics in JSON to a file (default: no)"),
     print_llvm_passes: bool = (false, parse_bool, [UNTRACKED],
         "print the LLVM optimization passes being run (default: no)"),
     print_mono_items: bool = (false, parse_bool, [UNTRACKED],
@@ -2604,10 +2597,10 @@ options! {
         "enable queries of the dependency graph for regression testing (default: no)"),
     randomize_layout: bool = (false, parse_bool, [TRACKED],
         "randomize the layout of types (default: no)"),
-    reg_struct_return: bool = (false, parse_bool, [TRACKED TARGET_MODIFIER],
+    reg_struct_return: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: RegStructReturn },
         "On x86-32 targets, it overrides the default ABI to return small structs in registers.
         It is UNSOUND to link together crates that use different values for this flag!"),
-    regparm: Option<u32> = (None, parse_opt_number, [TRACKED TARGET_MODIFIER],
+    regparm: Option<u32> = (None, parse_opt_number, [TRACKED] { TARGET_MODIFIER: Regparm },
         "On x86-32 targets, setting this to N causes the compiler to pass N arguments \
         in registers EAX, EDX, and ECX instead of on the stack for\
         \"C\", \"cdecl\", and \"stdcall\" fn.\
@@ -2619,19 +2612,19 @@ options! {
     remark_dir: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
         "directory into which to write optimization remarks (if not specified, they will be \
 written to standard error output)"),
-    retpoline: bool = (false, parse_bool, [TRACKED TARGET_MODIFIER],
+    retpoline: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: Retpoline },
         "enables retpoline-indirect-branches and retpoline-indirect-calls target features (default: no)"),
-    retpoline_external_thunk: bool = (false, parse_bool, [TRACKED TARGET_MODIFIER],
+    retpoline_external_thunk: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: RetpolineExternalThunk },
         "enables retpoline-external-thunk, retpoline-indirect-branches and retpoline-indirect-calls \
         target features (default: no)"),
     #[rustc_lint_opt_deny_field_access("use `Session::sanitizers()` instead of this field")]
-    sanitizer: SanitizerSet = (SanitizerSet::empty(), parse_sanitizers, [TRACKED TARGET_MODIFIER],
+    sanitizer: SanitizerSet = (SanitizerSet::empty(), parse_sanitizers, [TRACKED] { TARGET_MODIFIER: Sanitizer },
         "use a sanitizer"),
     sanitizer_cfi_canonical_jump_tables: Option<bool> = (Some(true), parse_opt_bool, [TRACKED],
         "enable canonical jump tables (default: yes)"),
     sanitizer_cfi_generalize_pointers: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable generalizing pointer types (default: no)"),
-    sanitizer_cfi_normalize_integers: Option<bool> = (None, parse_opt_bool, [TRACKED TARGET_MODIFIER],
+    sanitizer_cfi_normalize_integers: Option<bool> = (None, parse_opt_bool, [TRACKED] { TARGET_MODIFIER: SanitizerCfiNormalizeIntegers },
         "enable normalizing integer types (default: no)"),
     sanitizer_dataflow_abilist: Vec<String> = (Vec::new(), parse_comma_list, [TRACKED],
         "additional ABI list files that control how shadow parameters are passed (comma separated)"),
@@ -2691,7 +2684,7 @@ written to standard error output)"),
     src_hash_algorithm: Option<SourceFileHashAlgorithm> = (None, parse_src_file_hash, [TRACKED],
         "hash algorithm of source files in debug info (`md5`, `sha1`, or `sha256`)"),
     #[rustc_lint_opt_deny_field_access("use `Session::stack_protector` instead of this field")]
-    stack_protector: StackProtector = (StackProtector::None, parse_stack_protector, [TRACKED],
+    stack_protector: StackProtector = (StackProtector::None, parse_stack_protector, [TRACKED] { MITIGATION: StackProtector },
         "control stack smash protection strategy (`rustc --print stack-protector-strategies` for details)"),
     staticlib_allow_rdylib_deps: bool = (false, parse_bool, [TRACKED],
         "allow staticlibs to have rust dylib dependencies"),
@@ -2709,12 +2702,12 @@ written to standard error output)"),
     #[rustc_lint_opt_deny_field_access("use `Session::lto` instead of this field")]
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
-    /// We default to 1 here since we want to behave like
+    /// We default to None here since we want to behave like
     /// a sequential compiler for now. This'll likely be adjusted
     /// in the future. Note that -Zthreads=0 is the way to get
     /// the num_cpus behavior.
     #[rustc_lint_opt_deny_field_access("use `Session::threads` instead of this field")]
-    threads: usize = (1, parse_threads, [UNTRACKED],
+    threads: Option<usize> = (None, parse_threads, [UNTRACKED],
         "use a thread pool with N threads"),
     time_llvm_passes: bool = (false, parse_bool, [UNTRACKED],
         "measure time of each LLVM pass (default: no)"),
@@ -2757,7 +2750,7 @@ written to standard error output)"),
         "take the brakes off const evaluation. NOTE: this is unsound (default: no)"),
     unpretty: Option<String> = (None, parse_unpretty, [UNTRACKED],
         "present the input source, unstable (and less-pretty) variants;
-        `normal`, `identified`,
+        `normal`,
         `expanded`, `expanded,identified`,
         `expanded,hygiene` (with internal representations),
         `ast-tree` (raw AST before expansion),

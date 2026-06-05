@@ -40,13 +40,15 @@ static KINDS: &[(&str, &str)] = &[
     ("logw", "log::warn!"),
     ("loge", "log::error!"),
 ];
+static SNIPPET_RETURNS_NON_UNIT: &[&str] = &["format"];
 
 pub(crate) fn add_format_like_completions(
     acc: &mut Completions,
-    ctx: &CompletionContext<'_>,
+    ctx: &CompletionContext<'_, '_>,
     dot_receiver: &ast::Expr,
     cap: SnippetCap,
     receiver_text: &ast::String,
+    semi: &str,
 ) {
     let postfix_snippet = match build_postfix_snippet_builder(ctx, cap, dot_receiver) {
         Some(it) => it,
@@ -64,13 +66,14 @@ pub(crate) fn add_format_like_completions(
 
         let exprs = with_placeholders(exprs);
         for (label, macro_name) in KINDS {
+            let semi = if SNIPPET_RETURNS_NON_UNIT.contains(label) { "" } else { semi };
             let snippet = if exprs.is_empty() {
-                format!(r#"{macro_name}({out})"#)
+                format!(r#"{macro_name}({out}){semi}"#)
             } else {
-                format!(r#"{}({}, {})"#, macro_name, out, exprs.join(", "))
+                format!(r#"{}({}, {}){semi}"#, macro_name, out, exprs.join(", "))
             };
 
-            postfix_snippet(label, macro_name, &snippet).add_to(acc, ctx.db);
+            postfix_snippet(label, macro_name, snippet).add_to(acc, ctx.db);
         }
     }
 }

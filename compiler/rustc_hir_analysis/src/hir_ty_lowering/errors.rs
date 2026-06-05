@@ -16,7 +16,7 @@ use rustc_middle::ty::{
     self, AdtDef, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt,
     suggest_constraining_type_param,
 };
-use rustc_session::parse::feature_err;
+use rustc_session::errors::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::{BytePos, DUMMY_SP, Ident, Span, Symbol, kw, sym};
 use rustc_trait_selection::error_reporting::traits::report_dyn_incompatibility;
@@ -403,6 +403,141 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         })
     }
 
+    pub(super) fn report_ambiguous_assoc_item(
+        &self,
+        bound1: ty::PolyTraitRef<'tcx>,
+        bound2: ty::PolyTraitRef<'tcx>,
+        matching_candidates: impl Iterator<Item = ty::PolyTraitRef<'tcx>>,
+        qself: AssocItemQSelf,
+        assoc_tag: ty::AssocTag,
+        assoc_ident: Ident,
+        span: Span,
+        constraint: Option<&hir::AssocItemConstraint<'tcx>>,
+    ) -> ErrorGuaranteed {
+        let tcx = self.tcx();
+
+        let assoc_kind_str = assoc_tag_str(assoc_tag);
+        let qself_str = qself.to_string(tcx);
+        let mut err = self.dcx().create_err(crate::errors::AmbiguousAssocItem {
+            span,
+            assoc_kind: assoc_kind_str,
+            assoc_ident,
+            qself: &qself_str,
+        });
+        // Provide a more specific error code index entry for equality bindings.
+        err.code(
+            if let Some(constraint) = constraint
+                && let hir::AssocItemConstraintKind::Equality { .. } = constraint.kind
+            {
+                E0222
+            } else {
+                E0221
+            },
+        );
+
+        // FIXME(#97583): Print associated item bindings properly (i.e., not as equality
+        // predicates!).
+        // FIXME: Turn this into a structured, translatable & more actionable suggestion.
+        let mut where_bounds = vec![];
+        for bound in [bound1, bound2].into_iter().chain(matching_candidates) {
+            let bound_id = bound.def_id();
+            let assoc_item = tcx.associated_items(bound_id).find_by_ident_and_kind(
+                tcx,
+                assoc_ident,
+                assoc_tag,
+                bound_id,
+            );
+            let bound_span = assoc_item.and_then(|item| tcx.hir_span_if_local(item.def_id));
+
+            if let Some(bound_span) = bound_span {
+                err.span_label(
+                    bound_span,
+                    format!("ambiguous `{assoc_ident}` from `{}`", bound.print_trait_sugared(),),
+                );
+                if let Some(constraint) = constraint {
+                    match constraint.kind {
+                        hir::AssocItemConstraintKind::Equality { term } => {
+                            let term: ty::Term<'_> = match term {
+                                hir::Term::Ty(ty) => self.lower_ty(ty).into(),
+                                hir::Term::Const(ct) => {
+                                    let assoc_item =
+                                        assoc_item.expect("assoc_item should be present");
+                                    let projection_term = bound.map_bound(|trait_ref| {
+                                        let item_segment = hir::PathSegment {
+                                            ident: constraint.ident,
+                                            hir_id: constraint.hir_id,
+                                            res: Res::Err,
+                                            args: Some(constraint.gen_args),
+                                            infer_args: false,
+                                        };
+
+                                        let alias_args = self.lower_generic_args_of_assoc_item(
+                                            constraint.ident.span,
+                                            assoc_item.def_id,
+                                            &item_segment,
+                                            trait_ref.args,
+                                        );
+                                        ty::AliasTerm::new_from_def_id(
+                                            tcx,
+                                            assoc_item.def_id,
+                                            alias_args,
+                                        )
+                                    });
+
+                                    // FIXME(mgca): code duplication with other places we lower
+                                    // the rhs' of associated const bindings
+                                    let ty = projection_term.map_bound(|alias| {
+                                        tcx.type_of(alias.def_id())
+                                            .instantiate(tcx, alias.args)
+                                            .skip_norm_wip()
+                                    });
+                                    let ty = super::bounds::check_assoc_const_binding_type(
+                                        self,
+                                        constraint.ident,
+                                        ty,
+                                        constraint.hir_id,
+                                    );
+
+                                    self.lower_const_arg(ct, ty).into()
+                                }
+                            };
+                            if term.references_error() {
+                                continue;
+                            }
+                            // FIXME(#97583): This isn't syntactically well-formed!
+                            where_bounds.push(format!(
+                                "        T: {trait}::{assoc_ident} = {term}",
+                                trait = bound.print_only_trait_path(),
+                            ));
+                        }
+                        // FIXME: Provide a suggestion.
+                        hir::AssocItemConstraintKind::Bound { bounds: _ } => {}
+                    }
+                } else {
+                    err.span_suggestion_verbose(
+                        span.with_hi(assoc_ident.span.lo()),
+                        "use fully-qualified syntax to disambiguate",
+                        format!("<{qself_str} as {}>::", bound.print_only_trait_path()),
+                        Applicability::MaybeIncorrect,
+                    );
+                }
+            } else {
+                let trait_ = tcx.short_string(bound.print_only_trait_path(), err.long_ty_path());
+                err.note(format!(
+                    "associated {assoc_kind_str} `{assoc_ident}` could derive from `{trait_}`",
+                ));
+            }
+        }
+        if !where_bounds.is_empty() {
+            err.help(format!(
+                "consider introducing a new type parameter `T` and adding `where` constraints:\
+                     \n    where\n        T: {qself_str},\n{}",
+                where_bounds.join(",\n"),
+            ));
+        }
+        err.emit()
+    }
+
     pub(crate) fn report_missing_self_ty_for_resolved_path(
         &self,
         trait_def_id: DefId,
@@ -436,7 +571,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     tcx.visibility(trait_def_id).is_accessible_from(self.item_def_id(), tcx)
                         && header.polarity != ty::ImplPolarity::Negative
                 })
-                .map(|header| header.trait_ref.instantiate_identity().self_ty())
+                .map(|header| header.trait_ref.instantiate_identity().skip_norm_wip().self_ty())
                 // We don't care about blanket impls.
                 .filter(|self_ty| !self_ty.has_non_region_param())
                 .map(|self_ty| tcx.erase_and_anonymize_regions(self_ty).to_string())
@@ -511,7 +646,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                         }
                         Some((hir::def::CtorKind::Fn, def_id)) => {
                             // tuple
-                            let fn_sig = tcx.fn_sig(def_id).instantiate_identity();
+                            let fn_sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
                             let inputs = fn_sig.inputs().skip_binder();
                             suggestion = vec![(
                                 ident.span.with_hi(expr.span.hi()),
@@ -568,7 +703,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
     }
 
-    pub(super) fn report_ambiguous_assoc_item_path(
+    fn report_ambiguous_assoc_item_path(
         &self,
         span: Span,
         types: &[String],
@@ -728,7 +863,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 "the candidate".into()
             };
 
-            let impl_ty = tcx.at(span).type_of(impl_).instantiate_identity();
+            let impl_ty = tcx.at(span).type_of(impl_).instantiate_identity().skip_norm_wip();
             let note = format!("{title} is defined in an impl for the type `{impl_ty}`");
 
             if let Some(span) = note_span {
@@ -782,7 +917,10 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 .iter()
                 .take(limit)
                 .map(|cand| {
-                    format!("- `{}`", tcx.at(span).type_of(cand.impl_).instantiate_identity())
+                    format!(
+                        "- `{}`",
+                        tcx.at(span).type_of(cand.impl_).instantiate_identity().skip_norm_wip()
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -1112,12 +1250,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     )
                 })
                 .collect();
-            // FIXME(fmease): Does not account for `dyn Trait<>` (suggs `dyn Trait<, X = Y>`).
-            let code = if let Some(snippet) = snippet.strip_suffix('>') {
-                // The user wrote `Trait<'a>` or similar and we don't have a term we can suggest,
-                // but at least we can clue them to the correct syntax `Trait<'a, Item = /* ... */>`
-                // while accounting for the `<'a>` in the suggestion.
-                format!("{}, {}>", snippet, bindings.join(", "))
+            let code = if let Some(snippet) = snippet.strip_suffix("<>") {
+                // Empty generics
+                format!("{snippet}<{}>", bindings.join(", "))
+            } else if let Some(snippet) = snippet.strip_suffix('>') {
+                // Non-empty generics
+                format!("{snippet}, {}>", bindings.join(", "))
             } else if in_expr_or_pat {
                 // The user wrote `Trait`, so we don't have a term we can suggest, but at least we
                 // can clue them to the correct syntax `Trait::<Item = /* ... */>`.
@@ -1786,7 +1924,7 @@ fn generics_args_err_extend<'a>(
             );
         }
         GenericsArgsErrExtend::SelfTyAlias { def_id, span } => {
-            let ty = tcx.at(span).type_of(def_id).instantiate_identity();
+            let ty = tcx.at(span).type_of(def_id).instantiate_identity().skip_norm_wip();
             let span_of_impl = tcx.span_of_impl(def_id);
             let ty::Adt(self_def, _) = *ty.kind() else { return };
             let def_id = self_def.did();
@@ -1844,7 +1982,59 @@ fn generics_args_err_extend<'a>(
     }
 }
 
-pub(crate) fn assoc_tag_str(assoc_tag: ty::AssocTag) -> &'static str {
+pub(super) struct AmbiguityBetweenVariantAndAssocItem<'tcx> {
+    pub(super) variant_def_id: DefId,
+    pub(super) item_def_id: DefId,
+    pub(super) span: Span,
+    pub(super) segment_ident: Ident,
+    pub(super) bound_def_id: DefId,
+    pub(super) self_ty: Ty<'tcx>,
+    pub(super) tcx: TyCtxt<'tcx>,
+    pub(super) mode: super::LowerTypeRelativePathMode,
+}
+
+impl<'a, 'tcx> rustc_errors::Diagnostic<'a, ()> for AmbiguityBetweenVariantAndAssocItem<'tcx> {
+    fn into_diag(
+        self,
+        dcx: rustc_errors::DiagCtxtHandle<'a>,
+        level: rustc_errors::Level,
+    ) -> Diag<'a, ()> {
+        let Self {
+            variant_def_id,
+            item_def_id,
+            span,
+            segment_ident,
+            bound_def_id,
+            self_ty,
+            tcx,
+            mode,
+        } = self;
+        let mut lint = Diag::new(dcx, level, "ambiguous associated item");
+
+        let mut could_refer_to = |kind: DefKind, def_id, also| {
+            let note_msg = format!(
+                "`{}` could{} refer to the {} defined here",
+                segment_ident,
+                also,
+                tcx.def_kind_descr(kind, def_id)
+            );
+            lint.span_note(tcx.def_span(def_id), note_msg);
+        };
+
+        could_refer_to(DefKind::Variant, variant_def_id, "");
+        could_refer_to(mode.def_kind_for_diagnostics(), item_def_id, " also");
+
+        lint.span_suggestion(
+            span,
+            "use fully-qualified syntax",
+            format!("<{} as {}>::{}", self_ty, tcx.item_name(bound_def_id), segment_ident),
+            Applicability::MachineApplicable,
+        );
+        lint
+    }
+}
+
+fn assoc_tag_str(assoc_tag: ty::AssocTag) -> &'static str {
     match assoc_tag {
         ty::AssocTag::Fn => "function",
         ty::AssocTag::Const => "constant",

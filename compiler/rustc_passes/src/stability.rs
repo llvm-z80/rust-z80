@@ -54,10 +54,11 @@ fn inherit_const_stability(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     match def_kind {
         DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst { .. } => {
             match tcx.def_kind(tcx.local_parent(def_id)) {
-                DefKind::Impl { .. } => true,
+                DefKind::Trait | DefKind::Impl { .. } => true,
                 _ => false,
             }
         }
+        DefKind::Closure => true,
         _ => false,
     }
 }
@@ -842,9 +843,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'tcx> {
                                     // Calculating message for lint involves calling `self.def_path_str`,
                                     // which will by default invoke the expensive `visible_parent_map` query.
                                     // Skip all that work if the lint is allowed anyway.
-                                    if self.tcx.lint_level_at_node(DEPRECATED, id).level
-                                        == lint::Level::Allow
-                                    {
+                                    if self.tcx.lint_level_spec_at_node(DEPRECATED, id).is_allow() {
                                         return;
                                     }
                                     // Show a deprecation message.
@@ -1097,7 +1096,7 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
             let lang_features =
                 UNSTABLE_LANG_FEATURES.iter().map(|feature| feature.name).collect::<Vec<_>>();
             let lib_features = crates
-                .into_iter()
+                .iter()
                 .flat_map(|&cnum| {
                     tcx.lib_features(cnum).stability.keys().copied().into_sorted_stable_ord()
                 })
@@ -1105,11 +1104,33 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
 
             let valid_feature_names = [lang_features, lib_features].concat();
 
+            // Collect all of the marked as "removed" features
+            let unstable_removed_features = crates
+                .iter()
+                .flat_map(|&cnum| {
+                    find_attr!(tcx, cnum.as_def_id(), UnstableRemoved(rem_features) => rem_features)
+                        .into_iter()
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+
             for (feature, span) in remaining_lib_features {
-                let suggestion = feature
-                    .find_similar(&valid_feature_names)
-                    .map(|(actual_name, _)| errors::MisspelledFeature { span, actual_name });
-                tcx.dcx().emit_err(errors::UnknownFeature { span, feature, suggestion });
+                if let Some(removed) =
+                    unstable_removed_features.iter().find(|removed| removed.feature == feature)
+                {
+                    tcx.dcx().emit_err(errors::FeatureRemoved {
+                        span,
+                        feature,
+                        reason: removed.reason,
+                        link: removed.link,
+                        since: removed.since.to_string(),
+                    });
+                } else {
+                    let suggestion = feature
+                        .find_similar(&valid_feature_names)
+                        .map(|(actual_name, _)| errors::MisspelledFeature { span, actual_name });
+                    tcx.dcx().emit_err(errors::UnknownFeature { span, feature, suggestion });
+                }
             }
         }
     }

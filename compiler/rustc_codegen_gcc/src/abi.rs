@@ -46,7 +46,7 @@ impl GccType for CastTarget {
             )
         };
 
-        if self.prefix.iter().all(|x| x.is_none()) {
+        if self.prefix.is_empty() {
             // Simplify to a single unit when there is no prefix and size <= unit size
             if self.rest.total <= self.rest.unit.size {
                 return rest_gcc_unit;
@@ -62,7 +62,7 @@ impl GccType for CastTarget {
         let mut args: Vec<_> = self
             .prefix
             .iter()
-            .flat_map(|option_reg| option_reg.map(|reg| reg.gcc_type(cx)))
+            .map(|reg| reg.gcc_type(cx))
             .chain((0..rest_count).map(|_| rest_gcc_unit))
             .collect();
 
@@ -90,7 +90,9 @@ impl GccType for Reg {
                 64 => cx.type_f64(),
                 _ => bug!("unsupported float: {:?}", self),
             },
-            RegKind::Vector => cx.type_vector(cx.type_i8(), self.size.bytes()),
+            RegKind::Vector { hint_vector_elem: _ } => {
+                cx.type_vector(cx.type_i8(), self.size.bytes())
+            }
         }
     }
 }
@@ -222,15 +224,8 @@ impl<'gcc, 'tcx> FnAbiGccExt<'gcc, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
 
     fn ptr_to_gcc_type(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Type<'gcc> {
         // FIXME(antoyo): Should we do something with `FnAbiGcc::fn_attributes`?
-        let FnAbiGcc { return_type, arguments_type, is_c_variadic, on_stack_param_indices, .. } =
-            self.gcc_type(cx);
-        let pointer_type =
-            cx.context.new_function_pointer_type(None, return_type, &arguments_type, is_c_variadic);
-        cx.on_stack_params.borrow_mut().insert(
-            pointer_type.dyncast_function_ptr_type().expect("function ptr type"),
-            on_stack_param_indices,
-        );
-        pointer_type
+        let FnAbiGcc { return_type, arguments_type, is_c_variadic, .. } = self.gcc_type(cx);
+        cx.context.new_function_pointer_type(None, return_type, &arguments_type, is_c_variadic)
     }
 
     #[cfg(feature = "master")]
@@ -250,6 +245,8 @@ pub fn conv_to_fn_attribute<'gcc>(conv: CanonAbi, arch: &Arch) -> Option<FnAttri
         // possible to declare an `extern "custom"` block, so the backend still needs a calling
         // convention for declaring foreign functions.
         CanonAbi::Custom => return None,
+        // gcc/gccjit does not have anything for Swift's calling convention.
+        CanonAbi::Swift => panic!("gcc/gccjit backend does not support Swift calling convention"),
         CanonAbi::Arm(arm_call) => match arm_call {
             ArmCall::CCmseNonSecureCall => FnAttribute::ArmCmseNonsecureCall,
             ArmCall::CCmseNonSecureEntry => FnAttribute::ArmCmseNonsecureEntry,

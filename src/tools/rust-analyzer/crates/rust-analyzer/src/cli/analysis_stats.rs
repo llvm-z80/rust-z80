@@ -2,6 +2,7 @@
 //! errors.
 
 use std::{
+    cell::LazyCell,
     env, fmt,
     ops::AddAssign,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -11,7 +12,7 @@ use std::{
 use cfg::{CfgAtom, CfgDiff};
 use hir::{
     Adt, AssocItem, Crate, DefWithBody, FindPathConfig, GenericDef, HasCrate, HasSource,
-    HirDisplay, ModuleDef, Name, Variant, VariantId, crate_lang_items,
+    HirDisplay, ModuleDef, Name, Variant, crate_lang_items,
     db::{DefDatabase, ExpandDatabase, HirDatabase},
     next_solver::{DbInterner, GenericArgs},
 };
@@ -23,11 +24,12 @@ use hir_def::{
 use hir_ty::InferenceResult;
 use ide::{
     Analysis, AnalysisHost, AnnotationConfig, DiagnosticsConfig, Edition, InlayFieldsToResolve,
-    InlayHintsConfig, LineCol, RootDatabase,
+    InlayHintsConfig, LineCol, RaFixtureConfig, RootDatabase,
 };
 use ide_db::{
-    EditionedFileId, LineIndexDatabase, MiniCore, SnippetCap,
+    EditionedFileId, SnippetCap,
     base_db::{SourceDatabase, salsa::Database},
+    line_index,
 };
 use itertools::Itertools;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
@@ -587,8 +589,8 @@ impl flags::AnalysisStats {
                     continue;
                 };
 
-                fn trim(s: &str) -> String {
-                    s.chars().filter(|c| !c.is_whitespace()).collect()
+                fn drop_whitespace(s: &str) -> String {
+                    s.chars().filter(|c| !parser::is_rust_whitespace(*c)).collect()
                 }
 
                 let todo = syntax::ast::make::ext::expr_todo().to_string();
@@ -608,7 +610,8 @@ impl flags::AnalysisStats {
                             display_target,
                         )
                         .unwrap();
-                    syntax_hit_found |= trim(&original_text) == trim(&generated);
+                    syntax_hit_found |=
+                        drop_whitespace(&original_text) == drop_whitespace(&generated);
 
                     // Validate if type-checks
                     let mut txt = file_txt.text(db).to_string();
@@ -662,7 +665,7 @@ impl flags::AnalysisStats {
                 let msg = move || {
                     format!(
                         "processing: {:<50}",
-                        trim(&original_text).chars().take(50).collect::<String>()
+                        drop_whitespace(&original_text).chars().take(50).collect::<String>()
                     )
                 };
                 if verbosity.is_spammy() {
@@ -743,10 +746,8 @@ impl flags::AnalysisStats {
             }
 
             all += 1;
-            let Ok(body_id) = body.try_into() else {
-                continue;
-            };
-            let Err(e) = db.mir_body(body_id) else {
+            #[expect(deprecated)]
+            let Err(e) = body.run_mir_body(db) else {
                 continue;
             };
             if verbosity.is_spammy() {
@@ -777,7 +778,7 @@ impl flags::AnalysisStats {
         vfs: &Vfs,
         bodies: &[DefWithBody],
         signatures: &[GenericDef],
-        variants: &[Variant],
+        _variants: &[Variant],
         verbosity: Verbosity,
     ) {
         let mut bar = match verbosity {
@@ -798,23 +799,24 @@ impl flags::AnalysisStats {
                     InferenceResult::of(snap, body);
                 })
                 .count();
-            let signatures = signatures
+            let _signatures = signatures
                 .iter()
                 .filter_map(|&signatures| signatures.try_into().ok())
                 .collect::<Vec<GenericDefId>>();
-            signatures
-                .par_iter()
-                .map_with(db.clone(), |snap, &signatures| {
-                    InferenceResult::of(snap, signatures);
-                })
-                .count();
-            let variants = variants.iter().copied().map(Into::into).collect::<Vec<VariantId>>();
-            variants
-                .par_iter()
-                .map_with(db.clone(), |snap, &variants| {
-                    InferenceResult::of(snap, variants);
-                })
-                .count();
+            // FIXME: We don't have access to the necessary types here (nor we should have).
+            // signatures
+            //     .par_iter()
+            //     .map_with(db.clone(), |snap, &signatures| {
+            //         InferenceResult::of(snap, signatures);
+            //     })
+            //     .count();
+            // let variants = variants.iter().copied().map(Into::into).collect::<Vec<VariantId>>();
+            // variants
+            //     .par_iter()
+            //     .map_with(db.clone(), |snap, &variants| {
+            //         InferenceResult::of(snap, variants);
+            //     })
+            //     .count();
             eprintln!("{:<20} {}", "Parallel Inference:", inference_sw.elapsed());
         }
 
@@ -906,6 +908,18 @@ impl flags::AnalysisStats {
             // region:expressions
             let (previous_exprs, previous_unknown, previous_partially_unknown) =
                 (num_exprs, num_exprs_unknown, num_exprs_partially_unknown);
+            let type_mismatch_for_node = LazyCell::new(|| {
+                inference_result
+                    .diagnostics()
+                    .iter()
+                    .filter_map(|diag| match diag {
+                        hir_ty::InferenceDiagnostic::TypeMismatch { node, expected, found } => {
+                            Some((*node, (expected.as_ref(), found.as_ref())))
+                        }
+                        _ => None,
+                    })
+                    .collect::<FxHashMap<_, _>>()
+            });
             for (expr_id, _) in body.exprs() {
                 let ty = inference_result.expr_ty(expr_id);
                 num_exprs += 1;
@@ -962,9 +976,10 @@ impl flags::AnalysisStats {
                         ty.display(db, display_target)
                     );
                 }
-                if let Some(mismatch) = inference_result.type_mismatch_for_expr(expr_id) {
+                if inference_result.expr_has_type_mismatch(expr_id) {
                     num_expr_type_mismatches += 1;
                     if verbosity.is_verbose() {
+                        let (expected, actual) = type_mismatch_for_node[&expr_id.into()];
                         if let Some((path, start, end)) = expr_syntax_range(db, vfs, sm(), expr_id)
                         {
                             bar.println(format!(
@@ -974,24 +989,25 @@ impl flags::AnalysisStats {
                                 start.col,
                                 end.line + 1,
                                 end.col,
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
                                 name.display(db, Edition::LATEST),
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         }
                     }
                     if self.output == Some(OutputFormat::Csv) {
+                        let (expected, actual) = type_mismatch_for_node[&expr_id.into()];
                         println!(
                             r#"{},mismatch,"{}","{}""#,
                             location_csv_expr(db, vfs, sm(), expr_id),
-                            mismatch.expected.as_ref().display(db, display_target),
-                            mismatch.actual.as_ref().display(db, display_target)
+                            expected.display(db, display_target),
+                            actual.display(db, display_target)
                         );
                     }
                 }
@@ -1065,9 +1081,10 @@ impl flags::AnalysisStats {
                         ty.display(db, display_target)
                     );
                 }
-                if let Some(mismatch) = inference_result.type_mismatch_for_pat(pat_id) {
+                if inference_result.pat_has_type_mismatch(pat_id) {
                     num_pat_type_mismatches += 1;
                     if verbosity.is_verbose() {
+                        let (expected, actual) = type_mismatch_for_node[&pat_id.into()];
                         if let Some((path, start, end)) = pat_syntax_range(db, vfs, sm(), pat_id) {
                             bar.println(format!(
                                 "{} {}:{}-{}:{}: Expected {}, got {}",
@@ -1076,24 +1093,25 @@ impl flags::AnalysisStats {
                                 start.col,
                                 end.line + 1,
                                 end.col,
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
                                 name.display(db, Edition::LATEST),
-                                mismatch.expected.as_ref().display(db, display_target),
-                                mismatch.actual.as_ref().display(db, display_target)
+                                expected.display(db, display_target),
+                                actual.display(db, display_target)
                             ));
                         }
                     }
                     if self.output == Some(OutputFormat::Csv) {
+                        let (expected, actual) = type_mismatch_for_node[&pat_id.into()];
                         println!(
                             r#"{},mismatch,"{}","{}""#,
                             location_csv_pat(db, vfs, sm(), pat_id),
-                            mismatch.expected.as_ref().display(db, display_target),
-                            mismatch.actual.as_ref().display(db, display_target)
+                            expected.display(db, display_target),
+                            actual.display(db, display_target)
                         );
                     }
                 }
@@ -1367,6 +1385,7 @@ impl flags::AnalysisStats {
                 &InlayHintsConfig {
                     render_colons: false,
                     type_hints: true,
+                    type_hints_placement: ide::TypeHintsPlacement::Inline,
                     sized_bound: false,
                     discriminant_hints: ide::DiscriminantHints::Always,
                     parameter_hints: true,
@@ -1397,7 +1416,7 @@ impl flags::AnalysisStats {
                     closing_brace_hints_min_lines: Some(20),
                     fields_to_resolve: InlayFieldsToResolve::empty(),
                     range_exclusive_hints: true,
-                    minicore: MiniCore::default(),
+                    ra_fixture: RaFixtureConfig::default(),
                 },
                 analysis.editioned_file_id_to_vfs(file_id),
                 None,
@@ -1416,7 +1435,7 @@ impl flags::AnalysisStats {
             annotate_enum_variant_references: false,
             location: ide::AnnotationLocation::AboveName,
             filter_adjacent_derive_implementations: false,
-            minicore: MiniCore::default(),
+            ra_fixture: RaFixtureConfig::default(),
         };
         for &file_id in file_ids {
             let msg = format!("annotations: {}", vfs.file_path(file_id.file_id(db)));
@@ -1486,7 +1505,7 @@ fn location_csv_expr(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, expr_id: 
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
     let path = vfs.file_path(original_range.file_id.file_id(db));
-    let line_index = db.line_index(original_range.file_id.file_id(db));
+    let line_index = line_index(db, original_range.file_id.file_id(db));
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1502,7 +1521,7 @@ fn location_csv_pat(db: &RootDatabase, vfs: &Vfs, sm: &BodySourceMap, pat_id: Pa
     let node = src.map(|e| e.to_node(&root).syntax().clone());
     let original_range = node.as_ref().original_file_range_rooted(db);
     let path = vfs.file_path(original_range.file_id.file_id(db));
-    let line_index = db.line_index(original_range.file_id.file_id(db));
+    let line_index = line_index(db, original_range.file_id.file_id(db));
     let text_range = original_range.range;
     let (start, end) =
         (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1521,7 +1540,7 @@ fn expr_syntax_range<'a>(
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
         let path = vfs.file_path(original_range.file_id.file_id(db));
-        let line_index = db.line_index(original_range.file_id.file_id(db));
+        let line_index = line_index(db, original_range.file_id.file_id(db));
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1542,7 +1561,7 @@ fn pat_syntax_range<'a>(
         let node = src.map(|e| e.to_node(&root).syntax().clone());
         let original_range = node.as_ref().original_file_range_rooted(db);
         let path = vfs.file_path(original_range.file_id.file_id(db));
-        let line_index = db.line_index(original_range.file_id.file_id(db));
+        let line_index = line_index(db, original_range.file_id.file_id(db));
         let text_range = original_range.range;
         let (start, end) =
             (line_index.line_col(text_range.start()), line_index.line_col(text_range.end()));
@@ -1645,5 +1664,5 @@ impl fmt::Display for PrettyItemStats {
 // fn syntax_len(node: SyntaxNode) -> usize {
 //     // Macro expanded code doesn't contain whitespace, so erase *all* whitespace
 //     // to make macro and non-macro code comparable.
-//     node.to_string().replace(|it: char| it.is_ascii_whitespace(), "").len()
+//     drop_whitespace(&node.to_string()).len()
 // }

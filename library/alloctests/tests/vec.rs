@@ -1110,7 +1110,7 @@ fn test_into_iter_zst() {
     struct AlignedZstWithDrop([u64; 0]);
     impl Drop for AlignedZstWithDrop {
         fn drop(&mut self) {
-            let addr = self as *mut _ as usize;
+            let addr = (self as *mut Self).addr();
             assert!(hint::black_box(addr) % align_of::<u64>() == 0);
         }
     }
@@ -1356,10 +1356,10 @@ fn overaligned_allocations() {
     for i in 0..0x1000 {
         v.reserve_exact(i);
         assert!(v[0].0 == 273);
-        assert!(v.as_ptr() as usize & 0xff == 0);
+        assert!(v.as_ptr().addr() & 0xff == 0);
         v.shrink_to_fit();
         assert!(v[0].0 == 273);
-        assert!(v.as_ptr() as usize & 0xff == 0);
+        assert!(v.as_ptr().addr() & 0xff == 0);
     }
 }
 
@@ -1651,13 +1651,17 @@ fn extract_if_unconsumed() {
 
 #[test]
 fn extract_if_debug() {
-    let mut vec = vec![1, 2];
-    let mut drain = vec.extract_if(.., |&mut x| x % 2 != 0);
-    assert!(format!("{drain:?}").contains("Some(1)"));
-    drain.next();
-    assert!(format!("{drain:?}").contains("Some(2)"));
-    drain.next();
-    assert!(format!("{drain:?}").contains("None"));
+    let mut vec = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let mut drain = vec.extract_if(1..5, |&mut x| x % 2 != 0);
+    assert_eq!(
+        format!("{drain:?}"),
+        "ExtractIf { retained: [1], remainder: [2, 3, 4, 5], skipped_tail: [6, 7, 8], .. }"
+    );
+    drain.next().unwrap();
+    assert_eq!(
+        format!("{drain:?}"),
+        "ExtractIf { retained: [1, 2], remainder: [4, 5], skipped_tail: [6, 7, 8], .. }"
+    );
 }
 
 #[test]
@@ -2565,12 +2569,12 @@ fn test_box_zero_allocator() {
             } else {
                 unsafe { std::alloc::alloc(layout) }
             };
-            Ok(NonNull::slice_from_raw_parts(NonNull::new(ptr).ok_or(AllocError)?, layout.size()))
+            Ok(NonNull::new(ptr).ok_or(AllocError)?.cast_slice(layout.size()))
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
             if layout.size() == 0 {
-                let addr = ptr.as_ptr() as usize;
+                let addr = ptr.as_ptr().addr();
                 let mut state = self.state.borrow_mut();
                 std::println!("freeing {addr}");
                 assert!(state.0.remove(&addr), "ZST free that wasn't allocated");

@@ -14,10 +14,6 @@ use crate::check_attr::ProcMacroKind;
 use crate::lang_items::Duplicate;
 
 #[derive(Diagnostic)]
-#[diag("`#[diagnostic::do_not_recommend]` can only be placed on trait implementations")]
-pub(crate) struct IncorrectDoNotRecommendLocation;
-
-#[derive(Diagnostic)]
 #[diag("`#[loop_match]` should be applied to a loop")]
 pub(crate) struct LoopMatchAttr {
     #[primary_span]
@@ -187,10 +183,7 @@ pub(crate) struct BothFfiConstAndPure {
 #[warning(
     "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
 )]
-pub(crate) struct Link {
-    #[label("not an `extern` block")]
-    pub span: Option<Span>,
-}
+pub(crate) struct Link;
 
 #[derive(Diagnostic)]
 #[diag("#[rustc_legacy_const_generics] functions must only have const generics")]
@@ -302,6 +295,8 @@ pub(crate) enum UnusedNote {
         "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked"
     )]
     LinkerMessagesBinaryCrateOnly,
+    #[note("the `dead_code_pub_in_binary` lint has no effect in library crates")]
+    NoEffectDeadCodePubInBinary,
 }
 
 #[derive(Diagnostic)]
@@ -326,30 +321,6 @@ pub(crate) struct NonExportedMacroInvalidAttrs {
 pub(crate) struct InvalidMayDangle {
     #[primary_span]
     pub attr_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("unused attribute")]
-pub(crate) struct UnusedDuplicate {
-    #[suggestion("remove this attribute", code = "", applicability = "machine-applicable")]
-    pub this: Span,
-    #[note("attribute also specified here")]
-    pub other: Span,
-    #[warning(
-        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
-    )]
-    pub warning: bool,
-}
-
-#[derive(Diagnostic)]
-#[diag("multiple `{$name}` attributes")]
-pub(crate) struct UnusedMultiple {
-    #[primary_span]
-    #[suggestion("remove this attribute", code = "", applicability = "machine-applicable")]
-    pub this: Span,
-    #[note("attribute also specified here")]
-    pub other: Span,
-    pub name: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -458,47 +429,6 @@ pub(crate) struct DuplicateDiagnosticItemInCrate {
     pub crate_name: Symbol,
     pub orig_crate_name: Symbol,
     pub name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("abi: {$abi}")]
-pub(crate) struct LayoutAbi {
-    #[primary_span]
-    pub span: Span,
-    pub abi: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("align: {$align}")]
-pub(crate) struct LayoutAlign {
-    #[primary_span]
-    pub span: Span,
-    pub align: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("size: {$size}")]
-pub(crate) struct LayoutSize {
-    #[primary_span]
-    pub span: Span,
-    pub size: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("homogeneous_aggregate: {$homogeneous_aggregate}")]
-pub(crate) struct LayoutHomogeneousAggregate {
-    #[primary_span]
-    pub span: Span,
-    pub homogeneous_aggregate: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("layout_of({$normalized_ty}) = {$ty_layout}")]
-pub(crate) struct LayoutOf<'tcx> {
-    #[primary_span]
-    pub span: Span,
-    pub normalized_ty: Ty<'tcx>,
-    pub ty_layout: String,
 }
 
 #[derive(Diagnostic)]
@@ -766,38 +696,6 @@ pub(crate) struct UselessAssignment<'a> {
 pub(crate) struct InlineIgnoredForExported;
 
 #[derive(Diagnostic)]
-pub(crate) enum AttrApplication {
-    #[diag("attribute should be applied to an enum", code = E0517)]
-    Enum {
-        #[primary_span]
-        hint_span: Span,
-        #[label("not an enum")]
-        span: Span,
-    },
-    #[diag("attribute should be applied to a struct", code = E0517)]
-    Struct {
-        #[primary_span]
-        hint_span: Span,
-        #[label("not a struct")]
-        span: Span,
-    },
-    #[diag("attribute should be applied to a struct or union", code = E0517)]
-    StructUnion {
-        #[primary_span]
-        hint_span: Span,
-        #[label("not a struct or union")]
-        span: Span,
-    },
-    #[diag("attribute should be applied to a struct, enum, or union", code = E0517)]
-    StructEnumUnion {
-        #[primary_span]
-        hint_span: Span,
-        #[label("not a struct, enum, or union")]
-        span: Span,
-    },
-}
-
-#[derive(Diagnostic)]
 #[diag("transparent {$target} cannot have other repr hints", code = E0692)]
 pub(crate) struct TransparentIncompatible {
     #[primary_span]
@@ -937,6 +835,20 @@ pub(crate) struct ImpliedFeatureNotExist {
 }
 
 #[derive(Diagnostic)]
+#[diag("feature `{$feature}` has been removed", code = E0557)]
+#[note("removed in {$since}; see <{$link}> for more information")]
+#[note("{$reason}")]
+pub(crate) struct FeatureRemoved {
+    #[primary_span]
+    #[label("feature has been removed")]
+    pub span: Span,
+    pub feature: Symbol,
+    pub reason: Symbol,
+    pub since: String,
+    pub link: Symbol,
+}
+
+#[derive(Diagnostic)]
 #[diag(
     "attributes `#[rustc_const_unstable]`, `#[rustc_const_stable]` and `#[rustc_const_stable_indirect]` require the function or method to be `const`"
 )]
@@ -975,6 +887,8 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
         participle: &'tcx str,
         name_list: DiagSymbolList,
         #[subdiagnostic]
+        dead_code_pub_in_binary_note: Option<DeadCodePubInBinaryNote>,
+        #[subdiagnostic]
         // only on DeadCodes since it's never a problem for tuple struct fields
         enum_variants_with_same_name: Vec<EnumVariantSameName<'tcx>>,
         #[subdiagnostic]
@@ -998,6 +912,8 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
         participle: &'tcx str,
         name_list: DiagSymbolList,
         #[subdiagnostic]
+        dead_code_pub_in_binary_note: Option<DeadCodePubInBinaryNote>,
+        #[subdiagnostic]
         change_fields_suggestion: ChangeFields,
         #[subdiagnostic]
         parent_info: Option<ParentInfo<'tcx>>,
@@ -1005,6 +921,12 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
         ignored_derived_impls: Option<IgnoredDerivedImpls>,
     },
 }
+
+#[derive(Subdiagnostic)]
+#[note(
+    "in libraries, `pub` items can be used by dependent crates; in binaries, they cannot, so this `pub` item is unused"
+)]
+pub(crate) struct DeadCodePubInBinaryNote;
 
 #[derive(Subdiagnostic)]
 #[note(
@@ -1127,19 +1049,6 @@ pub(crate) struct UnnecessaryPartialStableFeature {
 #[note("see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information")]
 pub(crate) struct IneffectiveUnstableImpl;
 
-#[derive(Diagnostic)]
-#[diag("sanitize attribute not allowed here")]
-pub(crate) struct SanitizeAttributeNotAllowed {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("not a function, impl block, or module")]
-    pub not_fn_impl_mod: Option<Span>,
-    #[label("function has no body")]
-    pub no_body: Option<Span>,
-    #[help("sanitize attribute can be applied to a function (with body), impl block, or module")]
-    pub help: (),
-}
-
 // FIXME(jdonszelmann): move back to rustc_attr
 #[derive(Diagnostic)]
 #[diag(
@@ -1198,26 +1107,8 @@ pub(crate) enum UnexportableItem<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[repr(align(...))]` is not supported on {$item}")]
-pub(crate) struct ReprAlignShouldBeAlign {
-    #[primary_span]
-    #[help("use `#[rustc_align(...)]` instead")]
-    pub span: Span,
-    pub item: &'static str,
-}
-
-#[derive(Diagnostic)]
-#[diag("`#[repr(align(...))]` is not supported on {$item}")]
-pub(crate) struct ReprAlignShouldBeAlignStatic {
-    #[primary_span]
-    #[help("use `#[rustc_align_static(...)]` instead")]
-    pub span: Span,
-    pub item: &'static str,
-}
-
-#[derive(Diagnostic)]
-#[diag("`eii_macro_for` is only valid on functions")]
-pub(crate) struct EiiImplNotFunction {
+#[diag("`eii_macro_for` is only valid on functions and statics")]
+pub(crate) struct EiiImplTarget {
     #[primary_span]
     pub span: Span,
 }
@@ -1252,12 +1143,13 @@ pub(crate) struct EiiWithTrackCaller {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[{$name}]` required, but not found")]
+#[diag("`#[{$name}]` {$kind} required, but not found")]
 pub(crate) struct EiiWithoutImpl {
     #[primary_span]
     #[label("expected because `#[{$name}]` was declared here in crate `{$decl_crate_name}`")]
     pub span: Span,
     pub name: Symbol,
+    pub kind: &'static str,
 
     pub current_crate_name: Symbol,
     pub decl_crate_name: Symbol,

@@ -158,6 +158,16 @@ pub(crate) struct AllocMustStatics {
     pub(crate) span: Span,
 }
 
+#[derive(Diagnostic)]
+#[diag("allocators cannot be `#[thread_local]`")]
+pub(crate) struct AllocCannotThreadLocal {
+    #[primary_span]
+    pub(crate) span: Span,
+    #[label("marked `#[thread_local]` here")]
+    #[suggestion("remove this attribute", code = "", applicability = "maybe-incorrect")]
+    pub(crate) attr: Span,
+}
+
 pub(crate) use autodiff::*;
 
 mod autodiff {
@@ -543,7 +553,7 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for EnvNotDefinedWithUserMessag
 }
 
 #[derive(Diagnostic)]
-pub(crate) enum EnvNotDefined<'a> {
+pub(crate) enum EnvNotDefined {
     #[diag("environment variable `{$var}` not defined at compile time")]
     #[help("`{$var}` may not be available for the current Cargo target")]
     #[help(
@@ -553,7 +563,7 @@ pub(crate) enum EnvNotDefined<'a> {
         #[primary_span]
         span: Span,
         var: Symbol,
-        var_expr: &'a rustc_ast::Expr,
+        var_expr: String,
     },
     #[diag("environment variable `{$var}` not defined at compile time")]
     #[help("there is a similar Cargo environment variable: `{$suggested_var}`")]
@@ -569,7 +579,7 @@ pub(crate) enum EnvNotDefined<'a> {
         #[primary_span]
         span: Span,
         var: Symbol,
-        var_expr: &'a rustc_ast::Expr,
+        var_expr: String,
     },
 }
 
@@ -1107,8 +1117,42 @@ pub(crate) struct EiiExternTargetExpectedUnsafe {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[{$name}]` is only valid on functions")]
-pub(crate) struct EiiSharedMacroExpectedFunction {
+#[diag("`#[{$name}]` is only valid on functions and statics")]
+pub(crate) struct EiiSharedMacroTarget {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("static cannot implement multiple EIIs")]
+#[note(
+    "this is not allowed because multiple externally implementable statics that alias may be unintuitive"
+)]
+pub(crate) struct EiiStaticMultipleImplementations {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[{$name}]` cannot be used on statics with a value")]
+pub(crate) struct EiiStaticDefault {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[{$name}]` requires the name as an explicit argument when used on a static")]
+pub(crate) struct EiiStaticArgumentRequired {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[{$name}]` cannot be used on mutable statics")]
+pub(crate) struct EiiStaticMutable {
     #[primary_span]
     pub span: Span,
     pub name: String,
@@ -1140,4 +1184,32 @@ pub(crate) struct EiiMacroExpectedMaxOneArgument {
     #[primary_span]
     pub span: Span,
     pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("only a small subset of attributes are supported on externally implementable items")]
+pub(crate) struct EiiAttributeNotSupported {
+    #[primary_span]
+    pub span: Span,
+    #[note("this attribute is not supported")]
+    pub attr_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("named argument `{$named_arg_name}` is not used by name")]
+pub(crate) struct NamedArgumentUsedPositionally {
+    #[label("this named argument is referred to by position in formatting string")]
+    pub named_arg_sp: Span,
+    #[label("this formatting argument uses named argument `{$named_arg_name}` by position")]
+    pub position_label_sp: Option<Span>,
+    #[suggestion(
+        "use the named argument by name to avoid ambiguity",
+        style = "verbose",
+        code = "{name}",
+        applicability = "maybe-incorrect"
+    )]
+    pub suggestion: Option<Span>,
+
+    pub name: String,
+    pub named_arg_name: String,
 }

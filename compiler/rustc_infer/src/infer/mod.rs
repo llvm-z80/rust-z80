@@ -16,8 +16,9 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::undo_log::{Rollback, UndoLogs};
 use rustc_data_structures::unify as ut;
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
-use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::{self as hir, HirId};
+use rustc_index::IndexVec;
 use rustc_macros::extension;
 pub use rustc_macros::{TypeFoldable, TypeVisitable};
 use rustc_middle::bug;
@@ -33,11 +34,13 @@ use rustc_middle::ty::{
     TypeSuperFoldable, TypeVisitable, TypeVisitableExt, TypingEnv, TypingMode, fold_regions,
 };
 use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_type_ir::MayBeErased;
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use type_variable::TypeVariableOrigin;
 
 use crate::infer::snapshot::undo_log::UndoLog;
+use crate::infer::type_variable::FloatVariableOrigin;
 use crate::infer::unify_key::{ConstVariableOrigin, ConstVariableValue, ConstVidKey};
 use crate::traits::{
     self, ObligationCause, ObligationInspector, PredicateObligation, PredicateObligations,
@@ -108,6 +111,11 @@ pub struct InferCtxtInner<'tcx> {
     /// Map from floating variable to the kind of float it represents.
     float_unification_storage: ut::UnificationTableStorage<ty::FloatVid>,
 
+    /// Map from floating variable to the origin span it came from, and the HirId that should be
+    /// used to lint at that location. This is only used for the FCW for the fallback to `f32`,
+    /// so can be removed once the `f32` fallback is removed.
+    float_origin_origin_storage: IndexVec<FloatVid, FloatVariableOrigin>,
+
     /// Tracks the set of region variables and the constraints between them.
     ///
     /// This is initially `Some(_)` but when
@@ -115,6 +123,9 @@ pub struct InferCtxtInner<'tcx> {
     /// -- further attempts to perform unification, etc., may fail if new
     /// region constraints would've been added.
     region_constraint_storage: Option<RegionConstraintStorage<'tcx>>,
+
+    /// Used by the next solver when `-Zassumptions-on-binders` is set.
+    solver_region_constraint_storage: SolverRegionConstraintStorage<'tcx>,
 
     /// A set of constraints that regionck must validate.
     ///
@@ -161,7 +172,9 @@ impl<'tcx> InferCtxtInner<'tcx> {
             const_unification_storage: Default::default(),
             int_unification_storage: Default::default(),
             float_unification_storage: Default::default(),
+            float_origin_origin_storage: Default::default(),
             region_constraint_storage: Some(Default::default()),
+            solver_region_constraint_storage: SolverRegionConstraintStorage::new(),
             region_obligations: Default::default(),
             region_assumptions: Default::default(),
             hir_typeck_potentially_region_dependent_goals: Default::default(),
@@ -306,9 +319,52 @@ pub struct InferCtxt<'tcx> {
     /// bound.
     universe: Cell<ty::UniverseIndex>,
 
+    /// List of assumed wellformed types which we can derive implied
+    /// bounds on a `for<...>` from. Only used unstabley and by the
+    /// new solver.
+    //
+    // FIXME(-Zassumptions-on-binders): This and `universe` should probably be
+    // in `InferCtxtInner` so they can participate in rollbacks and whatnot
+    placeholder_assumptions_for_next_solver: RefCell<
+        FxIndexMap<
+            ty::UniverseIndex,
+            Option<rustc_type_ir::region_constraint::Assumptions<TyCtxt<'tcx>>>,
+        >,
+    >,
+
     next_trait_solver: bool,
 
     pub obligation_inspector: Cell<Option<ObligationInspector<'tcx>>>,
+}
+
+impl<'tcx> Drop for InferCtxt<'tcx> {
+    fn drop(&mut self) {
+        let mut inner = self.inner.borrow_mut();
+        let opaque_type_storage = &mut inner.opaque_type_storage;
+
+        // No need for the drop bomb when we're in TypingMode::Borrowck, and the InferCtxt doesn't consider regions.
+        // This is okay since in `Borrowck`, the only reason we care about opaques is in relation to regions.
+        // In some places *after* typeck, like in lints we use `TypingMode::Borrowck`
+        // to prevent defining opaque types and we simply don't care about regions.
+        match self.typing_mode_raw() {
+            TypingMode::Coherence
+            | TypingMode::Analysis { .. }
+            | TypingMode::PostBorrowckAnalysis { .. }
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen => {}
+            // In erased mode, the opaque type storage is always empty
+            TypingMode::ErasedNotCoherence(..) => {}
+            TypingMode::Borrowck { .. } => {
+                if !self.considering_regions {
+                    return;
+                }
+            }
+        }
+
+        if !opaque_type_storage.is_empty() {
+            ty::tls::with(|tcx| tcx.dcx().delayed_bug(format!("{opaque_type_storage:?}")));
+        }
+    }
 }
 
 /// See the `error_reporting` module for more details.
@@ -388,6 +444,10 @@ pub enum SubregionOrigin<'tcx> {
     },
 
     AscribeUserTypeProvePredicate(Span),
+
+    // FIXME(-Zassumptions-on-binders): this is a temporary hack until we support
+    // proper diagnostics for solver region constraints.
+    SolverRegionConstraint(Span),
 }
 
 // `SubregionOrigin` is used a lot. Make sure it doesn't unintentionally get bigger.
@@ -399,6 +459,7 @@ impl<'tcx> SubregionOrigin<'tcx> {
         match self {
             Self::Subtype(type_trace) => type_trace.cause.to_constraint_category(),
             Self::AscribeUserTypeProvePredicate(span) => ConstraintCategory::Predicate(*span),
+            Self::SolverRegionConstraint(span) => ConstraintCategory::SolverRegionConstraint(*span),
             _ => ConstraintCategory::BoringNoLocation,
         }
     }
@@ -564,16 +625,16 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
     {
-        let infcx = self.build(input.typing_mode);
+        let infcx = self.build(input.typing_mode.0);
         let (value, args) = infcx.instantiate_canonical(span, &input.canonical);
         (infcx, value, args)
     }
 
     pub fn build_with_typing_env(
         mut self,
-        TypingEnv { typing_mode, param_env }: TypingEnv<'tcx>,
+        typing_env: TypingEnv<'tcx>,
     ) -> (InferCtxt<'tcx>, ty::ParamEnv<'tcx>) {
-        (self.build(typing_mode), param_env)
+        (self.build(typing_env.typing_mode()), typing_env.param_env)
     }
 
     pub fn build(&mut self, typing_mode: TypingMode<'tcx>) -> InferCtxt<'tcx> {
@@ -598,6 +659,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             reported_signature_mismatch: Default::default(),
             tainted_by_errors: Cell::new(None),
             universe: Cell::new(ty::UniverseIndex::ROOT),
+            placeholder_assumptions_for_next_solver: RefCell::new(Default::default()),
             next_trait_solver,
             obligation_inspector: Cell::new(None),
         }
@@ -632,9 +694,34 @@ impl<'tcx> InferCtxt<'tcx> {
         self.next_trait_solver
     }
 
+    /// This method is deliberately called `..._raw`,
+    /// since the output may possibly include [`TypingMode::ErasedNotCoherence`](TypingMode::ErasedNotCoherence).
+    /// `ErasedNotCoherence` is an implementation detail of the next trait solver, see its docs for
+    /// more information.
+    ///
+    /// `InferCtxt` has two uses: the trait solver calls some methods on it, because the `InferCtxt`
+    /// works as a kind of store for for example type unification information.
+    /// `InferCtxt` is also often used outside the trait solver during typeck.
+    /// There, we don't care about the `ErasedNotCoherence` case and should never encounter it.
+    /// To make sure these two uses are never confused, we want to statically encode this information.
+    ///
+    /// The `FnCtxt`, for example, is only used in the outside-trait-solver case. It has a non-raw
+    /// version of the `typing_mode` method available that asserts `ErasedNotCoherence` is
+    /// impossible, and returns a `TypingMode` where `ErasedNotCoherence` is made uninhabited using
+    /// the [`CantBeErased`](rustc_type_ir::CantBeErased) enum. That way you don't even have to
+    /// match on the variant and can safely ignore it.
+    ///
+    /// Prefer non-raw apis if available. e.g.,
+    /// - On the `FnCtxt`
+    /// - on the `SelectionCtxt`
     #[inline(always)]
-    pub fn typing_mode(&self) -> TypingMode<'tcx> {
+    pub fn typing_mode_raw(&self) -> TypingMode<'tcx> {
         self.typing_mode
+    }
+
+    #[inline(always)]
+    pub fn disable_trait_solver_fast_paths(&self) -> bool {
+        self.tcx.disable_trait_solver_fast_paths()
     }
 
     /// Returns the origin of the type variable identified by `vid`.
@@ -642,6 +729,13 @@ impl<'tcx> InferCtxt<'tcx> {
     /// No attempt is made to resolve `vid` to its root variable.
     pub fn type_var_origin(&self, vid: TyVid) -> TypeVariableOrigin {
         self.inner.borrow_mut().type_variables().var_origin(vid)
+    }
+
+    /// Returns the origin of the float type variable identified by `vid`.
+    ///
+    /// No attempt is made to resolve `vid` to its root variable.
+    pub fn float_var_origin(&self, vid: FloatVid) -> FloatVariableOrigin {
+        self.inner.borrow_mut().float_origin_origin_storage[vid]
     }
 
     /// Returns the origin of the const variable identified by `vid`
@@ -683,8 +777,20 @@ impl<'tcx> InferCtxt<'tcx> {
         origin: SubregionOrigin<'tcx>,
         a: ty::Region<'tcx>,
         b: ty::Region<'tcx>,
+        vis: ty::VisibleForLeakCheck,
     ) {
-        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(origin, a, b);
+        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(origin, a, b, vis);
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    pub fn equate_regions(
+        &self,
+        origin: SubregionOrigin<'tcx>,
+        a: ty::Region<'tcx>,
+        b: ty::Region<'tcx>,
+        vis: ty::VisibleForLeakCheck,
+    ) {
+        self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(origin, a, b, vis);
     }
 
     /// Processes a `Coerce` predicate from the fulfillment context.
@@ -821,9 +927,12 @@ impl<'tcx> InferCtxt<'tcx> {
         Ty::new_int_var(self.tcx, next_int_var_id)
     }
 
-    pub fn next_float_var(&self) -> Ty<'tcx> {
-        let next_float_var_id =
-            self.inner.borrow_mut().float_unification_table().new_key(ty::FloatVarValue::Unknown);
+    pub fn next_float_var(&self, span: Span, lint_id: Option<HirId>) -> Ty<'tcx> {
+        let mut inner = self.inner.borrow_mut();
+        let next_float_var_id = inner.float_unification_table().new_key(ty::FloatVarValue::Unknown);
+        let origin = FloatVariableOrigin { span, lint_id };
+        let span_index = inner.float_origin_origin_storage.push(origin);
+        debug_assert_eq!(next_float_var_id, span_index);
         Ty::new_float_var(self.tcx, next_float_var_id)
     }
 
@@ -1022,7 +1131,7 @@ impl<'tcx> InferCtxt<'tcx> {
                     if opaque_sub_vid == ty_sub_vid {
                         return Some(ty::AliasTy::new_from_args(
                             self.tcx,
-                            key.def_id.into(),
+                            ty::Opaque { def_id: key.def_id.into() },
                             key.args,
                         ));
                     }
@@ -1036,7 +1145,7 @@ impl<'tcx> InferCtxt<'tcx> {
     #[inline(always)]
     pub fn can_define_opaque_ty(&self, id: impl Into<DefId>) -> bool {
         debug_assert!(!self.next_trait_solver());
-        match self.typing_mode() {
+        match self.typing_mode_raw().assert_not_erased() {
             TypingMode::Analysis {
                 defining_opaque_types_and_generators: defining_opaque_types,
             }
@@ -1048,7 +1157,8 @@ impl<'tcx> InferCtxt<'tcx> {
             // to support PostBorrowckAnalysis in the old solver as well.
             TypingMode::Coherence
             | TypingMode::PostBorrowckAnalysis { .. }
-            | TypingMode::PostAnalysis => false,
+            | TypingMode::PostAnalysis
+            | TypingMode::Codegen => false,
         }
     }
 
@@ -1074,7 +1184,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
     /// If `TyVar(vid)` resolves to a type, return that type. Else, return the
     /// universe index of `TyVar(vid)`.
-    pub fn probe_ty_var(&self, vid: TyVid) -> Result<Ty<'tcx>, ty::UniverseIndex> {
+    pub fn try_resolve_ty_var(&self, vid: TyVid) -> Result<Ty<'tcx>, ty::UniverseIndex> {
         use self::type_variable::TypeVariableValue;
 
         match self.inner.borrow_mut().type_variables().probe(vid) {
@@ -1099,45 +1209,22 @@ impl<'tcx> InferCtxt<'tcx> {
                     //
                     // Note: if these two lines are combined into one we get
                     // dynamic borrow errors on `self.inner`.
-                    let (root_vid, value) =
-                        self.inner.borrow_mut().type_variables().probe_with_root_vid(v);
-                    value.known().map_or_else(
-                        || if root_vid == v { ty } else { Ty::new_var(self.tcx, root_vid) },
-                        |t| self.shallow_resolve(t),
-                    )
+                    let known = self.inner.borrow_mut().type_variables().probe(v).known();
+                    known.map_or(ty, |t| self.shallow_resolve(t))
                 }
 
                 ty::IntVar(v) => {
-                    let (root, value) =
-                        self.inner.borrow_mut().int_unification_table().inlined_probe_key_value(v);
-                    match value {
+                    match self.inner.borrow_mut().int_unification_table().probe_value(v) {
                         ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
                         ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
-                        ty::IntVarValue::Unknown => {
-                            if root == v {
-                                ty
-                            } else {
-                                Ty::new_int_var(self.tcx, root)
-                            }
-                        }
+                        ty::IntVarValue::Unknown => ty,
                     }
                 }
 
                 ty::FloatVar(v) => {
-                    let (root, value) = self
-                        .inner
-                        .borrow_mut()
-                        .float_unification_table()
-                        .inlined_probe_key_value(v);
-                    match value {
+                    match self.inner.borrow_mut().float_unification_table().probe_value(v) {
                         ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
-                        ty::FloatVarValue::Unknown => {
-                            if root == v {
-                                ty
-                            } else {
-                                Ty::new_float_var(self.tcx, root)
-                            }
-                        }
+                        ty::FloatVarValue::Unknown => ty,
                     }
                 }
 
@@ -1151,16 +1238,13 @@ impl<'tcx> InferCtxt<'tcx> {
     pub fn shallow_resolve_const(&self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
         match ct.kind() {
             ty::ConstKind::Infer(infer_ct) => match infer_ct {
-                InferConst::Var(vid) => {
-                    let (root, value) = self
-                        .inner
-                        .borrow_mut()
-                        .const_unification_table()
-                        .inlined_probe_key_value(vid);
-                    value.known().unwrap_or_else(|| {
-                        if root.vid == vid { ct } else { ty::Const::new_var(self.tcx, root.vid) }
-                    })
-                }
+                InferConst::Var(vid) => self
+                    .inner
+                    .borrow_mut()
+                    .const_unification_table()
+                    .probe_value(vid)
+                    .known()
+                    .unwrap_or(ct),
                 InferConst::Fresh(_) => ct,
             },
             ty::ConstKind::Param(_)
@@ -1184,19 +1268,16 @@ impl<'tcx> InferCtxt<'tcx> {
         self.inner.borrow_mut().type_variables().root_var(var)
     }
 
-    /// If `ty` is an unresolved type variable, returns its root vid.
-    pub fn root_vid(&self, ty: Ty<'tcx>) -> Option<ty::TyVid> {
-        let (root, value) =
-            self.inner.borrow_mut().type_variables().inlined_probe_with_vid(ty.ty_vid()?);
-        value.is_unknown().then_some(root)
-    }
-
     pub fn sub_unify_ty_vids_raw(&self, a: ty::TyVid, b: ty::TyVid) {
         self.inner.borrow_mut().type_variables().sub_unify(a, b);
     }
 
     pub fn sub_unification_table_root_var(&self, var: ty::TyVid) -> ty::TyVid {
         self.inner.borrow_mut().type_variables().sub_unification_table_root_var(var)
+    }
+
+    pub fn root_float_var(&self, var: ty::FloatVid) -> ty::FloatVid {
+        self.inner.borrow_mut().float_unification_table().find(var)
     }
 
     pub fn root_const_var(&self, var: ty::ConstVid) -> ty::ConstVid {
@@ -1250,36 +1331,6 @@ impl<'tcx> InferCtxt<'tcx> {
         value.fold_with(&mut r)
     }
 
-    /// Normally, we shallow-resolve unresolved type variables to their root
-    /// variables. This is mainly done for performance reasons, and in most
-    /// cases resolving to the root variable (instead of the variable itself)
-    /// does not affect type inference.
-    ///
-    /// However, there is an exceptional case: *fudging*. Fudging is intended
-    /// to guide inference rather than impose hard requirements. But our current
-    /// handling here is somewhat janky.
-    ///
-    /// In particular, inference variables that are considered equal within the
-    /// fudging scope may not remain equal outside of it. This makes it observable
-    /// which inference variable we resolve to. For backwards compatibility, we
-    /// avoid resolving to the root variable by using this function inside the
-    /// fudge instead of [`InferCtxt::resolve_vars_if_possible`].
-    ///
-    /// See #153869 for more details.
-    pub fn resolve_vars_if_possible_for_fudging<T>(&self, value: T) -> T
-    where
-        T: TypeFoldable<TyCtxt<'tcx>>,
-    {
-        if let Err(guar) = value.error_reported() {
-            self.set_tainted_by_errors(guar);
-        }
-        if !value.has_non_region_infer() {
-            return value;
-        }
-        let mut r = resolve::OpportunisticVarResolver::new_for_fudging(self);
-        value.fold_with(&mut r)
-    }
-
     pub fn resolve_numeric_literals_with_default<T>(&self, value: T) -> T
     where
         T: TypeFoldable<TyCtxt<'tcx>>,
@@ -1291,7 +1342,10 @@ impl<'tcx> InferCtxt<'tcx> {
         value.fold_with(&mut r)
     }
 
-    pub fn probe_const_var(&self, vid: ty::ConstVid) -> Result<ty::Const<'tcx>, ty::UniverseIndex> {
+    pub fn try_resolve_const_var(
+        &self,
+        vid: ty::ConstVid,
+    ) -> Result<ty::Const<'tcx>, ty::UniverseIndex> {
         match self.inner.borrow_mut().const_unification_table().probe_value(vid) {
             ConstVariableValue::Known { value } => Ok(value),
             ConstVariableValue::Unknown { origin: _, universe } => Err(universe),
@@ -1423,7 +1477,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// which contains the necessary information to use the trait system without
     /// using canonicalization or carrying this inference context around.
     pub fn typing_env(&self, param_env: ty::ParamEnv<'tcx>) -> ty::TypingEnv<'tcx> {
-        let typing_mode = match self.typing_mode() {
+        let typing_mode = match self.typing_mode_raw() {
             // FIXME(#132279): This erases the `defining_opaque_types` as it isn't possible
             // to handle them without proper canonicalization. This means we may cause cycle
             // errors and fail to reveal opaques while inside of bodies. We should rename this
@@ -1434,9 +1488,11 @@ impl<'tcx> InferCtxt<'tcx> {
             }
             mode @ (ty::TypingMode::Coherence
             | ty::TypingMode::PostBorrowckAnalysis { .. }
-            | ty::TypingMode::PostAnalysis) => mode,
+            | ty::TypingMode::PostAnalysis
+            | ty::TypingMode::Codegen) => mode,
+            ty::TypingMode::ErasedNotCoherence(MayBeErased) => unreachable!(),
         };
-        ty::TypingEnv { typing_mode, param_env }
+        ty::TypingEnv::new(param_env, typing_mode)
     }
 
     /// Similar to [`Self::canonicalize_query`], except that it returns
@@ -1660,6 +1716,7 @@ impl<'tcx> SubregionOrigin<'tcx> {
             SubregionOrigin::CompareImplItemObligation { span, .. } => span,
             SubregionOrigin::AscribeUserTypeProvePredicate(span) => span,
             SubregionOrigin::CheckAssociatedTypeBounds { ref parent, .. } => parent.span(),
+            SubregionOrigin::SolverRegionConstraint(a) => a,
         }
     }
 
@@ -1746,6 +1803,58 @@ impl<'tcx> InferCtxt<'tcx> {
             }
             hir::Node::Expr(e) => e.span,
             _ => DUMMY_SP,
+        }
+    }
+}
+
+type SolverRegionConstraint<'tcx> =
+    rustc_type_ir::region_constraint::RegionConstraint<TyCtxt<'tcx>>;
+
+#[derive(Clone, Debug)]
+struct SolverRegionConstraintStorage<'tcx>(SolverRegionConstraint<'tcx>);
+
+impl<'tcx> SolverRegionConstraintStorage<'tcx> {
+    fn new() -> Self {
+        SolverRegionConstraintStorage(SolverRegionConstraint::And(Box::new([])))
+    }
+
+    fn get_constraint(&self) -> SolverRegionConstraint<'tcx> {
+        self.0.clone()
+    }
+
+    fn pop(&mut self) -> Option<SolverRegionConstraint<'tcx>> {
+        match &mut self.0 {
+            SolverRegionConstraint::And(and) => {
+                let mut and = core::mem::take(and).into_iter().collect::<Vec<_>>();
+                let popped = and.pop()?;
+                self.0 = SolverRegionConstraint::And(and.into_boxed_slice());
+                Some(popped)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[instrument(level = "debug")]
+    fn push(&mut self, constraint: SolverRegionConstraint<'tcx>) {
+        match &mut self.0 {
+            SolverRegionConstraint::And(and) => {
+                let and = core::mem::take(and)
+                    .into_iter()
+                    .chain([constraint])
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                self.0 = SolverRegionConstraint::And(and);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[instrument(level = "debug", skip(self))]
+    fn overwrite_solver_region_constraint(&mut self, constraint: SolverRegionConstraint<'tcx>) {
+        if !constraint.is_and() {
+            self.0 = SolverRegionConstraint::And(vec![constraint].into_boxed_slice())
+        } else {
+            self.0 = constraint;
         }
     }
 }

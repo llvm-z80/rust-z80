@@ -6,14 +6,15 @@ use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
+use rustc_abi::NumScalableVectors;
 use rustc_errors::codes::*;
 use rustc_errors::{
     Diag, DiagArgValue, DiagCtxtHandle, DiagSymbolList, Diagnostic, EmissionGuarantee, IntoDiagArg,
     Level, msg,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
+use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::LayoutError;
-use rustc_middle::ty::{FloatTy, Ty};
 use rustc_span::{Span, Symbol};
 
 use crate::assert_module_sources::CguReuse;
@@ -540,6 +541,12 @@ pub(crate) struct InsufficientVSCodeProduct;
 pub(crate) struct CpuRequired;
 
 #[derive(Diagnostic)]
+#[diag("target cpu `{$target_cpu}` is known but unsupported")]
+pub(crate) struct CpuUnsupported {
+    pub target_cpu: String,
+}
+
+#[derive(Diagnostic)]
 #[diag("processing debug info with `dsymutil` failed: {$status}")]
 #[note("{$output}")]
 pub(crate) struct ProcessingDymutilFailed {
@@ -671,6 +678,18 @@ pub(crate) struct UnknownArchiveKind<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag("archive `{$path}` was built as {$actual} format, but the target expects {$expected}")]
+#[help(
+    "this often occurs when using BSD-format archive tools on a Linux target; \
+    rebuild the archive with the correct format for the target platform"
+)]
+pub(crate) struct IncompatibleArchiveFormat {
+    pub path: PathBuf,
+    pub actual: String,
+    pub expected: String,
+}
+
+#[derive(Diagnostic)]
 #[diag("linking static libraries is not supported for BPF")]
 pub(crate) struct BpfStaticlibNotSupported;
 
@@ -729,7 +748,7 @@ pub enum InvalidMonomorphization<'tcx> {
         #[primary_span]
         span: Span,
         name: Symbol,
-        f_ty: FloatTy,
+        f_ty: String,
         in_ty: Ty<'tcx>,
     },
 
@@ -807,6 +826,17 @@ pub enum InvalidMonomorphization<'tcx> {
         in_ty: Ty<'tcx>,
         ret_ty: Ty<'tcx>,
         out_len: u64,
+    },
+
+    #[diag("invalid monomorphization of `{$name}` intrinsic: expected return type with {$in_num_vecs} vectors (same as input type `{$in_ty}`), found `{$ret_ty}` with length {$out_num_vecs}", code = E0511)]
+    ReturnNumVecsInputType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        in_num_vecs: NumScalableVectors,
+        in_ty: Ty<'tcx>,
+        ret_ty: Ty<'tcx>,
+        out_num_vecs: NumScalableVectors,
     },
 
     #[diag("invalid monomorphization of `{$name}` intrinsic: expected second argument with length {$in_len} (same as input type `{$in_ty}`), found `{$arg_ty}` with length {$out_len}", code = E0511)]
@@ -1057,7 +1087,7 @@ pub(crate) struct TargetFeatureSafeTrait {
 
 #[derive(Diagnostic)]
 #[diag("target feature `{$feature}` cannot be enabled with `#[target_feature]`: {$reason}")]
-pub struct ForbiddenTargetFeatureAttr<'a> {
+pub(crate) struct ForbiddenTargetFeatureAttr<'a> {
     #[primary_span]
     pub span: Span,
     pub feature: &'a str,
@@ -1182,24 +1212,28 @@ pub(crate) struct UnknownCTargetFeature<'a> {
 
 #[derive(Diagnostic)]
 #[diag("unstable feature specified for `-Ctarget-feature`: `{$feature}`")]
-#[note("this feature is not stably supported; its behavior can change in the future")]
+#[note("{$note}; its behavior can change in the future")]
 pub(crate) struct UnstableCTargetFeature<'a> {
     pub feature: &'a str,
+    pub note: &'a str,
 }
 
 #[derive(Diagnostic)]
 #[diag("target feature `{$feature}` cannot be {$enabled} with `-Ctarget-feature`: {$reason}")]
-#[note(
-    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
-)]
-#[note("for more information, see issue #116344 <https://github.com/rust-lang/rust/issues/116344>")]
 pub(crate) struct ForbiddenCTargetFeature<'a> {
     pub feature: &'a str,
     pub enabled: &'a str,
     pub reason: &'a str,
+    #[note(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    #[note(
+        "for more information, see issue #116344 <https://github.com/rust-lang/rust/issues/116344>"
+    )]
+    pub future_compat_note: bool,
 }
 
-pub struct TargetFeatureDisableOrEnable<'a> {
+pub(crate) struct TargetFeatureDisableOrEnable<'a> {
     pub features: &'a [&'a str],
     pub span: Option<Span>,
     pub missing_features: Option<MissingFeatures>,
@@ -1207,7 +1241,7 @@ pub struct TargetFeatureDisableOrEnable<'a> {
 
 #[derive(Subdiagnostic)]
 #[help("add the missing features in a `target_feature` attribute")]
-pub struct MissingFeatures;
+pub(crate) struct MissingFeatures;
 
 impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetFeatureDisableOrEnable<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {

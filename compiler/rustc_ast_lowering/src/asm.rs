@@ -5,7 +5,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_errors::msg;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_session::parse::feature_err;
+use rustc_session::errors::feature_err;
 use rustc_span::{Span, sym};
 use rustc_target::asm;
 
@@ -18,11 +18,9 @@ use super::errors::{
     InvalidRegisterClass, RegisterClassOnlyClobber, RegisterClassOnlyClobberStable,
     RegisterConflict,
 };
-use crate::{
-    AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, ParamMode, ResolverAstLoweringExt,
-};
+use crate::{AllowReturnTypeNotation, ImplTraitContext, ImplTraitPosition, ParamMode};
 
-impl<'hir, R: ResolverAstLoweringExt<'hir>> LoweringContext<'_, 'hir, R> {
+impl<'hir> LoweringContext<'_, 'hir> {
     pub(crate) fn lower_inline_asm(
         &mut self,
         sp: Span,
@@ -203,7 +201,6 @@ impl<'hir, R: ResolverAstLoweringExt<'hir>> LoweringContext<'_, 'hir, R> {
                     },
                     InlineAsmOperand::Sym { sym } => {
                         let static_def_id = self
-                            .resolver
                             .get_partial_res(sym.id)
                             .and_then(|res| res.full_res())
                             .and_then(|res| match res {

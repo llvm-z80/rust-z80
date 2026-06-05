@@ -493,7 +493,7 @@ impl<'a> TraitDef<'a> {
         match item {
             Annotatable::Item(item) => {
                 let is_packed = matches!(
-                    AttributeParser::parse_limited(cx.sess, &item.attrs, sym::repr, item.span, item.id, None),
+                    AttributeParser::parse_limited(cx.sess, &item.attrs, &[sym::repr]),
                     Some(Attribute::Parsed(AttributeKind::Repr { reprs, .. })) if reprs.iter().any(|(x, _)| matches!(x, ReprPacked(..)))
                 );
 
@@ -1027,7 +1027,7 @@ impl<'a> MethodDef<'a> {
 
             match ty {
                 // Selflike (`&Self`) arguments only occur in non-static methods.
-                Ref(box Self_, _) if !self.is_static() => selflike_args.push(arg_expr),
+                Ref(Self_, _) if !self.is_static() => selflike_args.push(arg_expr),
                 Self_ => cx.dcx().span_bug(span, "`Self` in non-return position"),
                 _ => nonselflike_args.push(arg_expr),
             }
@@ -1052,7 +1052,7 @@ impl<'a> MethodDef<'a> {
 
         let args = {
             let self_arg = explicit_self.map(|explicit_self| {
-                let ident = Ident::with_dummy_span(kw::SelfLower).with_span_pos(span);
+                let ident = Ident::new(kw::SelfLower, span);
                 ast::Param::from_self(ast::AttrVec::default(), explicit_self, ident)
             });
             let nonself_args =

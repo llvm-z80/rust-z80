@@ -15,7 +15,7 @@ use std::hash::Hash;
 
 use rustc_abi::{FieldIdx, VariantIdx};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
+use rustc_macros::{Decodable, Encodable, StableHash};
 
 // These modules are `pub` since they are not glob-imported.
 pub mod data_structures;
@@ -28,6 +28,7 @@ pub mod ir_print;
 pub mod lang_items;
 pub mod lift;
 pub mod outlives;
+pub mod region_constraint;
 pub mod relate;
 pub mod search_graph;
 pub mod solve;
@@ -53,6 +54,7 @@ mod predicate_kind;
 mod region_kind;
 mod ty_info;
 mod ty_kind;
+mod unnormalized;
 mod upcast;
 mod visit;
 
@@ -80,6 +82,7 @@ pub use rustc_ast_ir::{FloatTy, IntTy, Movability, Mutability, Pinnedness, UintT
 use rustc_type_ir_macros::GenericTypeVisitable;
 pub use ty_info::*;
 pub use ty_kind::*;
+pub use unnormalized::Unnormalized;
 pub use upcast::*;
 pub use visit::*;
 
@@ -123,7 +126,7 @@ rustc_index::newtype_index! {
     /// is the outer fn.
     ///
     /// [dbi]: https://en.wikipedia.org/wiki/De_Bruijn_index
-    #[stable_hash_no_context]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "DebruijnIndex({})"]
@@ -217,7 +220,7 @@ pub fn debug_bound_var<T: std::fmt::Write>(
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, HashStable_NoContext))]
+#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, StableHash))]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum Variance {
     Covariant,     // T<A> <: T<B> iff A <: B -- e.g., function return type
@@ -333,7 +336,7 @@ rustc_index::newtype_index! {
     /// declared, but a type name in a non-zero universe is a placeholder
     /// type -- an idealized representative of "types in general" that we
     /// use for checking generic functions.
-    #[stable_hash_no_context]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "U{}"]
@@ -388,7 +391,7 @@ impl Default for UniverseIndex {
 }
 
 rustc_index::newtype_index! {
-    #[stable_hash_generic]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "{}"]
@@ -403,7 +406,7 @@ rustc_index::newtype_index! {
 /// You can get the environment type of a closure using
 /// `tcx.closure_env_ty()`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
+#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, StableHash))]
 pub enum ClosureKind {
     Fn,
     FnMut,

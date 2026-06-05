@@ -71,11 +71,6 @@ use rustc_span::{Ident, Span, Symbol};
 
 use crate::hir::*;
 
-pub trait IntoVisitor<'hir> {
-    type Visitor: Visitor<'hir>;
-    fn into_visitor(&self) -> Self::Visitor;
-}
-
 #[derive(Copy, Clone, Debug)]
 pub enum FnKind<'a> {
     /// `#[xxx] pub async/const/extern "Abi" fn foo()`
@@ -618,15 +613,19 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::
             try_visit!(visitor.visit_generics(generics));
             try_visit!(visitor.visit_variant_data(struct_definition));
         }
-        ItemKind::Trait(
-            _constness,
-            _is_auto,
-            _safety,
+        ItemKind::Trait {
+            impl_restriction,
+            constness: _,
+            is_auto: _,
+            safety: _,
             ident,
-            ref generics,
+            generics,
             bounds,
-            trait_item_refs,
-        ) => {
+            items: trait_item_refs,
+        } => {
+            if let RestrictionKind::Restricted(path) = &impl_restriction.kind {
+                walk_list!(visitor, visit_path_segment, path.segments);
+            }
             try_visit!(visitor.visit_ident(ident));
             try_visit!(visitor.visit_generics(generics));
             walk_list!(visitor, visit_param_bound, bounds);
@@ -894,6 +893,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) 
             fn_arg_span: _,
             kind: _,
             constness: _,
+            explicit_captures: _,
         }) => {
             walk_list!(visitor, visit_generic_param, bound_generic_params);
             try_visit!(visitor.visit_fn(FnKind::Closure, fn_decl, body, *span, def_id));
@@ -1212,8 +1212,7 @@ pub fn walk_fn_decl<'v, V: Visitor<'v>>(
     visitor: &mut V,
     function_declaration: &'v FnDecl<'v>,
 ) -> V::Result {
-    let FnDecl { inputs, output, c_variadic: _, implicit_self: _, lifetime_elision_allowed: _ } =
-        function_declaration;
+    let FnDecl { inputs, output, fn_decl_kind: _ } = function_declaration;
     walk_list!(visitor, visit_ty_unambig, *inputs);
     visitor.visit_fn_ret_ty(output)
 }

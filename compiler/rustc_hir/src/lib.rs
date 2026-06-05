@@ -7,6 +7,7 @@
 #![feature(closure_track_caller)]
 #![feature(const_default)]
 #![feature(const_trait_impl)]
+#![feature(default_field_values)]
 #![feature(derive_const)]
 #![feature(exhaustive_patterns)]
 #![feature(never_type)]
@@ -43,7 +44,6 @@ pub use hir::*;
 pub use lang_items::{LangItem, LanguageItems};
 pub use rustc_ast::attr::version::*;
 pub use stability::*;
-pub use stable_hash_impls::HashStableContext;
 pub use target::{MethodKind, Target};
 
 arena_types!(rustc_arena::declare_arena);

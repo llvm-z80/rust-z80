@@ -1,6 +1,5 @@
 use std::num::IntErrorKind;
 
-use rustc_ast as ast;
 use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level,
@@ -11,6 +10,8 @@ use rustc_hir::attrs::{MirDialect, MirPhase};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 use rustc_target::spec::TargetTuple;
+
+use crate::context::Suggestion;
 
 #[derive(Diagnostic)]
 #[diag("invalid predicate `{$predicate}`", code = E0537)]
@@ -181,134 +182,6 @@ pub(crate) struct MissingIssue {
     pub span: Span,
 }
 
-// FIXME: Why is this the same error code as `InvalidReprHintNoParen` and `InvalidReprHintNoValue`?
-// It is more similar to `IncorrectReprFormatGeneric`.
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(packed)` attribute format: `packed` takes exactly one parenthesized argument, or no parentheses at all", code = E0552)]
-pub(crate) struct IncorrectReprFormatPackedOneOrZeroArg {
-    #[primary_span]
-    pub span: Span,
-}
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(packed)` attribute format: `packed` expects a literal integer as argument", code = E0552)]
-pub(crate) struct IncorrectReprFormatPackedExpectInteger {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid representation hint: `{$name}` does not take a parenthesized argument list", code = E0552)]
-pub(crate) struct InvalidReprHintNoParen {
-    #[primary_span]
-    pub span: Span,
-
-    pub name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid representation hint: `{$name}` does not take a value", code = E0552)]
-pub(crate) struct InvalidReprHintNoValue {
-    #[primary_span]
-    pub span: Span,
-
-    pub name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid `repr(align)` attribute: `align` needs an argument", code = E0589)]
-pub(crate) struct InvalidReprAlignNeedArg {
-    #[primary_span]
-    #[suggestion(
-        "supply an argument here",
-        code = "align(...)",
-        applicability = "has-placeholders"
-    )]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("invalid `repr({$repr_arg})` attribute: {$error_part}", code = E0589)]
-pub(crate) struct InvalidReprGeneric {
-    #[primary_span]
-    pub span: Span,
-
-    pub repr_arg: String,
-    pub error_part: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(align)` attribute format: `align` takes exactly one argument in parentheses", code = E0693)]
-pub(crate) struct IncorrectReprFormatAlignOneArg {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr(align)` attribute format: `align` expects a literal integer as argument", code = E0693)]
-pub(crate) struct IncorrectReprFormatExpectInteger {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("incorrect `repr({$repr_arg})` attribute format", code = E0693)]
-pub(crate) struct IncorrectReprFormatGeneric {
-    #[primary_span]
-    pub span: Span,
-
-    pub repr_arg: Symbol,
-
-    #[subdiagnostic]
-    pub cause: Option<IncorrectReprFormatGenericCause>,
-}
-
-#[derive(Subdiagnostic)]
-pub(crate) enum IncorrectReprFormatGenericCause {
-    #[suggestion(
-        "use parentheses instead",
-        code = "{name}({value})",
-        applicability = "machine-applicable"
-    )]
-    Int {
-        #[primary_span]
-        span: Span,
-
-        #[skip_arg]
-        name: Symbol,
-
-        #[skip_arg]
-        value: u128,
-    },
-
-    #[suggestion(
-        "use parentheses instead",
-        code = "{name}({value})",
-        applicability = "machine-applicable"
-    )]
-    Symbol {
-        #[primary_span]
-        span: Span,
-
-        #[skip_arg]
-        name: Symbol,
-
-        #[skip_arg]
-        value: Symbol,
-    },
-}
-
-impl IncorrectReprFormatGenericCause {
-    pub(crate) fn from_lit_kind(span: Span, kind: &ast::LitKind, name: Symbol) -> Option<Self> {
-        match *kind {
-            ast::LitKind::Int(value, ast::LitIntType::Unsuffixed) => {
-                Some(Self::Int { span, name, value: value.get() })
-            }
-            ast::LitKind::Str(value, _) => Some(Self::Symbol { span, name, value }),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Diagnostic)]
 #[diag("`rustc_promotable` attribute must be paired with either a `rustc_const_unstable` or a `rustc_const_stable` attribute", code = E0717)]
 pub(crate) struct RustcPromotablePairing {
@@ -395,6 +268,13 @@ pub(crate) struct UnusedMultiple {
 }
 
 #[derive(Diagnostic)]
+#[diag("`export_name` may not be empty")]
+pub(crate) struct EmptyExportName {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("`export_name` may not contain null characters", code = E0648)]
 pub(crate) struct NullOnExport {
     #[primary_span]
@@ -404,6 +284,13 @@ pub(crate) struct NullOnExport {
 #[derive(Diagnostic)]
 #[diag("`link_section` may not contain null characters", code = E0648)]
 pub(crate) struct NullOnLinkSection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("link name may not contain null characters", code = E0648)]
+pub(crate) struct NullOnLinkName {
     #[primary_span]
     pub span: Span,
 }
@@ -437,13 +324,6 @@ pub(crate) struct ObjcSelectorExpectedStringLiteral {
 }
 
 #[derive(Diagnostic)]
-#[diag("stability attributes may not be used outside of the standard library", code = E0734)]
-pub(crate) struct StabilityOutsideStd {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("expected at least one confusable name")]
 pub(crate) struct EmptyConfusables {
     #[primary_span]
@@ -451,8 +331,8 @@ pub(crate) struct EmptyConfusables {
 }
 
 #[derive(Diagnostic)]
-#[help("`#[{$name}]` can {$only}be applied to {$applied}")]
-#[diag("`#[{$name}]` attribute cannot be used on {$target}")]
+#[help("`#[{$name}{$attribute_args}]` can {$only}be applied to {$applied}")]
+#[diag("`#[{$name}{$attribute_args}]` attribute cannot be used on {$target}")]
 pub(crate) struct InvalidTarget {
     #[primary_span]
     #[suggestion(
@@ -466,6 +346,21 @@ pub(crate) struct InvalidTarget {
     pub target: &'static str,
     pub applied: DiagArgValue,
     pub only: &'static str,
+    pub attribute_args: &'static str,
+    #[subdiagnostic]
+    pub help: Option<InvalidTargetHelp>,
+    #[warning(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    pub previously_accepted: bool,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum InvalidTargetHelp {
+    #[help("use `#[rustc_align(...)]` instead")]
+    UseRustcAlign,
+    #[help("use `#[rustc_align_static(...)]` instead")]
+    UseRustcAlignStatic,
 }
 
 #[derive(Diagnostic)]
@@ -474,26 +369,6 @@ pub(crate) struct InvalidAlignmentValue {
     #[primary_span]
     pub span: Span,
     pub error_part: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("meta item in `repr` must be an identifier", code = E0565)]
-pub(crate) struct ReprIdent {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("unrecognized representation hint", code = E0552)]
-#[help(
-    "valid reprs are `Rust` (default), `C`, `align`, `packed`, `transparent`, `simd`, `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `i128`, `u128`, `isize`, `usize`"
-)]
-#[note(
-    "for more information, visit <https://doc.rust-lang.org/reference/type-layout.html?highlight=repr#representations>"
-)]
-pub(crate) struct UnrecognizedReprHint {
-    #[primary_span]
-    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -555,6 +430,7 @@ pub(crate) enum AttributeParseErrorReason<'a> {
         upper_bound: isize,
     },
     ExpectedAtLeastOneArgument,
+    ExpectedArgument,
     ExpectedSingleArgument,
     ExpectedList,
     ExpectedListOrNoArgs,
@@ -563,8 +439,9 @@ pub(crate) enum AttributeParseErrorReason<'a> {
     },
     ExpectedNameValueOrNoArgs,
     ExpectedNonEmptyStringLiteral,
-    UnexpectedLiteral,
+    ExpectedNotLiteral,
     ExpectedNameValue(Option<Symbol>),
+    MissingNameValue(Symbol),
     DuplicateKey(Symbol),
     ExpectedSpecificArgument {
         possibilities: &'a [Symbol],
@@ -591,32 +468,160 @@ pub(crate) struct AttributeParseError<'a> {
     pub(crate) path: AttrPath,
     pub(crate) description: ParsedDescription,
     pub(crate) reason: AttributeParseErrorReason<'a>,
-    pub(crate) suggestions: Vec<String>,
+    pub(crate) suggestions: AttributeParseErrorSuggestions,
+}
+
+pub(crate) enum AttributeParseErrorSuggestions {
+    CreatedByTemplate(Vec<String>),
+    CreatedByParser(Vec<Suggestion>),
+}
+
+impl<'a> AttributeParseError<'a> {
+    fn render_expected_specific_argument<G>(
+        &self,
+        diag: &mut Diag<'_, G>,
+        possibilities: &[Symbol],
+        strings: bool,
+    ) where
+        G: EmissionGuarantee,
+    {
+        let quote = if strings { '"' } else { '`' };
+        match possibilities {
+            &[] => {}
+            &[x] => {
+                diag.span_label(
+                    self.span,
+                    format!("the only valid argument here is {quote}{x}{quote}"),
+                );
+            }
+            [first, second] => {
+                diag.span_label(
+                    self.span,
+                    format!("valid arguments are {quote}{first}{quote} or {quote}{second}{quote}"),
+                );
+            }
+            [first @ .., second_to_last, last] => {
+                let mut res = String::new();
+                for i in first {
+                    res.push_str(&format!("{quote}{i}{quote}, "));
+                }
+                res.push_str(&format!("{quote}{second_to_last}{quote} or {quote}{last}{quote}"));
+
+                diag.span_label(self.span, format!("valid arguments are {res}"));
+            }
+        }
+    }
+
+    fn render_expected_specific_argument_list<G>(
+        &self,
+        diag: &mut Diag<'_, G>,
+        possibilities: &[Symbol],
+        strings: bool,
+    ) where
+        G: EmissionGuarantee,
+    {
+        let description = self.description();
+
+        let quote = if strings { '"' } else { '`' };
+        match possibilities {
+            &[] => {}
+            &[x] => {
+                diag.span_label(
+                    self.span,
+                    format!(
+                        "this {description} is only valid with {quote}{x}{quote} as an argument"
+                    ),
+                );
+            }
+            [first, second] => {
+                diag.span_label(self.span, format!("this {description} is only valid with either {quote}{first}{quote} or {quote}{second}{quote} as an argument"));
+            }
+            [first @ .., second_to_last, last] => {
+                let mut res = String::new();
+                for i in first {
+                    res.push_str(&format!("{quote}{i}{quote}, "));
+                }
+                res.push_str(&format!("{quote}{second_to_last}{quote} or {quote}{last}{quote}"));
+
+                diag.span_label(self.span, format!("this {description} is only valid with one of the following arguments: {res}"));
+            }
+        }
+    }
+
+    fn render_suggestions<G>(&self, diag: &mut Diag<'_, G>)
+    where
+        G: EmissionGuarantee,
+    {
+        let description = self.description();
+
+        match &self.suggestions {
+            AttributeParseErrorSuggestions::CreatedByTemplate(suggestions) => {
+                diag.span_suggestions(
+                        self.attr_span,
+                        if suggestions.len() == 1 {
+                            "must be of the form".to_string()
+                        } else {
+                            format!(
+                                "try changing it to one of the following valid forms of the {description}"
+                            )
+                        },
+                        suggestions.iter().cloned(),
+                        Applicability::HasPlaceholders,
+                    );
+            }
+
+            AttributeParseErrorSuggestions::CreatedByParser(suggestions) => {
+                for Suggestion { msg, sp, code } in suggestions {
+                    diag.span_suggestion_verbose(
+                        *sp,
+                        msg.to_string(),
+                        code.to_string(),
+                        Applicability::MaybeIncorrect,
+                    );
+                }
+            }
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self.description {
+            ParsedDescription::Attribute => "attribute",
+            ParsedDescription::Macro => "macro",
+        }
+    }
+}
+
+impl AttributeParseErrorSuggestions {
+    fn len(&self) -> usize {
+        match self {
+            AttributeParseErrorSuggestions::CreatedByTemplate(items) => items.len(),
+            AttributeParseErrorSuggestions::CreatedByParser(items) => items.len(),
+        }
+    }
 }
 
 impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
         let name = self.path.to_string();
 
-        let description = match self.description {
-            ParsedDescription::Attribute => "attribute",
-            ParsedDescription::Macro => "macro",
-        };
+        let description = self.description();
 
         let mut diag = Diag::new(dcx, level, format!("malformed `{name}` {description} input"));
         diag.span(self.attr_span);
         diag.code(E0539);
-        match self.reason {
+        match &self.reason {
             AttributeParseErrorReason::ExpectedStringLiteral { byte_string } => {
                 if let Some(start_point_span) = byte_string {
                     diag.span_suggestion(
-                        start_point_span,
+                        *start_point_span,
                         "consider removing the prefix",
                         "",
                         Applicability::MaybeIncorrect,
                     );
                     diag.note("expected a normal string literal, not a byte string literal");
 
+                    // Avoid emitting an "attribute must be of the form" suggestion, as the
+                    // attribute is likely to be well-formed already.
                     return diag;
                 } else {
                     diag.span_label(self.span, "expected a string literal here");
@@ -643,6 +648,10 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                 diag.span_label(self.span, "expected a single argument here");
                 diag.code(E0805);
             }
+            AttributeParseErrorReason::ExpectedArgument => {
+                diag.span_label(self.span, "expected an argument here");
+                diag.code(E0805);
+            }
             AttributeParseErrorReason::ExpectedAtLeastOneArgument => {
                 diag.span_label(self.span, "expected at least 1 argument here");
             }
@@ -665,7 +674,7 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                 diag.span_label(self.span, format!("found `{key}` used as a key more than once"));
                 diag.code(E0538);
             }
-            AttributeParseErrorReason::UnexpectedLiteral => {
+            AttributeParseErrorReason::ExpectedNotLiteral => {
                 diag.span_label(self.span, "didn't expect a literal here");
                 diag.code(E0565);
             }
@@ -688,70 +697,26 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
                     format!("expected this to be of the form `{name} = \"...\"`"),
                 );
             }
+            AttributeParseErrorReason::MissingNameValue(name) => {
+                diag.span_label(self.span, format!("missing argument `{name} = \"...\"`"));
+            }
             AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings,
                 list: false,
             } => {
-                let quote = if strings { '"' } else { '`' };
-                match possibilities {
-                    &[] => {}
-                    &[x] => {
-                        diag.span_label(
-                            self.span,
-                            format!("the only valid argument here is {quote}{x}{quote}"),
-                        );
-                    }
-                    [first, second] => {
-                        diag.span_label(self.span, format!("valid arguments are {quote}{first}{quote} or {quote}{second}{quote}"));
-                    }
-                    [first @ .., second_to_last, last] => {
-                        let mut res = String::new();
-                        for i in first {
-                            res.push_str(&format!("{quote}{i}{quote}, "));
-                        }
-                        res.push_str(&format!(
-                            "{quote}{second_to_last}{quote} or {quote}{last}{quote}"
-                        ));
-
-                        diag.span_label(self.span, format!("valid arguments are {res}"));
-                    }
-                }
+                self.render_expected_specific_argument(&mut diag, *possibilities, *strings);
             }
             AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings,
                 list: true,
             } => {
-                let quote = if strings { '"' } else { '`' };
-                match possibilities {
-                    &[] => {}
-                    &[x] => {
-                        diag.span_label(
-                            self.span,
-                            format!(
-                                "this {description} is only valid with {quote}{x}{quote} as an argument"
-                            ),
-                        );
-                    }
-                    [first, second] => {
-                        diag.span_label(self.span, format!("this {description} is only valid with either {quote}{first}{quote} or {quote}{second}{quote} as an argument"));
-                    }
-                    [first @ .., second_to_last, last] => {
-                        let mut res = String::new();
-                        for i in first {
-                            res.push_str(&format!("{quote}{i}{quote}, "));
-                        }
-                        res.push_str(&format!(
-                            "{quote}{second_to_last}{quote} or {quote}{last}{quote}"
-                        ));
-
-                        diag.span_label(self.span, format!("this {description} is only valid with one of the following arguments: {res}"));
-                    }
-                }
+                self.render_expected_specific_argument_list(&mut diag, *possibilities, *strings);
             }
             AttributeParseErrorReason::ExpectedIdentifier => {
                 diag.span_label(self.span, "expected a valid identifier here");
+                diag.code(E0565);
             }
         }
 
@@ -760,18 +725,7 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for AttributeParseError<'_> {
         }
 
         if self.suggestions.len() < 4 {
-            diag.span_suggestions(
-                self.attr_span,
-                if self.suggestions.len() == 1 {
-                    "must be of the form".to_string()
-                } else {
-                    format!(
-                        "try changing it to one of the following valid forms of the {description}"
-                    )
-                },
-                self.suggestions,
-                Applicability::HasPlaceholders,
-            );
+            self.render_suggestions(&mut diag);
         }
 
         diag
@@ -901,13 +855,6 @@ pub(crate) struct IncompatibleWasmLink {
 pub(crate) struct LinkRequiresName {
     #[primary_span]
     #[label("missing `name` argument")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("link name must not contain NUL characters if link kind is `raw-dylib`")]
-pub(crate) struct RawDylibNoNul {
-    #[primary_span]
     pub span: Span,
 }
 
@@ -1056,4 +1003,32 @@ pub(crate) struct UnstableAttrForAlreadyStableFeature {
     pub attr_span: Span,
     #[label("the stability attribute annotates this item")]
     pub item_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("invalid Mach-O section specifier")]
+pub(crate) struct InvalidMachoSection {
+    #[primary_span]
+    #[label("not a valid Mach-O section specifier")]
+    pub name_span: Span,
+    #[subdiagnostic]
+    pub reason: InvalidMachoSectionReason,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum InvalidMachoSectionReason {
+    #[note("a Mach-O section specifier requires a segment and a section, separated by a comma")]
+    #[help("an example of a valid Mach-O section specifier is `__TEXT,__cstring`")]
+    MissingSection,
+    #[note("section name `{$section}` is longer than 16 bytes")]
+    SectionTooLong { section: String },
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[sanitize({$field} = ...)]` attribute cannot be used on statics")]
+#[help("`#[sanitize]` can be used on statics if only the address is sanitized")]
+pub(crate) struct SanitizeInvalidStatic {
+    #[primary_span]
+    pub span: Span,
+    pub field: &'static str,
 }

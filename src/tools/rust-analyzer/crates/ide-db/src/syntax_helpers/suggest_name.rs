@@ -123,6 +123,20 @@ impl NameGenerator {
         generator
     }
 
+    pub fn new_from_scope_non_locals(scope: Option<SemanticsScope<'_>>) -> Self {
+        let mut generator = Self::default();
+        if let Some(scope) = scope {
+            scope.process_all_names(&mut |name, scope| {
+                if let hir::ScopeDef::Local(_) = scope {
+                    return;
+                }
+                generator.insert(name.as_str());
+            });
+        }
+
+        generator
+    }
+
     /// Suggest a name without conflicts. If the name conflicts with existing names,
     /// it will try to resolve the conflict by adding a numeric suffix.
     pub fn suggest_name(&mut self, name: &str) -> SmolStr {
@@ -179,7 +193,10 @@ impl NameGenerator {
     pub fn for_impl_trait_as_generic(&mut self, ty: &ast::ImplTraitType) -> SmolStr {
         let c = ty
             .type_bound_list()
-            .and_then(|bounds| bounds.syntax().text().char_at(0.into()))
+            .and_then(|bounds| {
+                let ty = bounds.bounds().next()?.ty()?;
+                ty.syntax().text().char_at(0.into()).filter(|ch| ch.is_alphabetic())
+            })
             .unwrap_or('T');
 
         self.suggest_name(&c.to_string())

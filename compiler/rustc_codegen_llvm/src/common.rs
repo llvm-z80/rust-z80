@@ -8,7 +8,7 @@ use rustc_abi::{self as abi, HasDataLayout as _};
 use rustc_ast::Mutability;
 use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash128;
 use rustc_hir::def_id::DefId;
 use rustc_middle::bug;
@@ -159,6 +159,10 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
         self.const_int(self.type_i32(), i as i64)
     }
 
+    fn const_i64(&self, i: i64) -> &'ll Value {
+        self.const_int(self.type_i64(), i as i64)
+    }
+
     fn const_int(&self, t: &'ll Type, i: i64) -> &'ll Value {
         debug_assert!(
             self.type_kind(t) == TypeKind::Integer,
@@ -304,7 +308,7 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
                             {
                                 let hash = self.tcx.with_stable_hashing_context(|mut hcx| {
                                     let mut hasher = StableHasher::new();
-                                    alloc.hash_stable(&mut hcx, &mut hasher);
+                                    alloc.stable_hash(&mut hcx, &mut hasher);
                                     hasher.finish::<Hash128>()
                                 });
                                 llvm::set_value_name(

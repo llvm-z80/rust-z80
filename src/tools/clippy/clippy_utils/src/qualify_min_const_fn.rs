@@ -50,7 +50,12 @@ pub fn is_min_const_fn<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, msrv: Ms
     // impl trait is gone in MIR, so check the return type manually
     check_ty(
         cx,
-        cx.tcx.fn_sig(def_id).instantiate_identity().output().skip_binder(),
+        cx.tcx
+            .fn_sig(def_id)
+            .instantiate_identity()
+            .skip_norm_wip()
+            .output()
+            .skip_binder(),
         body.local_decls.iter().next().unwrap().source_info.span,
         msrv,
     )?;
@@ -82,7 +87,10 @@ fn check_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, span: Span, msrv: Msrv) 
             ty::Ref(_, _, hir::Mutability::Mut) if !msrv.meets(cx, msrvs::CONST_MUT_REFS) => {
                 return Err((span, "mutable references in const fn are unstable".into()));
             },
-            ty::Alias(ty::Opaque, ..) => return Err((span, "`impl Trait` in const fn is unstable".into())),
+            ty::Alias(ty::AliasTy {
+                kind: ty::Opaque { .. },
+                ..
+            }) => return Err((span, "`impl Trait` in const fn is unstable".into())),
             ty::FnPtr(..) => {
                 return Err((span, "function pointers in const fn are unstable".into()));
             },
@@ -126,12 +134,13 @@ fn check_rvalue<'tcx>(
 ) -> McfResult {
     match rvalue {
         Rvalue::ThreadLocalRef(_) => Err((span, "cannot access thread local storage in const fn".into())),
-        Rvalue::Discriminant(place) | Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
-            check_place(cx, *place, span, body, msrv)
-        },
-        Rvalue::CopyForDeref(place) => check_place(cx, *place, span, body, msrv),
+        Rvalue::Discriminant(place)
+        | Rvalue::Ref(_, _, place)
+        | Rvalue::Reborrow(_, _, place)
+        | Rvalue::RawPtr(_, place)
+        | Rvalue::CopyForDeref(place) => check_place(cx, *place, span, body, msrv),
         Rvalue::Repeat(operand, _)
-        | Rvalue::Use(operand)
+        | Rvalue::Use(operand, _)
         | Rvalue::WrapUnsafeBinder(operand, _)
         | Rvalue::Cast(
             CastKind::PointerWithExposedProvenance
@@ -241,7 +250,6 @@ fn check_statement<'tcx>(
         // These are all NOPs
         StatementKind::StorageLive(_)
         | StatementKind::StorageDead(_)
-        | StatementKind::Retag { .. }
         | StatementKind::AscribeUserType(..)
         | StatementKind::PlaceMention(..)
         | StatementKind::Coverage(..)

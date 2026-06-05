@@ -21,7 +21,7 @@ use std::marker::PhantomData;
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
 use rustc_type_ir::data_structures::HashMap;
 use tracing::{debug, instrument, trace};
 
@@ -118,10 +118,7 @@ pub trait Delegate: Sized {
 /// result. In the case we return an initial provisional result depending
 /// on the kind of cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
-)]
+#[cfg_attr(feature = "nightly", derive(Decodable_NoContext, Encodable_NoContext, StableHash))]
 pub enum PathKind {
     /// A path consisting of only inductive/unproductive steps. Their initial
     /// provisional result is `Err(NoSolution)`. We currently treat them as
@@ -854,7 +851,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
             if let Some((_scope, expected)) = validate_cache {
                 // Do not try to move a goal into the cache again if we're testing
                 // the global cache.
-                assert_eq!(expected, evaluation_result.result, "input={input:?}");
+                assert_eq!(expected, result, "input={input:?}");
             } else if D::inspect_is_noop(inspect) {
                 self.insert_global_cache(cx, input, evaluation_result, dep_node)
             }
@@ -926,9 +923,10 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D> {
 /// heads from the stack. This may not necessarily mean that we've actually
 /// reached a fixpoint for that cycle head, which impacts the way we rebase
 /// provisional cache entries.
-#[derive(Debug)]
-enum RebaseReason {
+#[derive_where(Debug; X: Cx)]
+enum RebaseReason<X: Cx> {
     NoCycleUsages,
+    Ambiguity(X::AmbiguityInfo),
     Overflow,
     /// We've actually reached a fixpoint.
     ///
@@ -965,7 +963,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         &mut self,
         cx: X,
         stack_entry: &StackEntry<X>,
-        rebase_reason: RebaseReason,
+        rebase_reason: RebaseReason<X>,
     ) {
         let popped_head_index = self.stack.next_index();
         // Rebasing decisions depend only on each provisional entry and the current stack state,
@@ -1046,6 +1044,9 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
                         // is not actually equal to the final provisional result. We
                         // need to discard the provisional cache entry in this case.
                         RebaseReason::NoCycleUsages => return false,
+                        RebaseReason::Ambiguity(info) => {
+                            *result = D::propagate_ambiguity(cx, input, info);
+                        }
                         RebaseReason::Overflow => *result = D::fixpoint_overflow_result(cx, input),
                         RebaseReason::ReachedFixpoint(None) => {}
                         RebaseReason::ReachedFixpoint(Some(path_kind)) => {
@@ -1361,6 +1362,27 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
                 );
                 return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
             }
+
+            // If computing this goal results in ambiguity with no constraints,
+            // we do not rerun it. It's incredibly difficult to get a different
+            // response in the next iteration in this case. These changes would
+            // likely either be caused by incompleteness or can change the maybe
+            // cause from ambiguity to overflow. Returning ambiguity always
+            // preserves soundness and completeness even if the goal is be known
+            // to succeed or fail.
+            //
+            // This prevents exponential blowup affecting multiple major crates.
+            // As we only get to this branch if we haven't yet reached a fixpoint,
+            // we also taint all provisional cache entries which depend on the
+            // current goal.
+            if let Some(info) = D::is_ambiguous_result(result) {
+                self.rebase_provisional_cache_entries(
+                    cx,
+                    &stack_entry,
+                    RebaseReason::Ambiguity(info),
+                );
+                return EvaluationResult::finalize(stack_entry, encountered_overflow, result);
+            };
 
             // If we've reached the fixpoint step limit, we bail with overflow and taint all
             // provisional cache entries which depend on the current goal.

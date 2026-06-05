@@ -46,9 +46,12 @@ pub struct Flags {
     #[command(subcommand)]
     pub cmd: Subcommand,
 
-    #[arg(global = true, short, long, action = clap::ArgAction::Count)]
+    #[arg(global = true, short, long, action = clap::ArgAction::Count, conflicts_with = "quiet")]
     /// use verbose output (-vv for very verbose)
     pub verbose: u8, // each extra -v after the first is passed to Cargo
+    #[arg(global = true, short, long, conflicts_with = "verbose")]
+    /// use quiet output
+    pub quiet: bool,
     #[arg(global = true, short, long)]
     /// use incremental compilation
     pub incremental: bool,
@@ -243,7 +246,7 @@ fn normalize_args(args: &[String]) -> Vec<String> {
 
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum Subcommand {
-    #[command(aliases = ["b"], long_about = "\n
+    #[command(visible_aliases = ["b"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to directories to the crates
         and/or artifacts to compile. For example, for a quick build of a usable
@@ -261,7 +264,7 @@ pub enum Subcommand {
         /// Pass `--timings` to Cargo to get crate build timings
         timings: bool,
     },
-    #[command(aliases = ["c"], long_about = "\n
+    #[command(visible_aliases = ["c"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to directories to the crates
         and/or artifacts to compile. For example:
@@ -330,7 +333,7 @@ pub enum Subcommand {
         #[arg(long)]
         all: bool,
     },
-    #[command(aliases = ["d"], long_about = "\n
+    #[command(visible_aliases = ["d"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to directories of documentation
         to build. For example:
@@ -351,7 +354,7 @@ pub enum Subcommand {
         /// render the documentation in JSON format in addition to the usual HTML format
         json: bool,
     },
-    #[command(aliases = ["t"], long_about = "\n
+    #[command(visible_aliases = ["t"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to test directories that
         should be compiled and run. For example:
@@ -422,6 +425,10 @@ pub enum Subcommand {
         #[arg(long)]
         /// don't capture stdout/stderr of tests
         no_capture: bool,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        /// whether to show verbose subprocess output for run-make tests;
+        /// set to false to suppress output for passing tests (e.g. for cg_clif with --no-capture)
+        verbose_run_make_subprocess_output: bool,
         #[arg(long)]
         /// Use a different codegen backend when running tests.
         test_codegen_backend: Option<CodegenBackendKind>,
@@ -433,6 +440,15 @@ pub enum Subcommand {
         #[arg(long)]
         #[doc(hidden)]
         no_doc: bool,
+
+        /// Record all the failed tests in a file in the build directory.
+        ///
+        /// On subsequent invocations, this set of tests can be rerun by passing `--rerun`
+        #[arg(long)]
+        record: bool,
+        /// Rerun tests that previously failed, and stored with `--record`.
+        #[arg(long)]
+        rerun: bool,
     },
     /// Build and run some test suites *in Miri*
     Miri {
@@ -476,7 +492,7 @@ pub enum Subcommand {
     Dist,
     /// Install distribution artifacts
     Install,
-    #[command(aliases = ["r"], long_about = "\n
+    #[command(visible_aliases = ["r"], long_about = "\n
     Arguments:
         This subcommand accepts a number of paths to tools to build and run. For
         example:
@@ -631,6 +647,15 @@ impl Subcommand {
         }
     }
 
+    pub fn verbose_run_make_subprocess_output(&self) -> bool {
+        match *self {
+            Subcommand::Test { verbose_run_make_subprocess_output, .. } => {
+                verbose_run_make_subprocess_output
+            }
+            _ => true,
+        }
+    }
+
     pub fn rustfix_coverage(&self) -> bool {
         match *self {
             Subcommand::Test { rustfix_coverage, .. } => rustfix_coverage,
@@ -704,6 +729,20 @@ impl Subcommand {
     pub fn bypass_ignore_backends(&self) -> bool {
         match self {
             Subcommand::Test { bypass_ignore_backends, .. } => *bypass_ignore_backends,
+            _ => false,
+        }
+    }
+
+    pub fn record(&self) -> bool {
+        match self {
+            Subcommand::Test { record, .. } => *record,
+            _ => false,
+        }
+    }
+
+    pub fn rerun(&self) -> bool {
+        match self {
+            Subcommand::Test { rerun, .. } => *rerun,
             _ => false,
         }
     }

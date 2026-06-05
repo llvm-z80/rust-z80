@@ -1,4 +1,4 @@
-// skip-filecheck
+//@ skip-filecheck
 // Test that we don't ICE when trying to dump MIR for unusual item types and
 // that we don't create filenames containing `<` and `>`
 //@ compile-flags: -Zmir-opt-level=0
@@ -22,7 +22,7 @@ enum E {
     V = 5,
 }
 
-// EMIT_MIR core.ptr-drop_in_place.Vec_i32_.AddMovesForPackedDrops.before.mir
+// EMIT_MIR core.ptr-drop_glue.Vec_i32_.AddMovesForPackedDrops.before.mir
 pub fn main() {
     let f = Test::X as fn(usize) -> Test;
     let v = Vec::<i32>::new();

@@ -1,4 +1,3 @@
-use rustc_errors::{Diag, EmissionGuarantee, Subdiagnostic};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::Ty;
 use rustc_span::Span;
@@ -49,7 +48,7 @@ impl Uncovered {
 #[derive(Diagnostic)]
 #[diag("multiple patterns overlap on their endpoints")]
 #[note("you likely meant to write mutually exclusive ranges")]
-pub struct OverlappingRangeEndpoints {
+pub(crate) struct OverlappingRangeEndpoints {
     #[label("... with this range")]
     pub range: Span,
     #[subdiagnostic]
@@ -58,7 +57,7 @@ pub struct OverlappingRangeEndpoints {
 
 #[derive(Subdiagnostic)]
 #[label("this range overlaps on `{$range}`...")]
-pub struct Overlap {
+pub(crate) struct Overlap {
     #[primary_span]
     pub span: Span,
     pub range: String, // a printed pattern
@@ -66,7 +65,7 @@ pub struct Overlap {
 
 #[derive(Diagnostic)]
 #[diag("exclusive range missing `{$max}`")]
-pub struct ExclusiveRangeMissingMax {
+pub(crate) struct ExclusiveRangeMissingMax {
     #[label("this range doesn't match `{$max}` because `..` is an exclusive range")]
     #[suggestion(
         "use an inclusive range instead",
@@ -82,7 +81,7 @@ pub struct ExclusiveRangeMissingMax {
 
 #[derive(Diagnostic)]
 #[diag("multiple ranges are one apart")]
-pub struct ExclusiveRangeMissingGap {
+pub(crate) struct ExclusiveRangeMissingGap {
     #[label("this range doesn't match `{$gap}` because `..` is an exclusive range")]
     #[suggestion(
         "use an inclusive range instead",
@@ -99,23 +98,15 @@ pub struct ExclusiveRangeMissingGap {
     pub gap_with: Vec<GappedRange>,
 }
 
-pub struct GappedRange {
+#[derive(Subdiagnostic)]
+#[label(
+    "this could appear to continue range `{$first_range}`, but `{$gap}` isn't matched by either of them"
+)]
+pub(crate) struct GappedRange {
+    #[primary_span]
     pub span: Span,
     pub gap: String,         // a printed pattern
     pub first_range: String, // a printed pattern
-}
-
-impl Subdiagnostic for GappedRange {
-    fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
-        let GappedRange { span, gap, first_range } = self;
-
-        // FIXME(mejrs) Use `#[subdiagnostic(eager)]` instead
-        let message = format!(
-            "this could appear to continue range `{first_range}`, but `{gap}` isn't matched by \
-            either of them"
-        );
-        diag.span_label(span, message);
-    }
 }
 
 #[derive(Diagnostic)]

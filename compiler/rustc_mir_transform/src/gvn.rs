@@ -116,12 +116,13 @@ use rustc_middle::mir::interpret::{AllocRange, GlobalAlloc};
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
 use rustc_middle::ty::layout::HasTypingEnv;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
+use rustc_mir_dataflow::{Analysis, ResultsCursor};
 use rustc_span::DUMMY_SP;
 use smallvec::SmallVec;
 use tracing::{debug, instrument, trace};
 
-use crate::ssa::SsaLocals;
+use crate::ssa::{MaybeUninitializedLocals, SsaLocals};
 
 pub(super) struct GVN;
 
@@ -154,10 +155,35 @@ impl<'tcx> crate::MirPass<'tcx> for GVN {
             state.visit_basic_block_data(bb, data);
         }
 
-        // For each local that is reused (`y` above), we remove its storage statements do avoid any
-        // difficulty. Those locals are SSA, so should be easy to optimize by LLVM without storage
-        // statements.
-        StorageRemover { tcx, reused_locals: state.reused_locals }.visit_body_preserves_cfg(body);
+        // When emitting storage statements, we want to retain the reused locals' storage statements,
+        // as this enables better optimizations. For each local use location, we mark it for storage removal
+        // only if it might be uninitialized at that point.
+        let storage_to_remove = if tcx.sess.emit_lifetime_markers() {
+            let maybe_uninit = MaybeUninitializedLocals
+                .iterate_to_fixpoint(tcx, body, Some("mir_opt::gvn"))
+                .into_results_cursor(body);
+
+            let mut storage_checker = StorageChecker {
+                reused_locals: &state.reused_locals,
+                storage_to_remove: DenseBitSet::new_empty(body.local_decls.len()),
+                maybe_uninit,
+            };
+
+            for (bb, data) in traversal::reachable(body) {
+                storage_checker.visit_basic_block_data(bb, data);
+            }
+
+            Some(storage_checker.storage_to_remove)
+        } else {
+            None
+        };
+
+        // If None, remove the storage statements of all the reused locals.
+        let storage_to_remove = storage_to_remove.as_ref().unwrap_or(&state.reused_locals);
+        debug!(?storage_to_remove);
+
+        StorageRemover { tcx, reused_locals: &state.reused_locals, storage_to_remove }
+            .visit_body_preserves_cfg(body);
     }
 
     fn is_required(&self) -> bool {
@@ -1035,7 +1061,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
     ) -> Option<VnIndex> {
         let value = match *rvalue {
             // Forward values.
-            Rvalue::Use(ref mut operand) => return self.simplify_operand(operand, location),
+            Rvalue::Use(ref mut operand, _) => return self.simplify_operand(operand, location),
 
             // Roots.
             Rvalue::Repeat(ref mut op, amount) => {
@@ -1046,6 +1072,21 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             Rvalue::Ref(_, borrow_kind, ref mut place) => {
                 self.simplify_place_projection(place, location);
                 return self.new_pointer(*place, AddressKind::Ref(borrow_kind));
+            }
+            Rvalue::Reborrow(_, mutbl, place) => {
+                if mutbl == Mutability::Mut {
+                    // Note: this is adapted from simplify_aggregate.
+                    let mut operand = Operand::Copy(place);
+                    let val = self.simplify_operand(&mut operand, location);
+                    // FIXME(reborrow): Is it correct to make these retagging assignments?
+                    *rvalue = Rvalue::Use(Operand::Copy(place), WithRetag::Yes);
+                    return val;
+                } else {
+                    // FIXME(reborrow): CoerceShared should perform effectively a copy followed by a
+                    // transmute, or possibly something more complicated in the future. For now we
+                    // leave this unoptimised.
+                    return None;
+                }
             }
             Rvalue::RawPtr(mutbl, ref mut place) => {
                 self.simplify_place_projection(place, location);
@@ -1060,7 +1101,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             Rvalue::Cast(ref mut kind, ref mut value, to) => {
                 return self.simplify_cast(kind, value, to, location);
             }
-            Rvalue::BinaryOp(op, box (ref mut lhs, ref mut rhs)) => {
+            Rvalue::BinaryOp(op, (ref mut lhs, ref mut rhs)) => {
                 return self.simplify_binary(op, lhs, rhs, location);
             }
             Rvalue::UnaryOp(op, ref mut arg_op) => {
@@ -1159,7 +1200,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         let tcx = self.tcx;
         let ty = rvalue.ty(self.local_decls, tcx);
 
-        let Rvalue::Aggregate(box ref kind, ref mut field_ops) = *rvalue else { bug!() };
+        let Rvalue::Aggregate(ref kind, ref mut field_ops) = *rvalue else { bug!() };
 
         if field_ops.is_empty() {
             let is_zst = match *kind {
@@ -1237,7 +1278,8 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         if let Some(value) = self.simplify_aggregate_to_copy(ty, variant_index, &fields) {
             if let Some(place) = self.try_as_place(value, location, true) {
                 self.reused_locals.insert(place.local);
-                *rvalue = Rvalue::Use(Operand::Copy(place));
+                // FIXME: Is it correct to make these retagging assignments?
+                *rvalue = Rvalue::Use(Operand::Copy(place), WithRetag::Yes);
             }
             return Some(value);
         }
@@ -1632,10 +1674,13 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         let right_meta_ty = right_ptr_ty.pointee_metadata_ty_or_projection(self.tcx);
         if left_meta_ty == right_meta_ty {
             true
-        } else if let Ok(left) =
-            self.tcx.try_normalize_erasing_regions(self.typing_env(), left_meta_ty)
-            && let Ok(right) =
-                self.tcx.try_normalize_erasing_regions(self.typing_env(), right_meta_ty)
+        } else if let Ok(left) = self
+            .tcx
+            .try_normalize_erasing_regions(self.typing_env(), Unnormalized::new_wip(left_meta_ty))
+            && let Ok(right) = self.tcx.try_normalize_erasing_regions(
+                self.typing_env(),
+                Unnormalized::new_wip(right_meta_ty),
+            )
         {
             left == right
         } else {
@@ -1731,7 +1776,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             && adt.repr().transparent()
             && let [single_field] = adt.non_enum_variant().fields.raw.as_slice()
         {
-            Some((FieldIdx::ZERO, single_field.ty(self.tcx, args)))
+            Some((FieldIdx::ZERO, single_field.ty(self.tcx, args).skip_norm_wip()))
         } else {
             None
         }
@@ -1993,13 +2038,13 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
 
         let value = self.simplify_rvalue(lhs, rvalue, location);
         if let Some(value) = value {
+            // FIXME: Is it correct to make these retagging assignments?
             if let Some(const_) = self.try_as_constant(value) {
-                *rvalue = Rvalue::Use(Operand::Constant(Box::new(const_)));
+                *rvalue = Rvalue::Use(Operand::Constant(Box::new(const_)), WithRetag::Yes);
             } else if let Some(place) = self.try_as_place(value, location, false)
-                && *rvalue != Rvalue::Use(Operand::Move(place))
-                && *rvalue != Rvalue::Use(Operand::Copy(place))
+                && !matches!(rvalue, Rvalue::Use(Operand::Move(p) | Operand::Copy(p), _) if p == &place)
             {
-                *rvalue = Rvalue::Use(Operand::Copy(place));
+                *rvalue = Rvalue::Use(Operand::Copy(place), WithRetag::Yes);
                 self.reused_locals.insert(place.local);
             }
         }
@@ -2030,12 +2075,13 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
     }
 }
 
-struct StorageRemover<'tcx> {
+struct StorageRemover<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    reused_locals: DenseBitSet<Local>,
+    reused_locals: &'a DenseBitSet<Local>,
+    storage_to_remove: &'a DenseBitSet<Local>,
 }
 
-impl<'tcx> MutVisitor<'tcx> for StorageRemover<'tcx> {
+impl<'a, 'tcx> MutVisitor<'tcx> for StorageRemover<'a, 'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -2053,11 +2099,53 @@ impl<'tcx> MutVisitor<'tcx> for StorageRemover<'tcx> {
         match stmt.kind {
             // When removing storage statements, we need to remove both (#107511).
             StatementKind::StorageLive(l) | StatementKind::StorageDead(l)
-                if self.reused_locals.contains(l) =>
+                if self.storage_to_remove.contains(l) =>
             {
                 stmt.make_nop(true)
             }
             _ => self.super_statement(stmt, loc),
+        }
+    }
+}
+
+struct StorageChecker<'a, 'tcx> {
+    reused_locals: &'a DenseBitSet<Local>,
+    storage_to_remove: DenseBitSet<Local>,
+    maybe_uninit: ResultsCursor<'a, 'tcx, MaybeUninitializedLocals>,
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for StorageChecker<'a, 'tcx> {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
+        match context {
+            // These mutating uses do not require the local to be initialized,
+            // so we cannot use our maybe-uninit check on them.
+            // However, GVN doesn't introduce or move mutations,
+            // so this local must already have valid storage at this location.
+            PlaceContext::MutatingUse(MutatingUseContext::AsmOutput)
+            | PlaceContext::MutatingUse(MutatingUseContext::Call)
+            | PlaceContext::MutatingUse(MutatingUseContext::Store)
+            | PlaceContext::MutatingUse(MutatingUseContext::Yield)
+            | PlaceContext::NonUse(_) => {
+                return;
+            }
+            // Must check validity for other mutating usages and all non-mutating uses.
+            PlaceContext::MutatingUse(_) | PlaceContext::NonMutatingUse(_) => {}
+        }
+
+        // We only need to check reused locals which we haven't already removed storage for.
+        if !self.reused_locals.contains(local) || self.storage_to_remove.contains(local) {
+            return;
+        }
+
+        self.maybe_uninit.seek_before_primary_effect(location);
+
+        if self.maybe_uninit.get().contains(local) {
+            debug!(
+                ?location,
+                ?local,
+                "local is reused and is maybe uninit at this location, marking it for storage statement removal"
+            );
+            self.storage_to_remove.insert(local);
         }
     }
 }

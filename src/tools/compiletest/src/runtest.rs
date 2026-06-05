@@ -14,7 +14,7 @@ use regex::{Captures, Regex};
 use tracing::*;
 
 use crate::common::{
-    CompareMode, Config, Debugger, FailMode, PassMode, RunFailMode, RunResult, TestMode, TestPaths,
+    CompareMode, Config, Debugger, ForcePassMode, PassFailMode, RunResult, TestMode, TestPaths,
     TestSuite, UI_EXTENSIONS, UI_FIXED, UI_RUN_STDERR, UI_RUN_STDOUT, UI_STDERR, UI_STDOUT, UI_SVG,
     UI_WINDOWS_SVG, expected_output_path, incremental_dir, output_base_dir, output_base_name,
 };
@@ -22,7 +22,7 @@ use crate::directives::{AuxCrate, TestProps};
 use crate::errors::{Error, ErrorKind, load_errors};
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
-use crate::runtest::compute_diff::{DiffLine, make_diff, write_diff};
+use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
 use crate::util::{Utf8PathBufExt, add_dylib_path, static_regex};
 use crate::{json, stamp_file_path};
 
@@ -106,7 +106,7 @@ fn dylib_name(name: &str) -> String {
     format!("{}{name}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION)
 }
 
-pub fn run(
+pub(crate) fn run(
     config: &Config,
     stdout: &dyn ConsoleOut,
     stderr: &dyn ConsoleOut,
@@ -181,7 +181,7 @@ pub fn run(
     cx.create_stamp();
 }
 
-pub fn compute_stamp_hash(config: &Config) -> String {
+pub(crate) fn compute_stamp_hash(config: &Config) -> String {
     let mut hash = DefaultHasher::new();
     config.stage_id.hash(&mut hash);
     config.run.hash(&mut hash);
@@ -266,12 +266,6 @@ impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
     /// revisions, exactly once, with revision == None).
     fn run_revision(&self) {
-        if self.props.should_ice
-            && self.config.mode != TestMode::Incremental
-            && self.config.mode != TestMode::Crashes
-        {
-            self.fatal("cannot use should-ice in a test that is not cfail");
-        }
         // Run the test multiple times if requested.
         // This is useful for catching flaky tests under the parallel frontend.
         for _ in 0..self.config.iteration_count {
@@ -295,88 +289,68 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn pass_mode(&self) -> Option<PassMode> {
-        self.props.pass_mode(self.config)
-    }
+    /// Returns the pass/fail expectation of this UI test
+    /// (e.g. `//@ check-pass` or `//@ build-fail`),
+    /// possibly modified by an explicit `--pass=check` on the command-line.
+    fn effective_pass_fail_mode(&self) -> Option<PassFailMode> {
+        assert_eq!(self.config.mode, TestMode::Ui);
+        // UI tests always have a pass/fail mode, but their auxiliary crates never have one.
+        let declared = self.props.pass_fail_mode?;
 
-    fn should_run(&self, pm: Option<PassMode>) -> WillExecute {
-        let test_should_run = match self.config.mode {
-            TestMode::Ui
-                if pm == Some(PassMode::Run)
-                    || matches!(self.props.fail_mode, Some(FailMode::Run(_))) =>
-            {
-                true
+        // Specifying `--pass` only overrides `//@ pass-*` modes, and only if
+        // the test doesn't opt out with `//@ no-pass-override`.
+        if let Some(force_pass_mode) = self.config.force_pass_mode
+            && !self.props.no_pass_override
+            && declared.is_pass()
+        {
+            match force_pass_mode {
+                ForcePassMode::Check => Some(PassFailMode::CheckPass),
+                ForcePassMode::Build => Some(PassFailMode::BuildPass),
+                ForcePassMode::Run => Some(PassFailMode::RunPass),
             }
-            TestMode::MirOpt if pm == Some(PassMode::Run) => true,
-            TestMode::Ui | TestMode::MirOpt => false,
-            mode => panic!("unimplemented for mode {:?}", mode),
-        };
-        if test_should_run { self.run_if_enabled() } else { WillExecute::No }
+        } else {
+            Some(declared)
+        }
     }
 
     fn run_if_enabled(&self) -> WillExecute {
         if self.config.run_enabled() { WillExecute::Yes } else { WillExecute::Disabled }
     }
 
-    fn should_run_successfully(&self, pm: Option<PassMode>) -> bool {
-        match self.config.mode {
-            TestMode::Ui | TestMode::MirOpt => pm == Some(PassMode::Run),
-            mode => panic!("unimplemented for mode {:?}", mode),
-        }
-    }
+    fn check_if_test_should_compile(&self, pass_fail: PassFailMode, proc_res: &ProcRes) {
+        assert_eq!(self.config.mode, TestMode::Ui);
 
-    fn should_compile_successfully(&self, pm: Option<PassMode>) -> bool {
-        match self.config.mode {
-            TestMode::RustdocJs => true,
-            TestMode::Ui => pm.is_some() || self.props.fail_mode > Some(FailMode::Build),
-            TestMode::Crashes => false,
-            TestMode::Incremental => {
-                let revision =
-                    self.revision.expect("incremental tests require a list of revisions");
-                if revision.starts_with("cpass")
-                    || revision.starts_with("rpass")
-                    || revision.starts_with("rfail")
-                {
-                    true
-                } else if revision.starts_with("cfail") {
-                    pm.is_some()
-                } else {
-                    panic!("revision name must begin with cpass, rpass, rfail, or cfail");
-                }
-            }
-            mode => panic!("unimplemented for mode {:?}", mode),
-        }
-    }
+        let should_compile_successfully = match pass_fail {
+            PassFailMode::CheckFail | PassFailMode::BuildFail => false,
 
-    fn check_if_test_should_compile(
-        &self,
-        fail_mode: Option<FailMode>,
-        pass_mode: Option<PassMode>,
-        proc_res: &ProcRes,
-    ) {
-        if self.should_compile_successfully(pass_mode) {
+            PassFailMode::CheckPass
+            | PassFailMode::BuildPass
+            | PassFailMode::RunFail
+            | PassFailMode::RunCrash
+            | PassFailMode::RunFailOrCrash
+            | PassFailMode::RunPass => true,
+        };
+
+        if should_compile_successfully {
             if !proc_res.status.success() {
-                match (fail_mode, pass_mode) {
-                    (Some(FailMode::Build), Some(PassMode::Check)) => {
-                        // A `build-fail` test needs to `check-pass`.
-                        self.fatal_proc_rec(
-                            "`build-fail` test is required to pass check build, but check build failed",
-                            proc_res,
-                        );
-                    }
-                    _ => {
-                        self.fatal_proc_rec(
-                            "test compilation failed although it shouldn't!",
-                            proc_res,
-                        );
-                    }
+                if pass_fail == PassFailMode::CheckPass
+                    && self.effective_pass_fail_mode() == Some(PassFailMode::BuildFail)
+                {
+                    // A `build-fail` test needs to `check-pass`.
+                    self.fatal_proc_rec(
+                        "`build-fail` test is required to pass check build, but check build failed",
+                        proc_res,
+                    );
+                } else {
+                    self.fatal_proc_rec("test compilation failed although it shouldn't!", proc_res);
                 }
             }
         } else {
             if proc_res.status.success() {
                 let err = &format!("{} test did not emit an error", self.config.mode);
-                let extra_note = (self.config.mode == crate::common::TestMode::Ui)
-                    .then_some("note: by default, ui tests are expected not to compile.\nhint: use check-pass, build-pass, or run-pass directive to change this behavior.");
+                let extra_note = Some(
+                    "note: by default, ui tests are expected not to compile.\nhint: use check-pass, build-pass, or run-pass directive to change this behavior.",
+                );
                 self.fatal_proc_rec_general(err, extra_note, proc_res, || ());
             }
 
@@ -455,6 +429,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg(input)
             .args(&["-Z", &format!("unpretty={}", pretty_type)])
+            .arg("-Zunstable-options")
             .args(&["--target", &self.config.target])
             .arg("-L")
             .arg(&aux_dir)
@@ -560,6 +535,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg("-")
             .arg("-Zno-codegen")
+            .arg("-Zunstable-options")
             .arg("--out-dir")
             .arg(&out_dir)
             .arg(&format!("--target={}", target))
@@ -673,16 +649,6 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_no_compiler_crash(&self, proc_res: &ProcRes, should_ice: bool) {
-        match proc_res.status.code() {
-            Some(101) if !should_ice => {
-                self.fatal_proc_rec("compiler encountered internal error", proc_res)
-            }
-            None => self.fatal_proc_rec("compiler terminated by signal", proc_res),
-            _ => (),
-        }
-    }
-
     fn check_forbid_output(&self, output_to_check: &str, proc_res: &ProcRes) {
         for pat in &self.props.forbid_output {
             if output_to_check.contains(pat) {
@@ -779,6 +745,11 @@ impl<'test> TestCx<'test> {
             }
         }
 
+        unexpected.sort_by_key(|e| (e.line_num, e.column_num));
+        unimportant.sort_by_key(|e| (e.line_num, e.column_num));
+
+        // `not_found` are sorted because `expected_errors` are sorted as they are read from file
+        // line by line.
         let mut not_found = Vec::new();
         // anything not yet found is a problem
         for (index, expected_error) in expected_errors.iter().enumerate() {
@@ -939,33 +910,14 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn should_emit_metadata(&self, pm: Option<PassMode>) -> Emit {
-        match (pm, self.props.fail_mode, self.config.mode) {
-            (Some(PassMode::Check), ..) | (_, Some(FailMode::Check), TestMode::Ui) => {
-                Emit::Metadata
-            }
-            _ => Emit::None,
-        }
-    }
-
     fn compile_test(&self, will_execute: WillExecute, emit: Emit) -> ProcRes {
-        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), Vec::new())
-    }
-
-    fn compile_test_with_passes(
-        &self,
-        will_execute: WillExecute,
-        emit: Emit,
-        passes: Vec<String>,
-    ) -> ProcRes {
-        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), passes)
+        self.compile_test_general(will_execute, emit, Vec::new())
     }
 
     fn compile_test_general(
         &self,
         will_execute: WillExecute,
         emit: Emit,
-        local_pm: Option<PassMode>,
         passes: Vec<String>,
     ) -> ProcRes {
         let compiler_kind = self.compiler_kind_for_non_aux();
@@ -986,16 +938,19 @@ impl<'test> TestCx<'test> {
                 // let's just ignore unused code warnings by defaults and tests
                 // can turn it back on if needed.
                 if compiler_kind == CompilerKind::Rustc
-                    // Note that we use the local pass mode here as we don't want
+                    // Note that we use the declared pass mode here as we don't want
                     // to set unused to allow if we've overridden the pass mode
                     // via command line flags.
-                    && local_pm != Some(PassMode::Run)
+                    // FIXME(Zalathar): We should probably also warn in run-fail/crash
+                    // tests, but that requires changes to some existing tests.
+                    && self.props.pass_fail_mode != Some(PassFailMode::RunPass)
                 {
                     AllowUnused::Yes
                 } else {
                     AllowUnused::No
                 }
             }
+            TestMode::Incremental => AllowUnused::Yes,
             _ => AllowUnused::No,
         };
 
@@ -1697,9 +1652,11 @@ impl<'test> TestCx<'test> {
                 TestMode::Ui => {
                     // If optimize-tests is true we still only want to optimize tests that actually get
                     // executed and that don't specify their own optimization levels.
-                    // Note: aux libs don't have a pass-mode, so they won't get optimized
+                    // Note: aux libs don't have a pass/fail mode, so they won't get optimized
                     // unless compile-flags are set in the aux file.
-                    if self.props.pass_mode(&self.config) == Some(PassMode::Run)
+                    // FIXME(Zalathar): We could also optimize run-fail/run-crash tests,
+                    // but it's unclear whether that would be helpful or a waste of time.
+                    if self.effective_pass_fail_mode() == Some(PassFailMode::RunPass)
                         && !self
                             .props
                             .compile_flags
@@ -2795,6 +2752,7 @@ impl<'test> TestCx<'test> {
                     expected,
                     actual,
                     actual_unnormalized,
+                    compare_output_by_lines || compare_output_by_lines_subset,
                 );
             }
         } else {
@@ -2832,6 +2790,7 @@ impl<'test> TestCx<'test> {
         expected: &str,
         actual: &str,
         actual_unnormalized: &str,
+        show_diff_by_lines: bool,
     ) {
         writeln!(self.stderr, "diff of {stream}:\n");
         if let Some(diff_command) = self.config.diff_command.as_deref() {
@@ -2897,6 +2856,10 @@ impl<'test> TestCx<'test> {
                 "{}",
                 write_diff(&mismatches_unnormalized, &mismatches_normalized, 0)
             );
+        }
+
+        if show_diff_by_lines {
+            write!(self.stderr, "{}", diff_by_lines(expected, actual));
         }
     }
 
@@ -2985,7 +2948,7 @@ struct ProcArgs {
 }
 
 #[derive(Debug)]
-pub struct ProcRes {
+pub(crate) struct ProcRes {
     status: ExitStatus,
     stdout: String,
     stderr: String,
@@ -2995,7 +2958,7 @@ pub struct ProcRes {
 
 impl ProcRes {
     #[must_use]
-    pub fn format_info(&self) -> String {
+    pub(crate) fn format_info(&self) -> String {
         fn render(name: &str, contents: &str) -> String {
             let contents = json::extract_rendered(contents);
             let contents = contents.trim_end();

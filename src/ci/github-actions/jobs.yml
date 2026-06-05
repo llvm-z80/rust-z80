@@ -94,6 +94,7 @@ jobs:
   dist-x86_64-linux: &job-dist-x86_64-linux
     name: dist-x86_64-linux
     env:
+      IMAGE: dist-x86_64-linux
       CODEGEN_BACKENDS: llvm,cranelift
       DOCKER_SCRIPT: dist.sh
     <<: *job-linux-36c-codebuild
@@ -143,6 +144,13 @@ pr:
     <<: *job-linux-4c
   - name: x86_64-gnu-gcc
     doc_url: https://rustc-dev-guide.rust-lang.org/tests/codegen-backend-tests/cg_gcc.html
+    env:
+      CODEGEN_BACKENDS: llvm,gcc
+    <<: *job-linux-4c
+  - name: x86_64-gnu-gcc-core-tests
+    doc_url: https://rustc-dev-guide.rust-lang.org/tests/codegen-backend-tests/cg_gcc.html
+    env:
+      CODEGEN_BACKENDS: gcc
     <<: *job-linux-4c
 
 # Jobs that run when you perform a try build (@bors try)
@@ -150,6 +158,7 @@ pr:
 # it in each job definition.
 try:
   - <<: *job-dist-x86_64-linux
+    name: dist-x86_64-linux-quick
 
 # Jobs that only run when explicitly invoked in one of the following ways:
 # - comment `@bors try jobs=<job-name>`
@@ -259,6 +268,9 @@ auto:
   - name: dist-x86_64-freebsd
     <<: *job-linux-4c
 
+  - name: dist-aarch64-freebsd
+    <<: *job-aarch64-linux
+
   - name: dist-x86_64-illumos
     <<: *job-linux-4c
 
@@ -351,10 +363,6 @@ auto:
   - name: optional-x86_64-gnu-parallel-frontend
     # This test can be flaky, so do not cancel CI if it fails, for now.
     continue_on_error: true
-    <<: *job-linux-4c
-
-  - name: x86_64-gnu-gcc
-    doc_url: https://rustc-dev-guide.rust-lang.org/tests/codegen-backend-tests/cg_gcc.html
     <<: *job-linux-4c
 
   # This job ensures commits landing on nightly still pass the full
@@ -509,7 +517,7 @@ auto:
   - name: dist-aarch64-apple
     env:
       SCRIPT: >-
-        ./x.py dist bootstrap
+        ./x.py dist bootstrap enzyme
         --include-default-paths
         --host=aarch64-apple-darwin
         --target=aarch64-apple-darwin
@@ -518,6 +526,7 @@ auto:
         --enable-sanitizers
         --enable-profiler
         --set rust.jemalloc
+        --set llvm.link-shared=true
         --set rust.lto=thin
         --set rust.codegen-units=1
       # Aarch64 tooling only needs to support macOS 11.0 and up as nothing else
