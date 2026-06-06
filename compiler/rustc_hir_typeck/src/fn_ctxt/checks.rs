@@ -486,16 +486,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
 
                 // There are a few types which get autopromoted when passed via varargs
-                // in C but we just error out instead and require explicit casts.
+                // in C but we just error out instead and require explicit casts. An
+                // integer narrower than `int` (whose width is target-dependent) is
+                // promoted and must be cast; one already `int`-wide or wider is not.
                 let arg_ty = self.structurally_resolve_type(arg.span, arg_ty);
+                let c_int_width = tcx.sess.target.c_int_width;
                 match arg_ty.kind() {
                     ty::Float(ty::FloatTy::F32) => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_double");
                     }
-                    ty::Int(ty::IntTy::I8 | ty::IntTy::I16) | ty::Bool => {
+                    ty::Int(ty::IntTy::I8) | ty::Bool => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_int");
                     }
-                    ty::Uint(ty::UintTy::U8 | ty::UintTy::U16) => {
+                    ty::Int(ty::IntTy::I16) if c_int_width > 16 => {
+                        variadic_error(tcx.sess, arg.span, arg_ty, "c_int");
+                    }
+                    ty::Uint(ty::UintTy::U8) => {
+                        variadic_error(tcx.sess, arg.span, arg_ty, "c_uint");
+                    }
+                    ty::Uint(ty::UintTy::U16) if c_int_width > 16 => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_uint");
                     }
                     ty::FnDef(..) => {
