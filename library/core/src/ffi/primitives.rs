@@ -123,7 +123,9 @@ mod c_char_definition {
                 target_arch = "riscv32",
                 target_arch = "riscv64",
                 target_arch = "s390x",
+                target_arch = "sm83",
                 target_arch = "xtensa",
+                target_arch = "z80",
             )
         ) => {
             pub(super) type c_char = u8;

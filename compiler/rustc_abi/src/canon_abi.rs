@@ -166,7 +166,7 @@ pub enum ArmCall {
 /// ABIs defined for Z80/SM83
 #[derive(Copy, Clone, Debug)]
 #[derive(PartialOrd, Ord, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Z80Call {
     /// SDCC __sdcccall(0): all arguments on the stack
     SdccCall0,

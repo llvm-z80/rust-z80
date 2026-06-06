@@ -316,7 +316,7 @@ const impl<'f> Drop for VaList<'f> {
 pub impl(self) unsafe trait VaArgSafe: Copy {}
 
 crate::cfg_select! {
-    any(target_arch = "avr", target_arch = "msp430") => {
+    any(target_arch = "avr", target_arch = "msp430", target_arch = "z80", target_arch = "sm83") => {
         // c_int/c_uint are i16/u16 on these targets.
         //
         // - i8 is implicitly promoted to c_int in C, and cannot implement `VaArgSafe`.
