@@ -276,6 +276,12 @@ mod sealed {
 
     impl Sealed for f64 {}
 
+    // `int` is 16-bit on these targets, so i16/u16 are the c_int width.
+    #[cfg(any(target_arch = "z80", target_arch = "sm83"))]
+    impl Sealed for i16 {}
+    #[cfg(any(target_arch = "z80", target_arch = "sm83"))]
+    impl Sealed for u16 {}
+
     impl<T> Sealed for *mut T {}
     impl<T> Sealed for *const T {}
 }
@@ -311,6 +317,13 @@ unsafe impl VaArgSafe for usize {}
 
 // f32 is implicitly promoted to c_double in C, and cannot implement `VaArgSafe`.
 unsafe impl VaArgSafe for f64 {}
+
+// On z80/sm83 `int` is 16-bit, so i16/u16 are the c_int width and are not promoted
+// further (unlike on targets with a 32-bit `int`).
+#[cfg(any(target_arch = "z80", target_arch = "sm83"))]
+unsafe impl VaArgSafe for i16 {}
+#[cfg(any(target_arch = "z80", target_arch = "sm83"))]
+unsafe impl VaArgSafe for u16 {}
 
 unsafe impl<T> VaArgSafe for *mut T {}
 unsafe impl<T> VaArgSafe for *const T {}
