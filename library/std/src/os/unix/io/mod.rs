@@ -103,7 +103,7 @@ use crate::sys::cvt;
 mod tests;
 
 #[unstable(feature = "stdio_swap", issue = "150667")]
-pub trait StdioExt: crate::sealed::Sealed {
+pub impl(self) trait StdioExt {
     /// Redirects the stdio file descriptor to point to the file description underpinning `fd`.
     ///
     /// Rust std::io write buffers (if any) are flushed, but other runtimes
@@ -214,7 +214,7 @@ fn replace_stdio_fd(this: BorrowedFd<'_>, other: OwnedFd) -> io::Result<()> {
             cvt(unsafe { libc::__wasilibc_fd_renumber(other.as_raw_fd(), this.as_raw_fd()) }).map(|_| ())
         }
         not(any(
-            target_arch = "wasm32",
+            all(target_arch = "wasm32", not(target_os = "emscripten")),
             target_os = "hermit",
             target_os = "trusty",
             target_os = "motor"

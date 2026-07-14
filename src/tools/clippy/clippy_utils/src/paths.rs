@@ -133,6 +133,8 @@ path_macros! {
     macro_path: PathNS::Macro,
 }
 
+// Paths in the standard library missing a diagnostic item
+
 // Paths in external crates
 pub static FUTURES_IO_ASYNCREADEXT: PathLookup = type_path!(futures_util::AsyncReadExt);
 pub static FUTURES_IO_ASYNCWRITEEXT: PathLookup = type_path!(futures_util::AsyncWriteExt);
@@ -330,7 +332,7 @@ fn local_item_child_by_name(tcx: TyCtxt<'_>, local_id: LocalDefId, ns: PathNS, n
                 None
             }
         }),
-        ItemKind::Impl(..) | ItemKind::Trait(..) => tcx
+        ItemKind::Impl(..) | ItemKind::Trait { .. } => tcx
             .associated_items(local_id)
             .filter_by_name_unhygienic(name)
             .find(|assoc_item| ns.matches(Some(assoc_item.namespace())))

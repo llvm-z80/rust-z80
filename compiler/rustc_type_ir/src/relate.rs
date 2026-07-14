@@ -154,20 +154,24 @@ impl<I: Interner> Relate<I> for ty::FnSig<I> {
     ) -> RelateResult<I, ty::FnSig<I>> {
         let cx = relation.cx();
 
-        if a.c_variadic != b.c_variadic {
+        if a.c_variadic() != b.c_variadic() {
             return Err(TypeError::VariadicMismatch(ExpectedFound::new(
-                a.c_variadic,
-                b.c_variadic,
+                a.c_variadic(),
+                b.c_variadic(),
             )));
         }
 
-        if a.safety != b.safety {
-            return Err(TypeError::SafetyMismatch(ExpectedFound::new(a.safety, b.safety)));
+        if a.safety() != b.safety() {
+            return Err(TypeError::SafetyMismatch(ExpectedFound::new(a.safety(), b.safety())));
         }
 
-        if a.abi != b.abi {
-            return Err(TypeError::AbiMismatch(ExpectedFound::new(a.abi, b.abi)));
+        if a.abi() != b.abi() {
+            return Err(TypeError::AbiMismatch(ExpectedFound::new(a.abi(), b.abi())));
         };
+
+        if a.splatted() != b.splatted() {
+            return Err(TypeError::SplatMismatch(ExpectedFound::new(a.splatted(), b.splatted())));
+        }
 
         let a_inputs = a.inputs();
         let b_inputs = b.inputs();
@@ -202,9 +206,7 @@ impl<I: Interner> Relate<I> for ty::FnSig<I> {
             });
         Ok(ty::FnSig {
             inputs_and_output: cx.mk_type_list_from_iter(inputs_and_output)?,
-            c_variadic: a.c_variadic,
-            safety: a.safety,
-            abi: a.abi,
+            fn_sig_kind: a.fn_sig_kind,
         })
     }
 }
@@ -215,16 +217,39 @@ impl<I: Interner> Relate<I> for ty::AliasTy<I> {
         a: ty::AliasTy<I>,
         b: ty::AliasTy<I>,
     ) -> RelateResult<I, ty::AliasTy<I>> {
-        if a.def_id != b.def_id {
-            Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.def_id, b.def_id)))
+        if a.kind != b.kind {
+            Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.kind.into(), b.kind.into())))
         } else {
             let cx = relation.cx();
-            let args = if let Some(variances) = cx.opt_alias_variances(a.kind(cx), a.def_id) {
+            let args = if let Some(variances) = cx.opt_alias_variances(a.kind) {
                 relate_args_with_variances(relation, variances, a.args, b.args)?
             } else {
                 relate_args_invariantly(relation, a.args, b.args)?
             };
-            Ok(ty::AliasTy::new_from_args(relation.cx(), a.def_id, args))
+            Ok(ty::AliasTy::new_from_args(relation.cx(), a.kind, args))
+        }
+    }
+}
+
+impl<I: Interner> Relate<I> for ty::AliasConst<I> {
+    fn relate<R: TypeRelation<I>>(
+        relation: &mut R,
+        a: ty::AliasConst<I>,
+        b: ty::AliasConst<I>,
+    ) -> RelateResult<I, ty::AliasConst<I>> {
+        let cx = relation.cx();
+        if a.kind != b.kind {
+            Err(TypeError::ConstMismatch(ExpectedFound::new(
+                Const::new_alias(cx, ty::IsRigid::yes_if_next_solver(cx), a),
+                Const::new_alias(cx, ty::IsRigid::yes_if_next_solver(cx), b),
+            )))
+        } else {
+            // FIXME(mgca): remove this
+            debug_assert_eq!(a.type_of(cx).skip_norm_wip(), b.type_of(cx).skip_norm_wip());
+
+            let args = relate_args_invariantly(relation, a.args, b.args)?;
+
+            Ok(ty::AliasConst::new(cx, a.kind, args))
         }
     }
 }
@@ -235,27 +260,27 @@ impl<I: Interner> Relate<I> for ty::AliasTerm<I> {
         a: ty::AliasTerm<I>,
         b: ty::AliasTerm<I>,
     ) -> RelateResult<I, ty::AliasTerm<I>> {
-        if a.def_id != b.def_id {
-            Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.def_id, b.def_id)))
+        if a.kind != b.kind {
+            Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.kind, b.kind)))
         } else {
-            let args = match a.kind(relation.cx()) {
-                ty::AliasTermKind::OpaqueTy => relate_args_with_variances(
+            let args = match a.kind {
+                ty::AliasTermKind::OpaqueTy { def_id } => relate_args_with_variances(
                     relation,
-                    relation.cx().variances_of(a.def_id),
+                    relation.cx().variances_of(def_id.into()),
                     a.args,
                     b.args,
                 )?,
-                ty::AliasTermKind::ProjectionTy
-                | ty::AliasTermKind::FreeConst
-                | ty::AliasTermKind::FreeTy
-                | ty::AliasTermKind::InherentTy
-                | ty::AliasTermKind::InherentConst
-                | ty::AliasTermKind::UnevaluatedConst
-                | ty::AliasTermKind::ProjectionConst => {
+                ty::AliasTermKind::ProjectionTy { .. }
+                | ty::AliasTermKind::FreeConst { .. }
+                | ty::AliasTermKind::FreeTy { .. }
+                | ty::AliasTermKind::InherentTy { .. }
+                | ty::AliasTermKind::InherentConst { .. }
+                | ty::AliasTermKind::AnonConst { .. }
+                | ty::AliasTermKind::ProjectionConst { .. } => {
                     relate_args_invariantly(relation, a.args, b.args)?
                 }
             };
-            Ok(ty::AliasTerm::new_from_args(relation.cx(), a.def_id, args))
+            Ok(a.with_args(relation.cx(), args))
         }
     }
 }
@@ -267,7 +292,10 @@ impl<I: Interner> Relate<I> for ty::ExistentialProjection<I> {
         b: ty::ExistentialProjection<I>,
     ) -> RelateResult<I, ty::ExistentialProjection<I>> {
         if a.def_id != b.def_id {
-            Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.def_id, b.def_id)))
+            Err(TypeError::ProjectionMismatched(ExpectedFound::new(
+                relation.cx().alias_term_kind_from_def_id(a.def_id.into()),
+                relation.cx().alias_term_kind_from_def_id(b.def_id.into()),
+            )))
         } else {
             let term = relation.relate_with_variance(
                 ty::Invariant,
@@ -484,11 +512,14 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
         }
 
         (ty::FnDef(a_def_id, a_args), ty::FnDef(b_def_id, b_args)) if a_def_id == b_def_id => {
-            if a_args.is_empty() {
+            if a_args.skip_binder().is_empty() {
                 Ok(a)
             } else {
+                let a_args = a_args.no_bound_vars().unwrap();
+                let b_args = b_args.no_bound_vars().unwrap();
                 relation.relate_ty_args(a, b, a_def_id.into(), a_args, b_args, |args| {
-                    Ty::new_fn_def(cx, a_def_id, args)
+                    // FIXME(156581): actually instantiate the binder correctly (turbofishing/fndef changes)
+                    Ty::new_fn_def(cx, a_def_id, ty::Binder::dummy(args))
                 })
             }
         }
@@ -499,10 +530,12 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
         }
 
         // Alias tend to mostly already be handled downstream due to normalization.
-        (ty::Alias(a_kind, a_data), ty::Alias(b_kind, b_data)) => {
-            let alias_ty = relation.relate(a_data, b_data)?;
-            assert_eq!(a_kind, b_kind);
-            Ok(Ty::new_alias(cx, a_kind, alias_ty))
+        (ty::Alias(is_rigid_a, alias_a), ty::Alias(is_rigid_b, alias_b)) => {
+            // Users shouldn't know about this so the mismatch should be caught
+            // during development rather than presented as type error.
+            debug_assert_eq!(is_rigid_a, is_rigid_b, "{a:?} != {b:?}");
+            let alias_ty = relation.relate(alias_a, alias_b)?;
+            Ok(Ty::new_alias(cx, is_rigid_a, alias_ty))
         }
 
         (ty::Pat(a_ty, a_pat), ty::Pat(b_ty, b_pat)) => {
@@ -520,7 +553,7 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
 }
 
 /// Relates `a` and `b` structurally, calling the relation for all nested values.
-/// Any semantic equality, e.g. of unevaluated consts, and inference variables have
+/// Any semantic equality, e.g. of alias consts, and inference variables have
 /// to be handled by the caller.
 ///
 /// FIXME: This is not totally structural, which probably should be fixed.
@@ -588,21 +621,11 @@ pub fn structurally_relate_consts<I: Interner, R: TypeRelation<I>>(
         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
         // and is the better alternative to waiting until `generic_const_exprs` can
         // be stabilized.
-        (ty::ConstKind::Unevaluated(au), ty::ConstKind::Unevaluated(bu)) if au.def == bu.def => {
-            // FIXME(mgca): remove this
-            if cfg!(debug_assertions) {
-                let a_ty = cx.type_of(au.def.into()).instantiate(cx, au.args);
-                let b_ty = cx.type_of(bu.def.into()).instantiate(cx, bu.args);
-                assert_eq!(a_ty, b_ty);
-            }
-
-            let args = relation.relate_with_variance(
-                ty::Invariant,
-                VarianceDiagInfo::default(),
-                au.args,
-                bu.args,
-            )?;
-            return Ok(Const::new_unevaluated(cx, ty::UnevaluatedConst { def: au.def, args }));
+        (ty::ConstKind::Alias(is_rigid_a, au), ty::ConstKind::Alias(is_rigid_b, bu)) => {
+            // Users shouldn't know about this so the mismatch should be caught
+            // during development rather than presented as type error.
+            debug_assert_eq!(is_rigid_a, is_rigid_b, "{a:?} != {b:?}");
+            return Ok(Const::new_alias(cx, is_rigid_a, relation.relate(au, bu)?));
         }
         (ty::ConstKind::Expr(ae), ty::ConstKind::Expr(be)) => {
             let expr = relation.relate(ae, be)?;

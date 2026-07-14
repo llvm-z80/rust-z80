@@ -197,7 +197,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for tuple patterns with a wildcard
+    /// Checks for tuple and struct patterns with a wildcard
     /// pattern (`_`) is next to a rest pattern (`..`).
     ///
     /// _NOTE_: While `_, ..` means there is at least one element left, `..`
@@ -231,7 +231,7 @@ declare_clippy_lint! {
     #[clippy::version = "1.40.0"]
     pub UNNEEDED_WILDCARD_PATTERN,
     complexity,
-    "tuple patterns with a wildcard pattern (`_`) is next to a rest pattern (`..`)"
+    "tuple and struct patterns with a wildcard pattern (`_`) is next to a rest pattern (`..`)"
 }
 
 declare_clippy_lint! {
@@ -333,11 +333,15 @@ impl EarlyLintPass for MiscEarlyLints {
     }
 
     fn check_expr(&mut self, cx: &EarlyContext<'_>, expr: &Expr) {
-        if expr.span.in_external_macro(cx.sess().source_map()) {
-            return;
-        }
-
-        if let ExprKind::Lit(lit) = expr.kind {
+        // `check_lit` only lints integer literals and suffixed float literals.
+        if let ExprKind::Lit(lit) = expr.kind
+            && match lit.kind {
+                token::LitKind::Integer => true,
+                token::LitKind::Float => lit.suffix.is_some(),
+                _ => false,
+            }
+            && !expr.span.in_external_macro(cx.sess().source_map())
+        {
             MiscEarlyLints::check_lit(cx, lit, expr.span);
         }
     }

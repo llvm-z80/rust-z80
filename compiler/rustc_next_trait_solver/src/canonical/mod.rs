@@ -17,15 +17,16 @@ use rustc_type_ir::inherent::*;
 use rustc_type_ir::relate::solver_relating::RelateExt;
 use rustc_type_ir::{
     self as ty, Canonical, CanonicalVarKind, CanonicalVarValues, InferCtxtLike, Interner,
-    TypeFoldable,
+    TypeFoldable, TypingMode, TypingModeEqWrapper,
 };
 use tracing::instrument;
 
 use crate::delegate::SolverDelegate;
 use crate::resolve::eager_resolve_vars;
 use crate::solve::{
-    CanonicalInput, CanonicalResponse, Certainty, ExternalConstraintsData, Goal,
-    NestedNormalizationGoals, QueryInput, Response, inspect,
+    CanonicalInput, CanonicalResponse, Certainty, ExternalConstraintsData,
+    ExternalRegionConstraints, Goal, NestedNormalizationGoals, QueryInput, Response,
+    VisibleForLeakCheck, inspect,
 };
 
 pub mod canonicalizer;
@@ -54,6 +55,7 @@ pub(super) fn canonicalize_goal<D, I>(
     delegate: &D,
     goal: Goal<I, I::Predicate>,
     opaque_types: &[(ty::OpaqueTypeKey<I>, I::Ty)],
+    typing_mode: TypingMode<I>,
 ) -> (Vec<I::GenericArg>, CanonicalInput<I, I::Predicate>)
 where
     D: SolverDelegate<Interner = I>,
@@ -66,7 +68,9 @@ where
             predefined_opaques_in_body: delegate.cx().mk_predefined_opaques_in_body(opaque_types),
         },
     );
-    let query_input = ty::CanonicalQueryInput { canonical, typing_mode: delegate.typing_mode() };
+
+    let query_input =
+        ty::CanonicalQueryInput { canonical, typing_mode: TypingModeEqWrapper(typing_mode) };
     (orig_values, query_input)
 }
 
@@ -113,7 +117,24 @@ where
     let ExternalConstraintsData { region_constraints, opaque_types, normalization_nested_goals } =
         &*external_constraints;
 
-    register_region_constraints(delegate, region_constraints, span);
+    match region_constraints {
+        ExternalRegionConstraints::Old(r) => register_region_constraints(
+            delegate,
+            r.iter().map(|(c, vis)| {
+                // FIXME: We should revisit and consider removing this after *assumptions on
+                // binders* is available, like once we had done in the stabilization of
+                // `-Znext-solver=coherence`(#121848).
+                // We ignore constraints from the nested goals in leak check. This is to match with
+                // the old solver's behavior, which has separated evaluation and fulfillment, and
+                // the former doesn't consider outlives obligations from the later.
+                (*c, vis.and(VisibleForLeakCheck::No))
+            }),
+            span,
+        ),
+        ExternalRegionConstraints::NextGen(r) => {
+            delegate.register_solver_region_constraint(r.clone())
+        }
+    };
     register_new_opaque_types(delegate, opaque_types, span);
 
     (normalization_nested_goals.clone(), certainty)
@@ -208,6 +229,18 @@ where
         } else {
             // For placeholders which were already part of the input, we simply map this
             // universal bound variable back the placeholder of the input.
+            //
+            // For `CanonicalVarKind::PlaceholderRegion`, this differs slightly: we
+            // canonicalize all free regions from the input into placeholders. This is
+            // unlike types or consts, where only input placeholders remain placeholders
+            // in the canonical form.
+            //
+            // We can still map these back to the original input regions, as we
+            // just instantiate the canonical variable with its corresponding
+            // `original_value`.
+            //
+            // For more information on why we canonicalize all input regions as
+            // placeholders, see the comment in `Canonicalizer::fold_region`.
             original_values[kind.expect_placeholder_index()]
         }
     })
@@ -247,17 +280,22 @@ fn unify_query_var_values<D, I>(
 
 fn register_region_constraints<D, I>(
     delegate: &D,
-    outlives: &[ty::OutlivesPredicate<I, I::GenericArg>],
+    constraints: impl IntoIterator<Item = (ty::RegionConstraint<I>, VisibleForLeakCheck)>,
     span: I::Span,
 ) where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
-    for &ty::OutlivesPredicate(lhs, rhs) in outlives {
-        match lhs.kind() {
-            ty::GenericArgKind::Lifetime(lhs) => delegate.sub_regions(rhs, lhs, span),
-            ty::GenericArgKind::Type(lhs) => delegate.register_ty_outlives(lhs, rhs, span),
-            ty::GenericArgKind::Const(_) => panic!("const outlives: {lhs:?}: {rhs:?}"),
+    for (constraint, vis) in constraints {
+        match constraint {
+            ty::RegionConstraint::Outlives(ty::OutlivesPredicate(lhs, rhs)) => match lhs.kind() {
+                ty::GenericArgKind::Lifetime(lhs) => delegate.sub_regions(rhs, lhs, vis, span),
+                ty::GenericArgKind::Type(lhs) => delegate.register_ty_outlives(lhs, rhs, span),
+                ty::GenericArgKind::Const(_) => panic!("const outlives: {lhs:?}: {rhs:?}"),
+            },
+            ty::RegionConstraint::Eq(ty::RegionEqPredicate(lhs, rhs)) => {
+                delegate.equate_regions(lhs, rhs, vis, span)
+            }
         }
     }
 }
@@ -302,7 +340,7 @@ where
 {
     let var_values = CanonicalVarValues { var_values: delegate.cx().mk_args(var_values) };
     let state = inspect::State { var_values, data };
-    let state = eager_resolve_vars(delegate, state);
+    let state = eager_resolve_vars(&**delegate, state);
     Canonicalizer::canonicalize_response(delegate, max_input_universe, state)
 }
 
@@ -350,7 +388,7 @@ pub fn response_no_constraints_raw<I: Interner>(
             var_values: ty::CanonicalVarValues::make_identity(cx, var_kinds),
             // FIXME: maybe we should store the "no response" version in cx, like
             // we do for cx.types and stuff.
-            external_constraints: cx.mk_external_constraints(ExternalConstraintsData::default()),
+            external_constraints: cx.mk_external_constraints(ExternalConstraintsData::new(cx)),
             certainty,
         },
     }

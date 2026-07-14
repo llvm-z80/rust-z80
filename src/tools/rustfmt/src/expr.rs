@@ -125,6 +125,16 @@ pub(crate) fn format_expr(
             let callee_str = callee.rewrite_result(context, shape)?;
             rewrite_call(context, &callee_str, args, inner_span, shape)
         }
+        ast::ExprKind::Move(ref subexpr, move_kw_span) => {
+            let inner_span = mk_sp(move_kw_span.hi(), expr.span.hi());
+            rewrite_call(
+                context,
+                "move",
+                std::slice::from_ref(subexpr),
+                inner_span,
+                shape,
+            )
+        }
         ast::ExprKind::Paren(ref subexpr) => rewrite_paren(context, subexpr, shape, expr.span),
         ast::ExprKind::Binary(op, ref lhs, ref rhs) => {
             // FIXME: format comments between operands and operator
@@ -476,7 +486,8 @@ pub(crate) fn format_expr(
         | ast::ExprKind::Type(..)
         | ast::ExprKind::IncludedBytes(..)
         | ast::ExprKind::OffsetOf(..)
-        | ast::ExprKind::UnsafeBinderCast(..) => {
+        | ast::ExprKind::UnsafeBinderCast(..)
+        | ast::ExprKind::DirectConstArg(..) => {
             // These don't normally occur in the AST because macros aren't expanded. However,
             // rustfmt tries to parse macro arguments when formatting macros, so it's not totally
             // impossible for rustfmt to come across one of these nodes when formatting a file.

@@ -1,6 +1,6 @@
 //! Post-nameres attribute resolution.
 
-use base_db::Crate;
+use base_db::{Crate, SourceDatabase};
 use hir_expand::{
     AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},
@@ -9,11 +9,9 @@ use hir_expand::{
 };
 use span::SyntaxContext;
 use syntax::ast;
-use triomphe::Arc;
 
 use crate::{
     AstIdWithPath, MacroId, ModuleId, UnresolvedMacro,
-    db::DefDatabase,
     item_scope::BuiltinShadowMode,
     nameres::{LocalDefMap, path_resolution::ResolveMode},
 };
@@ -32,7 +30,7 @@ impl DefMap {
     pub(crate) fn resolve_attr_macro(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
         original_module: ModuleId,
         ast_id: AstIdWithPath<ast::Item>,
         attr: &Attr,
@@ -74,7 +72,7 @@ impl DefMap {
             // replace their input, and derive macros are not allowed in this function.
             AttrMacroAttrIds::from_one(attr_id),
             self.krate,
-            db.macro_def(def),
+            def.definition(db),
         )))
     }
 
@@ -104,7 +102,7 @@ impl DefMap {
 }
 
 pub(super) fn attr_macro_as_call_id(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     item_attr: &AstIdWithPath<ast::Item>,
     macro_attr: &Attr,
     censored_attr_ids: AttrMacroAttrIds,
@@ -126,7 +124,7 @@ pub(super) fn attr_macro_as_call_id(
         krate,
         MacroCallKind::Attr {
             ast_id: item_attr.ast_id,
-            attr_args: arg.map(Arc::new),
+            attr_args: arg.map(Box::new),
             censored_attr_ids,
         },
         macro_attr.ctxt,
@@ -134,7 +132,7 @@ pub(super) fn attr_macro_as_call_id(
 }
 
 pub(super) fn derive_macro_as_call_id(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     item_attr: &AstIdWithPath<ast::Adt>,
     derive_attr_index: AttrId,
     derive_pos: u32,

@@ -5,19 +5,18 @@
 
 use std::path::PathBuf;
 
-use build_helper::exit;
 use build_helper::git::get_git_untracked_files;
 use clap_complete::{Generator, shells};
 
 use crate::core::build_steps::dist::distdir;
 use crate::core::build_steps::test;
 use crate::core::build_steps::tool::{self, RustcPrivateCompilers, SourceType, Tool};
-use crate::core::build_steps::vendor::{Vendor, default_paths_to_vendor};
+use crate::core::build_steps::vendor::{VENDOR_DIR, Vendor, default_paths_to_vendor};
 use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetadata};
 use crate::core::config::TargetSelection;
 use crate::core::config::flags::{get_completion, top_level_help};
 use crate::utils::exec::command;
-use crate::{Mode, t};
+use crate::{Mode, exit, t};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BuildManifest;
@@ -180,6 +179,10 @@ impl Step for Miri {
         // Forward arguments. This may contain further arguments to the program
         // after another --, so this must be at the end.
         miri.args(builder.config.args());
+        // Add default edition for Miri tests (2021); defaulting to 2015 is often confusing.
+        if !builder.config.args().iter().any(|arg| arg.starts_with("--edition")) {
+            miri.arg("--edition=2021");
+        }
 
         miri.into_cmd().run(builder);
     }
@@ -271,9 +274,10 @@ impl Step for GenerateCopyright {
                 sync_args: Vec::new(),
                 versioned_dirs: true,
                 root_dir: builder.src.clone(),
-                output_dir: cache_dir.clone(),
+                output_dir: Some(cache_dir.clone()),
+                only_library_workspace: false,
             });
-            cache_dir
+            cache_dir.join(VENDOR_DIR)
         };
 
         let _guard = builder.group("generate-copyright");
@@ -505,7 +509,7 @@ impl Step for Rustfmt {
         let compilers = RustcPrivateCompilers::new(builder, stage, host);
         let rustfmt_build = builder.ensure(tool::Rustfmt::from_compilers(compilers));
 
-        let mut rustfmt = tool::prepare_tool_cargo(
+        let mut cargo = tool::prepare_tool_cargo(
             builder,
             rustfmt_build.build_compiler,
             Mode::ToolRustcPrivate,
@@ -516,10 +520,10 @@ impl Step for Rustfmt {
             &[],
         );
 
-        rustfmt.args(["--bin", "rustfmt", "--"]);
-        rustfmt.args(builder.config.args());
+        cargo.args(["--bin", "rustfmt", "--"]);
+        cargo.args(builder.config.args());
 
-        rustfmt.into_cmd().run(builder);
+        cargo.into_cmd().run(builder);
     }
 }
 

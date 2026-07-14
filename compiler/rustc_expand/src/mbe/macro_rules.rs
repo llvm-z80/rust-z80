@@ -14,6 +14,7 @@ use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan};
 use rustc_feature::Features;
 use rustc_hir as hir;
+use rustc_hir::attrs::diagnostic::Directive;
 use rustc_hir::def::MacroKinds;
 use rustc_hir::find_attr;
 use rustc_lint_defs::builtin::{
@@ -22,23 +23,24 @@ use rustc_lint_defs::builtin::{
 use rustc_parse::exp;
 use rustc_parse::parser::{Parser, Recovery};
 use rustc_session::Session;
-use rustc_session::parse::{ParseSess, feature_err};
+use rustc_session::errors::feature_err;
+use rustc_session::parse::ParseSess;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::Transparency;
 use rustc_span::{Ident, Span, Symbol, kw, sym};
 use tracing::{debug, instrument, trace, trace_span};
 
+use super::SequenceRepetition;
 use super::diagnostics::{FailedMacro, failed_to_match_macro};
 use super::macro_parser::{NamedMatches, NamedParseResult};
-use super::{SequenceRepetition, diagnostics};
 use crate::base::{
     AttrProcMacro, BangProcMacro, DummyResult, ExpandResult, ExtCtxt, MacResult,
     MacroExpanderResult, SyntaxExtension, SyntaxExtensionKind, TTMacroExpander,
 };
-use crate::errors;
+use crate::diagnostics;
 use crate::expand::{AstFragment, AstFragmentKind, ensure_complete_parse, parse_ast_fragment};
 use crate::mbe::macro_check::check_meta_variables;
-use crate::mbe::macro_parser::{Error, ErrorReported, Failure, MatcherLoc, Success, TtParser};
+use crate::mbe::macro_parser::{Ambiguity, ErrorReported, Failure, MatcherLoc, Success, TtParser};
 use crate::mbe::quoted::{RulePart, parse_one_tt};
 use crate::mbe::transcribe::transcribe;
 use crate::mbe::{self, KleeneOp};
@@ -79,7 +81,7 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
         let fragment = match parse_ast_fragment(parser, kind) {
             Ok(f) => f,
             Err(err) => {
-                let guar = diagnostics::emit_frag_parse_err(
+                let guar = super::diagnostics::emit_frag_parse_err(
                     err,
                     parser,
                     snapshot,
@@ -102,7 +104,7 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
                     SEMICOLON_IN_EXPRESSIONS_FROM_MACROS,
                     parser.token.span,
                     lint_node_id,
-                    errors::TrailingMacro { is_trailing: is_trailing_mac, name: macro_ident },
+                    diagnostics::TrailingMacro { is_trailing: is_trailing_mac, name: macro_ident },
                 );
             }
             parser.bump();
@@ -160,13 +162,41 @@ pub(crate) enum MacroRule {
     Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: mbe::TokenTree },
 }
 
+/// A selection of a matcher in a [`MacroRule`].
+///
+/// [`MacroRule::Attr`] has two different matchers (args and body). This enum allows distinguishing
+/// between them, even when used for other kinds of rules.
+///
+/// This type implements [`Ord`]. The arms within a rule come in a fixed order and this type is
+/// consistent with that ordering.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WhichMatcher {
+    /// The arguments of an attr macro ([`MacroRule::Attr::args`]).
+    Args,
+
+    /// The body of an attr macro ([`MacroRule::Attr::body`]), **or** the only arm of the rule.
+    ///
+    /// This is also used to express the only arm in a [`MacroRule::Func`] or [`MacroRule::Derive`].
+    Body,
+}
+
+impl WhichMatcher {
+    /// The [`WhichMatcher`] for [`MacroRule::Func`].
+    pub(crate) const FOR_FUNC: Self = Self::Body;
+
+    /// The [`WhichMatcher`] for [`MacroRule::Derive`].
+    pub(crate) const FOR_DERIVE: Self = Self::Body;
+}
+
 pub struct MacroRulesMacroExpander {
     node_id: NodeId,
     name: Ident,
     span: Span,
+    on_unmatched_args: Option<Directive>,
     transparency: Transparency,
     kinds: MacroKinds,
     rules: Vec<MacroRule>,
+    macro_rules: bool,
 }
 
 impl MacroRulesMacroExpander {
@@ -186,6 +216,14 @@ impl MacroRulesMacroExpander {
         self.kinds
     }
 
+    pub fn nrules(&self) -> usize {
+        self.rules.len()
+    }
+
+    pub fn is_macro_rules(&self) -> bool {
+        self.macro_rules
+    }
+
     pub fn expand_derive(
         &self,
         cx: &mut ExtCtxt<'_>,
@@ -194,7 +232,8 @@ impl MacroRulesMacroExpander {
     ) -> Result<TokenStream, ErrorGuaranteed> {
         // This is similar to `expand_macro`, but they have very different signatures, and will
         // diverge further once derives support arguments.
-        let Self { name, ref rules, node_id, .. } = *self;
+        let name = self.name;
+        let rules = &self.rules;
         let psess = &cx.sess.psess;
 
         if cx.trace_macros() {
@@ -220,8 +259,8 @@ impl MacroRulesMacroExpander {
                     trace_macros_note(&mut cx.expansions, sp, msg);
                 }
 
-                if is_defined_in_current_crate(node_id) {
-                    cx.resolver.record_macro_rule_usage(node_id, rule_index);
+                if is_defined_in_current_crate(self.node_id) {
+                    cx.resolver.record_macro_rule_usage(self.node_id, rule_index);
                 }
 
                 Ok(tts)
@@ -236,6 +275,7 @@ impl MacroRulesMacroExpander {
                     FailedMacro::Derive,
                     body,
                     rules,
+                    self.on_unmatched_args.as_ref(),
                 );
                 cx.macro_error_and_trace_macros_diag();
                 Err(guar)
@@ -260,6 +300,7 @@ impl TTMacroExpander for MacroRulesMacroExpander {
             self.transparency,
             input,
             &self.rules,
+            self.on_unmatched_args.as_ref(),
         ))
     }
 }
@@ -294,6 +335,7 @@ impl AttrProcMacro for MacroRulesMacroExpander {
             args,
             body,
             &self.rules,
+            self.on_unmatched_args.as_ref(),
         )
     }
 }
@@ -317,27 +359,39 @@ fn trace_macros_note(cx_expansions: &mut FxIndexMap<Span, Vec<String>>, sp: Span
 }
 
 pub(super) trait Tracker<'matcher> {
-    /// The contents of `ParseResult::Failure`.
-    type Failure;
-
-    /// Arm failed to match. If the token is `token::Eof`, it indicates an unexpected
-    /// end of macro invocation. Otherwise, it indicates that no rules expected the given token.
-    /// The usize is the approximate position of the token in the input token stream.
-    fn build_failure(tok: Token, position: u32, msg: &'static str) -> Self::Failure;
+    /// Provide context on the arm that's about to be matched.
+    fn prepare(&mut self, which_matcher: WhichMatcher);
 
     /// This is called before trying to match next MatcherLoc on the current token.
-    fn before_match_loc(&mut self, _parser: &TtParser, _matcher: &'matcher MatcherLoc) {}
+    fn before_match_loc(&mut self, parser: &TtParser, matcher: &'matcher MatcherLoc);
 
     /// This is called after an arm has been parsed, either successfully or unsuccessfully. When
     /// this is called, `before_match_loc` was called at least once (with a `MatcherLoc::Eof`).
-    fn after_arm(&mut self, _in_body: bool, _result: &NamedParseResult<Self::Failure>) {}
+    fn after_arm(&mut self, result: &NamedParseResult);
+
+    /// The arm could not be matched successfully.
+    ///
+    /// If the parser is located at [`token::Eof`], it indicates an unexpected end of macro
+    /// invocation. Otherwise, the parser is located at a token in the middle of the input, and it
+    /// indicates that no rules in the arm expected the given token.
+    ///
+    /// The parser will return [`NamedParseResult::Failure`] after calling this.
+    fn failure(&mut self, parser: &Parser<'_>);
+
+    /// An ambiguity error occurred.
+    ///
+    /// The parser will return [`NamedParseResult::Ambiguity`] after calling this.
+    fn ambiguity(
+        &mut self,
+        parser: &Parser<'_>,
+        bb_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
+        next_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
+    );
 
     /// For tracing.
     fn description() -> &'static str;
 
-    fn recovery() -> Recovery {
-        Recovery::Forbidden
-    }
+    fn recovery() -> Recovery;
 }
 
 /// A noop tracker that is used in the hot path of the expansion, has zero overhead thanks to
@@ -345,17 +399,33 @@ pub(super) trait Tracker<'matcher> {
 pub(super) struct NoopTracker;
 
 impl<'matcher> Tracker<'matcher> for NoopTracker {
-    type Failure = ();
+    fn prepare(&mut self, _which_matcher: WhichMatcher) {}
 
-    fn build_failure(_tok: Token, _position: u32, _msg: &'static str) -> Self::Failure {}
+    fn before_match_loc(&mut self, _parser: &TtParser, _matcher: &'matcher MatcherLoc) {}
+
+    fn ambiguity(
+        &mut self,
+        _parser: &Parser<'_>,
+        _bb_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
+        _next_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
+    ) {
+    }
+
+    fn after_arm(&mut self, _result: &NamedParseResult) {}
+
+    fn failure(&mut self, _parser: &Parser<'_>) {}
 
     fn description() -> &'static str {
         "none"
     }
+
+    fn recovery() -> Recovery {
+        Recovery::Forbidden
+    }
 }
 
 /// Expands the rules based macro defined by `rules` for a given input `arg`.
-#[instrument(skip(cx, transparency, arg, rules))]
+#[instrument(skip(cx, transparency, arg, rules, on_unmatched_args))]
 fn expand_macro<'cx, 'a: 'cx>(
     cx: &'cx mut ExtCtxt<'_>,
     sp: Span,
@@ -365,6 +435,7 @@ fn expand_macro<'cx, 'a: 'cx>(
     transparency: Transparency,
     arg: TokenStream,
     rules: &'a [MacroRule],
+    on_unmatched_args: Option<&Directive>,
 ) -> Box<dyn MacResult + 'cx> {
     let psess = &cx.sess.psess;
 
@@ -423,6 +494,7 @@ fn expand_macro<'cx, 'a: 'cx>(
                 FailedMacro::Func,
                 &arg,
                 rules,
+                on_unmatched_args,
             );
             cx.macro_error_and_trace_macros_diag();
             DummyResult::any(span, guar)
@@ -431,7 +503,7 @@ fn expand_macro<'cx, 'a: 'cx>(
 }
 
 /// Expands the rules based macro defined by `rules` for a given attribute `args` and `body`.
-#[instrument(skip(cx, transparency, args, body, rules))]
+#[instrument(skip(cx, transparency, args, body, rules, on_unmatched_args))]
 fn expand_macro_attr(
     cx: &mut ExtCtxt<'_>,
     sp: Span,
@@ -443,6 +515,7 @@ fn expand_macro_attr(
     args: TokenStream,
     body: TokenStream,
     rules: &[MacroRule],
+    on_unmatched_args: Option<&Directive>,
 ) -> Result<TokenStream, ErrorGuaranteed> {
     let psess = &cx.sess.psess;
     // Macros defined in the current crate have a real node id,
@@ -507,6 +580,7 @@ fn expand_macro_attr(
                 FailedMacro::Attr(&args),
                 &body,
                 rules,
+                on_unmatched_args,
             );
             cx.trace_macros_diag();
             Err(guar)
@@ -552,7 +626,7 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     // this situation.)
     let parser = parser_from_cx(psess, arg.clone(), T::recovery());
     // Try each arm's matchers.
-    let mut tt_parser = TtParser::new(name);
+    let mut tt_parser = TtParser::new();
     for (i, rule) in rules.iter().enumerate() {
         let MacroRule::Func { lhs, .. } = rule else { continue };
         let _tracing_span = trace_span!("Matching arm", %i);
@@ -563,9 +637,9 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
         // are not recorded. On the first `Success(..)`ful matcher, the spans are merged.
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
+        track.prepare(WhichMatcher::FOR_FUNC);
         let result = tt_parser.parse_tt(&mut Cow::Borrowed(&parser), lhs, track);
-
-        track.after_arm(true, &result);
+        track.after_arm(&result);
 
         match result {
             Success(named_matches) => {
@@ -576,11 +650,11 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
 
                 return Ok((i, rule, named_matches));
             }
-            Failure(_) => {
+            Failure => {
                 trace!("Failed to match arm, trying the next one");
                 // Try the next arm.
             }
-            Error(_, _) => {
+            Ambiguity => {
                 debug!("Fatal error occurred during matching");
                 // We haven't emitted an error yet, so we can retry.
                 return Err(CanRetry::Yes);
@@ -615,27 +689,29 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
     // This uses the same strategy as `try_match_macro`
     let args_parser = parser_from_cx(psess, attr_args.clone(), T::recovery());
     let body_parser = parser_from_cx(psess, attr_body.clone(), T::recovery());
-    let mut tt_parser = TtParser::new(name);
+    let mut tt_parser = TtParser::new();
     for (i, rule) in rules.iter().enumerate() {
         let MacroRule::Attr { args, body, .. } = rule else { continue };
 
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
+        track.prepare(WhichMatcher::Args);
         let result = tt_parser.parse_tt(&mut Cow::Borrowed(&args_parser), args, track);
-        track.after_arm(false, &result);
+        track.after_arm(&result);
 
         let mut named_matches = match result {
             Success(named_matches) => named_matches,
-            Failure(_) => {
+            Failure => {
                 mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut());
                 continue;
             }
-            Error(_, _) => return Err(CanRetry::Yes),
+            Ambiguity => return Err(CanRetry::Yes),
             ErrorReported(guar) => return Err(CanRetry::No(guar)),
         };
 
+        track.prepare(WhichMatcher::Body);
         let result = tt_parser.parse_tt(&mut Cow::Borrowed(&body_parser), body, track);
-        track.after_arm(true, &result);
+        track.after_arm(&result);
 
         match result {
             Success(body_named_matches) => {
@@ -644,10 +720,10 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
                 named_matches.extend(body_named_matches);
                 return Ok((i, rule, named_matches));
             }
-            Failure(_) => {
+            Failure => {
                 mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut())
             }
-            Error(_, _) => return Err(CanRetry::Yes),
+            Ambiguity => return Err(CanRetry::Yes),
             ErrorReported(guar) => return Err(CanRetry::No(guar)),
         }
     }
@@ -668,24 +744,25 @@ pub(super) fn try_match_macro_derive<'matcher, T: Tracker<'matcher>>(
 ) -> Result<(usize, &'matcher MacroRule, NamedMatches), CanRetry> {
     // This uses the same strategy as `try_match_macro`
     let body_parser = parser_from_cx(psess, body.clone(), T::recovery());
-    let mut tt_parser = TtParser::new(name);
+    let mut tt_parser = TtParser::new();
     for (i, rule) in rules.iter().enumerate() {
         let MacroRule::Derive { body, .. } = rule else { continue };
 
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
+        track.prepare(WhichMatcher::FOR_DERIVE);
         let result = tt_parser.parse_tt(&mut Cow::Borrowed(&body_parser), body, track);
-        track.after_arm(true, &result);
+        track.after_arm(&result);
 
         match result {
             Success(named_matches) => {
                 psess.gated_spans.merge(gated_spans_snapshot);
                 return Ok((i, rule, named_matches));
             }
-            Failure(_) => {
+            Failure => {
                 mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut())
             }
-            Error(_, _) => return Err(CanRetry::Yes),
+            Ambiguity => return Err(CanRetry::Yes),
             ErrorReported(guar) => return Err(CanRetry::No(guar)),
         }
     }
@@ -703,13 +780,12 @@ pub fn compile_declarative_macro(
     span: Span,
     node_id: NodeId,
     edition: Edition,
-) -> (SyntaxExtension, usize) {
+) -> SyntaxExtension {
     let mk_syn_ext = |kind| {
         let is_local = is_defined_in_current_crate(node_id);
         SyntaxExtension::new(sess, kind, span, Vec::new(), edition, ident.name, attrs, is_local)
     };
-    let dummy_syn_ext =
-        |guar| (mk_syn_ext(SyntaxExtensionKind::Bang(Arc::new(DummyBang(guar)))), 0);
+    let dummy_syn_ext = |guar| mk_syn_ext(SyntaxExtensionKind::Bang(Arc::new(DummyBang(guar))));
 
     let macro_rules = macro_def.macro_rules;
     let exp_sep = if macro_rules { exp!(Semi) } else { exp!(Comma) };
@@ -846,11 +922,24 @@ pub fn compile_declarative_macro(
         return dummy_syn_ext(guar);
     }
 
-    // Return the number of rules for unused rule linting, if this is a local macro.
-    let nrules = if is_defined_in_current_crate(node_id) { rules.len() } else { 0 };
+    let on_unmatched_args = find_attr!(
+        attrs,
+        OnUnmatchedArgs { directive, .. } => directive.clone()
+    )
+    .flatten()
+    .map(|directive| *directive);
 
-    let exp = MacroRulesMacroExpander { name: ident, kinds, span, node_id, transparency, rules };
-    (mk_syn_ext(SyntaxExtensionKind::MacroRules(Arc::new(exp))), nrules)
+    let exp = MacroRulesMacroExpander {
+        name: ident,
+        kinds,
+        span,
+        node_id,
+        on_unmatched_args,
+        transparency,
+        rules,
+        macro_rules,
+    };
+    mk_syn_ext(SyntaxExtensionKind::MacroRules(Arc::new(exp)))
 }
 
 fn check_no_eof(sess: &Session, p: &Parser<'_>, msg: &'static str) -> Option<ErrorGuaranteed> {
@@ -871,9 +960,9 @@ fn check_args_parens(sess: &Session, rule_kw: Symbol, args: &tokenstream::TokenT
     if let tokenstream::TokenTree::Delimited(dspan, _, delim, _) = args
         && *delim != Delimiter::Parenthesis
     {
-        sess.dcx().emit_err(errors::MacroArgsBadDelim {
+        sess.dcx().emit_err(diagnostics::MacroArgsBadDelim {
             span: dspan.entire(),
-            sugg: errors::MacroArgsBadDelimSugg { open: dspan.open, close: dspan.close },
+            sugg: diagnostics::MacroArgsBadDelimSugg { open: dspan.open, close: dspan.close },
             rule_kw,
         });
     }
@@ -1507,7 +1596,7 @@ fn check_matcher_core<'tt>(
                             RUST_2021_INCOMPATIBLE_OR_PATTERNS,
                             span,
                             ast::CRATE_NODE_ID,
-                            errors::OrPatternsBackCompat { span, suggestion },
+                            diagnostics::OrPatternsBackCompat { span, suggestion },
                         );
                     }
                     match is_in_follow(next_token, kind) {

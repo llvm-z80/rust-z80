@@ -7,7 +7,6 @@ use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AstIdLoc, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId,
     Lookup, MacroId, ModuleDefId, ModuleId, TraitId,
-    db::DefDatabase,
     expr_store::Body,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
     nameres::crate_def_map,
@@ -190,8 +189,8 @@ impl<'a> SymbolCollector<'a> {
                     let enum_name = Symbol::intern(EnumSignature::of(this.db, id).name.as_str());
                     this.with_container_name(Some(enum_name), |this| {
                         let variants = id.enum_variants(this.db);
-                        for (variant_id, variant_name, _) in &variants.variants {
-                            this.push_decl(*variant_id, variant_name, true, None);
+                        for (variant_name, (variant_id, _)) in &variants.variants {
+                            this.push_decl(*variant_id, variant_name, false, None);
                         }
                     });
                 }
@@ -401,7 +400,7 @@ impl<'a> SymbolCollector<'a> {
     fn collect_from_impl(&mut self, impl_id: ImplId) {
         let impl_data = ImplSignature::of(self.db, impl_id);
         let impl_name = Some(
-            hir_display_with_store(impl_data.self_ty, &impl_data.store)
+            hir_display_with_store(impl_data.self_ty, impl_id.into(), &impl_data.store)
                 .display(
                     self.db,
                     crate::Impl::from(impl_id).krate(self.db).to_display_target(self.db),
@@ -410,7 +409,7 @@ impl<'a> SymbolCollector<'a> {
         );
         self.with_container_name(impl_name.as_deref().map(Symbol::intern), |s| {
             for &(ref name, assoc_item_id) in &impl_id.impl_items(self.db).items {
-                if s.collect_pub_only && s.db.assoc_visibility(assoc_item_id) != Visibility::Public
+                if s.collect_pub_only && assoc_item_id.assoc_visibility(s.db) != Visibility::Public
                 {
                     continue;
                 }
@@ -460,7 +459,7 @@ impl<'a> SymbolCollector<'a> {
         trait_do_not_complete: Option<Complete>,
     ) -> Complete
     where
-        L: Lookup<Database = dyn DefDatabase> + Into<ModuleDefId>,
+        L: Lookup + Into<ModuleDefId>,
         <L as Lookup>::Data: HasSource,
         <<L as Lookup>::Data as HasSource>::Value: HasName,
     {

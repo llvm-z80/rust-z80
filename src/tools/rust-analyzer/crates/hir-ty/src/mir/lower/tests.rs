@@ -78,7 +78,7 @@ fn check_borrowck(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         }
 
         for body in bodies {
-            let _ = db.borrowck(body);
+            let _ = db.borrowck(body.into());
         }
     })
 }
@@ -104,6 +104,32 @@ impl<const N: usize> Tr for &ConstGeneric<N> {
 
 pub struct AssocTy {
     x: i32,
+}
+    "#,
+    );
+}
+
+#[test]
+fn borrowck_tuple_field_projection_recovery_does_not_panic() {
+    check_borrowck(
+        r#"
+//- minicore: sized
+fn tuple_field() {
+    let t = (1,);
+    let x = t.1;
+}
+    "#,
+    );
+}
+
+#[test]
+fn borrowck_alias_projection_recovery_does_not_panic() {
+    check_borrowck(
+        r#"
+//- minicore: sized
+trait Tr { type A; }
+fn alias<T: Tr>(x: T::A) {
+    let (a, b) = x;
 }
     "#,
     );

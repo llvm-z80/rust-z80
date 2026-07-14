@@ -58,7 +58,13 @@ impl Alignment {
 
     /// Returns the [ABI]-required minimum alignment of the type of the value that `val` points to.
     ///
-    /// Every reference to a value of the type `T` must be a multiple of this number.
+    /// This function is identical to [`Alignment::of::<T>()`][Self::of] whenever
+    /// <code>T: [Sized]</code>,
+    /// but also supports determining the alignment required by a `dyn Trait` value, which is the
+    /// alignment of the underlying concrete type.
+    ///
+    /// This provides the same numerical value as [`align_of_val`],
+    /// but in an `Alignment` instead of a `usize`.
     ///
     /// [ABI]: https://en.wikipedia.org/wiki/Application_binary_interface
     ///
@@ -70,6 +76,25 @@ impl Alignment {
     ///
     /// assert_eq!(Alignment::of_val(&5i32).as_usize(), 4);
     /// ```
+    ///
+    /// (Caution: [it is not guaranteed][type-layout] that the alignment of `i32` is `4`;
+    /// that is, the above assertion does not pass on all platforms.)
+    ///
+    /// `dyn` types may have different alignments for different values;
+    /// `Alignment::of_val()` can be used to learn those alignments:
+    ///
+    /// ```
+    /// #![feature(ptr_alignment_type)]
+    /// use std::mem::Alignment;
+    ///
+    /// let a: &dyn ToString = &1234u16;
+    /// let b: &dyn ToString = &String::from("abcd");
+    ///
+    /// assert_eq!(Alignment::of_val(a), Alignment::of::<u16>());
+    /// assert_eq!(Alignment::of_val(b), Alignment::of::<String>());
+    /// ```
+    ///
+    /// [type-layout]: ../../reference/type-layout.html#r-layout.primitive
     #[inline]
     #[must_use]
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
@@ -81,7 +106,9 @@ impl Alignment {
 
     /// Returns the [ABI]-required minimum alignment of the type of the value that `val` points to.
     ///
-    /// Every reference to a value of the type `T` must be a multiple of this number.
+    /// This function is identical to [`Alignment::of_val()`], except that it can be used with raw
+    /// pointers in situations where it would be unsound or undesirable to convert them to
+    /// [`&` references][primitive@reference] and impose the aliasing rules that come with that.
     ///
     /// [ABI]: https://en.wikipedia.org/wiki/Application_binary_interface
     ///
@@ -117,6 +144,11 @@ impl Alignment {
     ///
     /// assert_eq!(unsafe { Alignment::of_val_raw(&5i32) }.as_usize(), 4);
     /// ```
+    ///
+    /// (Caution: [it is not guaranteed][type-layout] that the alignment of `i32` is `4`;
+    /// that is, the above assertion does not pass on all platforms.)
+    ///
+    /// [type-layout]: ../../reference/type-layout.html#r-layout.primitive
     #[inline]
     #[must_use]
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
@@ -178,7 +210,7 @@ impl Alignment {
     /// Returns the alignment as a <code>[NonZero]<[usize]></code>.
     #[unstable(feature = "ptr_alignment_type", issue = "102070")]
     #[deprecated(
-        since = "CURRENT_RUSTC_VERSION",
+        since = "1.96.0",
         note = "renamed to `as_nonzero_usize`",
         suggestion = "as_nonzero_usize"
     )]
@@ -265,7 +297,7 @@ impl fmt::Debug for Alignment {
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const TryFrom<NonZero<usize>> for Alignment {
+const impl TryFrom<NonZero<usize>> for Alignment {
     type Error = num::TryFromIntError;
 
     #[inline]
@@ -276,18 +308,18 @@ impl const TryFrom<NonZero<usize>> for Alignment {
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const TryFrom<usize> for Alignment {
+const impl TryFrom<usize> for Alignment {
     type Error = num::TryFromIntError;
 
     #[inline]
     fn try_from(align: usize) -> Result<Alignment, Self::Error> {
-        Self::new(align).ok_or(num::TryFromIntError(()))
+        Self::new(align).ok_or(num::TryFromIntError(num::IntErrorKind::NotAPowerOfTwo))
     }
 }
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const From<Alignment> for NonZero<usize> {
+const impl From<Alignment> for NonZero<usize> {
     #[inline]
     fn from(align: Alignment) -> NonZero<usize> {
         align.as_nonzero_usize()
@@ -296,7 +328,7 @@ impl const From<Alignment> for NonZero<usize> {
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const From<Alignment> for usize {
+const impl From<Alignment> for usize {
     #[inline]
     fn from(align: Alignment) -> usize {
         align.as_usize()
@@ -305,7 +337,7 @@ impl const From<Alignment> for usize {
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-impl const cmp::Ord for Alignment {
+const impl cmp::Ord for Alignment {
     #[inline]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.as_nonzero_usize().cmp(&other.as_nonzero_usize())
@@ -314,7 +346,7 @@ impl const cmp::Ord for Alignment {
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
-impl const cmp::PartialOrd for Alignment {
+const impl cmp::PartialOrd for Alignment {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
@@ -332,7 +364,7 @@ impl hash::Hash for Alignment {
 /// Returns [`Alignment::MIN`], which is valid for any type.
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl const Default for Alignment {
+const impl Default for Alignment {
     fn default() -> Alignment {
         Alignment::MIN
     }

@@ -1,8 +1,7 @@
 //! Everything related to checking the signature of shim invocations.
 
 use rustc_abi::{CanonAbi, ExternAbi};
-use rustc_hir::Safety;
-use rustc_middle::ty::{Binder, FnSig, Ty};
+use rustc_middle::ty::{Binder, FnSig, FnSigKind, Ty};
 use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
 
@@ -275,10 +274,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         inputs_and_output.push(shim_sig.ret);
         let fn_sig_binder = Binder::dummy(FnSig {
             inputs_and_output: this.machine.tcx.mk_type_list(&inputs_and_output),
-            c_variadic: false,
-            // This does not matter for the ABI.
-            safety: Safety::Safe,
-            abi: shim_sig.abi,
+            // Safety and splatted do not matter for the ABI.
+            fn_sig_kind: FnSigKind::default()
+                .set_abi(shim_sig.abi)
+                .set_safety(rustc_hir::Safety::Safe),
         });
         let callee_fn_abi = this.fn_abi_of_fn_ptr(fn_sig_binder, Default::default())?;
 
@@ -330,6 +329,30 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return interp_ok(args);
         }
         panic!("mismatch between signature and `args` slice");
+    }
+
+    /// Check that the given function has the expected amount of arguments, and then
+    /// return the list of arguments.
+    ///
+    /// This may only be used for `extern "unadjusted"` LLVM intrinsics.
+    fn check_shim_sig_unadjusted<'a, const N: usize>(
+        &mut self,
+        link_name: Symbol,
+        args: &'a [OpTy<'tcx>],
+    ) -> InterpResult<'tcx, &'a [OpTy<'tcx>; N]> {
+        assert!(link_name.as_str().starts_with("llvm."));
+
+        let this = self.eval_context_mut();
+        check_shim_symbol_clash(this, link_name)?;
+
+        if let Ok(ops) = args.try_into() {
+            return interp_ok(ops);
+        }
+        throw_ub_format!(
+            "incorrect number of arguments for `{link_name}`: got {}, expected {}",
+            args.len(),
+            N
+        )
     }
 }
 

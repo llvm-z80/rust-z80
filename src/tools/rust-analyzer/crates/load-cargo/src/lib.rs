@@ -11,16 +11,15 @@ extern crate rustc_driver as _;
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
 use crossbeam_channel::{Receiver, unbounded};
-use hir_expand::{
-    db::ExpandDatabase,
-    proc_macro::{
-        ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
-        ProcMacrosBuilder,
-    },
+use hir_expand::proc_macro::{
+    ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
+    ProcMacrosBuilder,
 };
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, RootDatabase,
-    base_db::{CrateGraphBuilder, Env, ProcMacroLoadingError, SourceRoot, SourceRootId},
+    base_db::{
+        CrateGraphBuilder, Env, ProcMacroLoadingError, SourceDatabase, SourceRoot, SourceRootId,
+    },
     prime_caches,
 };
 use itertools::Itertools;
@@ -171,7 +170,7 @@ pub fn load_workspace_into_db(
             .map(|(crate_id, path)| {
                 (
                     crate_id,
-                    path.map_or_else(Err, |(_, path)| {
+                    path.and_then(|(_, path)| {
                         proc_macro_server.as_ref().map_err(Clone::clone).and_then(
                             |proc_macro_server| load_proc_macro(proc_macro_server, &path, &[]),
                         )
@@ -283,6 +282,19 @@ impl ProjectFolders {
             }
         }
 
+        // Collect workspace roots not already covered by a local PackageRoot
+        // (e.g. virtual workspaces where no package lives at the workspace root).
+        // We need these to load workspace-root rust-analyzer.toml into a local source root.
+        let uncovered_ws_roots: Vec<AbsPathBuf> = workspaces
+            .iter()
+            .filter_map(|ws| {
+                let ws_root = ws.workspace_root().to_path_buf();
+                let dominated =
+                    roots.iter().any(|root| root.is_local && root.include.contains(&ws_root));
+                (!dominated).then_some(ws_root)
+            })
+            .collect();
+
         for root in roots.into_iter().filter(|it| !it.include.is_empty()) {
             let file_set_roots: Vec<VfsPath> =
                 root.include.iter().cloned().map(VfsPath::from).collect();
@@ -291,6 +303,7 @@ impl ProjectFolders {
                 let mut dirs = vfs::loader::Directories::default();
                 dirs.extensions.push("rs".into());
                 dirs.extensions.push("toml".into());
+                dirs.extensions.push("md".into());
                 dirs.include.extend(root.include);
                 dirs.exclude.extend(root.exclude);
                 for excl in global_excludes {
@@ -333,6 +346,20 @@ impl ProjectFolders {
                 local_filesets.push(fsc.len() as u64);
                 fsc.add_file_set(file_set_roots)
             }
+        }
+
+        // For virtual workspaces, the workspace root has no local PackageRoot, so
+        // rust-analyzer.toml there would fall into a library source root and be
+        // ignored. Load it explicitly via Entry::Files and register the workspace
+        // root as a local file-set root so the file is classified as local.
+        for ws_root in &uncovered_ws_roots {
+            let ratoml_path = ws_root.join("rust-analyzer.toml");
+            let file_set_roots = vec![VfsPath::from(ws_root.clone())];
+            let entry = vfs::loader::Entry::Files(vec![ratoml_path]);
+            res.watch.push(res.load.len());
+            res.load.push(entry);
+            local_filesets.push(fsc.len() as u64);
+            fsc.add_file_set(file_set_roots);
         }
 
         if let Some(user_config_path) = user_config_dir_path {
@@ -541,7 +568,7 @@ struct Expander(proc_macro_api::ProcMacro);
 impl ProcMacroExpander for Expander {
     fn expand(
         &self,
-        db: &dyn ExpandDatabase,
+        db: &dyn SourceDatabase,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -581,11 +608,9 @@ impl ProcMacroExpander for Expander {
             SubRequest::LineColumn { file_id, ast_id, offset } => {
                 let range =
                     resolve_sub_span(db, file_id, ast_id, TextRange::empty(TextSize::from(offset)));
-                let source = db.file_text(range.file_id.file_id(db)).text(db);
-                let line_index = ide_db::line_index::LineIndex::new(source);
-                let (line, column) = line_index
-                    .try_line_col(range.range.start())
-                    .map(|lc| (lc.line + 1, lc.col + 1))
+                let (line, column) = db
+                    .line_column(range.file_id.file_id(db), range.range.start())
+                    .map(|(line, col)| (line + 1, col + 1))
                     .unwrap_or((1, 1));
                 // proc_macro::Span line/column are 1-based
                 Ok(SubResponse::LineColumnResult { line, column })
@@ -629,11 +654,11 @@ impl ProcMacroExpander for Expander {
                 let mut current_ctx = span.ctx;
 
                 while let Some(macro_call_id) = current_ctx.outer_expn(db) {
-                    let macro_call_loc = db.lookup_intern_macro_call(macro_call_id.into());
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
 
                     let call_site_file = macro_call_loc.kind.file_id();
 
-                    let resolved = db.resolve_span(current_span);
+                    let resolved = hir_expand::resolve_span(db, current_span);
 
                     current_ctx = macro_call_loc.ctxt;
                     current_span = Span {
@@ -650,7 +675,7 @@ impl ProcMacroExpander for Expander {
                     }
                 }
 
-                let resolved = db.resolve_span(current_span);
+                let resolved = hir_expand::resolve_span(db, current_span);
 
                 Ok(SubResponse::SpanSourceResult {
                     file_id: resolved.file_id.span_file_id(db).as_u32(),
@@ -673,14 +698,14 @@ impl ProcMacroExpander for Expander {
                 };
 
                 if let Some(macro_call_id) = span.ctx.outer_expn(db) {
-                    let macro_call_loc = db.lookup_intern_macro_call(macro_call_id.into());
+                    let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
 
                     let call_site_file = macro_call_loc.kind.file_id();
                     let call_site_ast_id = macro_call_loc.kind.erased_ast_id();
 
                     if let Some(editioned_file_id) = call_site_file.file_id() {
-                        let range = db
-                            .ast_id_map(editioned_file_id.into())
+                        let range = hir_expand::HirFileId::from(editioned_file_id)
+                            .ast_id_map(db)
                             .get_erased(call_site_ast_id)
                             .text_range();
 
@@ -698,6 +723,8 @@ impl ProcMacroExpander for Expander {
 
                 Ok(SubResponse::SpanParentResult { parent_span: None })
             }
+            // FIXME: implement this
+            SubRequest::SpanJoin { .. } => Ok(SubResponse::SpanJoinResult { span: None }),
         };
         match self.0.expand(
             subtree.view(),
@@ -721,7 +748,7 @@ impl ProcMacroExpander for Expander {
 }
 
 fn resolve_sub_span(
-    db: &dyn ExpandDatabase,
+    db: &dyn SourceDatabase,
     file_id: u32,
     ast_id: u32,
     range: TextRange,
@@ -733,12 +760,12 @@ fn resolve_sub_span(
         anchor: SpanAnchor { file_id: editioned_file_id, ast_id },
         ctx: SyntaxContext::root(editioned_file_id.edition()),
     };
-    db.resolve_span(span)
+    hir_expand::resolve_span(db, span)
 }
 
 #[cfg(test)]
 mod tests {
-    use ide_db::base_db::RootQueryDb;
+    use ide_db::base_db::all_crates;
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
@@ -766,7 +793,7 @@ mod tests {
         let (db, _vfs, _proc_macro) =
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config).unwrap();
 
-        let n_crates = db.all_crates().len();
+        let n_crates = all_crates(&db).len();
         // RA has quite a few crates, but the exact count doesn't matter
         assert!(n_crates > 20);
     }
@@ -856,7 +883,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 2, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(2), SourceRootId(1)), (SourceRootId(3), SourceRootId(1))])
     }
@@ -871,7 +898,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -886,7 +913,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1, 3] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(3), SourceRootId(1)),])
     }
@@ -902,7 +929,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }
@@ -918,7 +945,7 @@ mod tests {
         let fsc = builder.build();
         let src = SourceRootConfig { fsc, local_filesets: vec![0, 1] };
         let mut vc = src.source_root_parent_map().into_iter().collect::<Vec<_>>();
-        vc.sort_by(|x, y| x.0.0.cmp(&y.0.0));
+        vc.sort_by_key(|x| x.0.0);
 
         assert_eq!(vc, vec![(SourceRootId(1), SourceRootId(0)),])
     }

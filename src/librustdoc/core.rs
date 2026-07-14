@@ -56,9 +56,18 @@ pub(crate) struct DocContext<'tcx> {
     pub(crate) current_type_aliases: DefIdMap<usize>,
     /// Table synthetic type parameter for `impl Trait` in argument position -> bounds
     pub(crate) impl_trait_bounds: FxHashMap<ImplTraitParam, Vec<clean::GenericBound>>,
-    /// Auto-trait or blanket impls processed so far, as `(self_ty, trait_def_id)`.
-    // FIXME(eddyb) make this a `ty::TraitRef<'tcx>` set.
-    pub(crate) generated_synthetics: FxHashSet<(Ty<'tcx>, DefId)>,
+
+    // FIXME: I'm pretty that the only reason we "need" these caches is because we also invoke
+    //        `synthesize_auto_trait_and_blanket_impls` on all impls(!) for primitive types
+    //        instead of calling it only once per primitive type (see also #97129).
+    //        Get rid of that jank and remove both caches!
+    //
+    /// The set of auto-trait impls generated so far; identified by `(self_ty, trait_def_id)`.
+    pub(crate) synthetic_auto_trait_impls: FxHashSet<(Ty<'tcx>, DefId)>,
+    /// The set of blanket impls generated so far; identified by `(self_ty, trait_def_id)`.
+    pub(crate) synthetic_blanket_impls: FxHashSet<(Ty<'tcx>, DefId)>,
+
+    /// All auto traits in the (visible) crate graph.
     pub(crate) auto_traits: Vec<DefId>,
     /// This same cache is used throughout rustdoc, including in [`crate::html::render`].
     pub(crate) cache: Cache,
@@ -66,8 +75,6 @@ pub(crate) struct DocContext<'tcx> {
     pub(crate) inlined: FxHashSet<ItemId>,
     /// Used by `calculate_doc_coverage`.
     pub(crate) output_format: OutputFormat,
-    /// Used by `strip_private`.
-    pub(crate) show_coverage: bool,
 }
 
 impl<'tcx> DocContext<'tcx> {
@@ -87,10 +94,7 @@ impl<'tcx> DocContext<'tcx> {
     }
 
     pub(crate) fn typing_env(&self) -> ty::TypingEnv<'tcx> {
-        ty::TypingEnv {
-            typing_mode: ty::TypingMode::non_body_analysis(),
-            param_env: self.param_env,
-        }
+        ty::TypingEnv::new(self.param_env, ty::TypingMode::non_body_analysis())
     }
 
     /// Call the closure with the given parameters set as
@@ -133,7 +137,7 @@ impl<'tcx> DocContext<'tcx> {
     ///
     /// If another option like `--show-coverage` is enabled, it will return `false`.
     pub(crate) fn is_json_output(&self) -> bool {
-        self.output_format.is_json() && !self.show_coverage
+        self.output_format == OutputFormat::IrJson
     }
 
     /// If `--document-private-items` was passed to rustdoc.
@@ -214,6 +218,7 @@ pub(crate) fn create_config(
         lint_cap,
         scrape_examples_options,
         remap_path_prefix,
+        remap_path_scope,
         target_modifiers,
         ..
     }: RustdocOptions,
@@ -228,6 +233,7 @@ pub(crate) fn create_config(
         // it's unclear whether these should be part of rustdoc directly (#77364)
         rustc_lint::builtin::MISSING_DOCS.name.to_string(),
         rustc_lint::builtin::INVALID_DOC_ATTRIBUTES.name.to_string(),
+        rustc_lint::builtin::UNUSED_DOC_COMMENTS.name.to_string(),
         // these are definitely not part of rustdoc, but we want to warn on them anyway.
         rustc_lint::builtin::RENAMED_AND_REMOVED_LINTS.name.to_string(),
         rustc_lint::builtin::UNKNOWN_LINTS.name.to_string(),
@@ -273,6 +279,7 @@ pub(crate) fn create_config(
         crate_name,
         test,
         remap_path_prefix,
+        remap_path_scope,
         output_types: if let Some(file) = render_options.dep_info() {
             OutputTypes::new(&[(OutputType::DepInfo, file.cloned())])
         } else {
@@ -339,7 +346,7 @@ pub(crate) fn run_global_ctxt(
     let expanded_macros = {
         // We need for these variables to be removed to ensure that the `Crate` won't be "stolen"
         // anymore.
-        let (_resolver, krate) = &*tcx.resolver_for_lowering().borrow();
+        let krate = &*tcx.resolver_for_lowering().1.borrow();
 
         source_macro_expansion(&krate, &render_options, output_format, tcx.sess.source_map())
     };
@@ -370,12 +377,12 @@ pub(crate) fn run_global_ctxt(
         args: Default::default(),
         current_type_aliases: Default::default(),
         impl_trait_bounds: Default::default(),
-        generated_synthetics: Default::default(),
+        synthetic_auto_trait_impls: Default::default(),
+        synthetic_blanket_impls: Default::default(),
         auto_traits,
         cache: Cache::new(render_options.document_private, render_options.document_hidden),
         inlined: FxHashSet::default(),
         output_format,
-        show_coverage,
     };
 
     for cnum in tcx.crates(()) {

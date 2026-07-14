@@ -234,9 +234,9 @@ The compiler uses the [`tracing`] crate for logging.
 
 [`tracing`]: https://docs.rs/tracing
 
-For details see [the guide section on tracing](./tracing.md)
+For details, see [the chapter on tracing](./tracing.md).
 
-## Narrowing (Bisecting) Regressions
+## Narrowing (bisecting) regressions
 
 The [cargo-bisect-rustc][bisect] tool can be used as a quick and easy way to
 find exactly which PR caused a change in `rustc` behavior.
@@ -248,7 +248,7 @@ You can then look at the PR to get more context on *why* it was changed.
 [bisect]: https://github.com/rust-lang/cargo-bisect-rustc
 [bisect-tutorial]: https://rust-lang.github.io/cargo-bisect-rustc/tutorial.html
 
-## Downloading Artifacts from Rust's CI
+## Downloading artifacts from Rust's CI
 
 The [rustup-toolchain-install-master][rtim] tool by kennytm can be used to
 download the artifacts produced by Rust's CI for a specific SHA1 -- this
@@ -273,18 +273,19 @@ Here are some notable ones:
 
 | Attribute | Description |
 |----------------|-------------|
-| `rustc_def_path` | Dumps the [`def_path_str`] of an item. |
 | `rustc_dump_def_parents` | Dumps the chain of `DefId` parents of certain definitions. |
+| `rustc_dump_def_path` | Dumps the [`def_path_str`] of an item. |
+| `rustc_dump_generics` | Dumps the generics of an item. |
+| `rustc_dump_hidden_type_of_opaques` | Dumps the [hidden type of each opaque types][opaq] in the crate. |
 | `rustc_dump_inferred_outlives` | Dumps implied bounds of an item. More precisely, the [`inferred_outlives_of`] an item. |
 | `rustc_dump_item_bounds` | Dumps the [`item_bounds`] of an item. |
+| `rustc_dump_layout` | [See this section](#debugging-type-layouts). |
 | `rustc_dump_object_lifetime_defaults` | Dumps the [object lifetime defaults] of an item. |
 | `rustc_dump_predicates` | Dumps the [`predicates_of`] an item. |
+| `rustc_dump_symbol_name` | Dumps the mangled & demangled [`symbol_name`] of an item. |
 | `rustc_dump_variances` | Dumps the [variances] of an item. |
 | `rustc_dump_vtable` | Dumps the vtable layout of an impl, or a type alias of a dyn type. |
-| `rustc_hidden_type_of_opaques` | Dumps the [hidden type of each opaque types][opaq] in the crate. |
-| `rustc_layout` | [See this section](#debugging-type-layouts). |
 | `rustc_regions` | Dumps NLL closure region requirements. |
-| `rustc_symbol_name` | Dumps the mangled & demangled [`symbol_name`] of an item. |
 
 Right below you can find elaborate explainers on a selected few.
 
@@ -316,54 +317,55 @@ $ firefox maybe_init_suffix.pdf # Or your favorite pdf viewer
 
 ### Debugging type layouts
 
-The internal attribute `#[rustc_layout]` can be used to dump the [`Layout`] of
-the type it is attached to.
+The internal attribute `#[rustc_dump_layout(...)]` can be used to dump the
+[`Layout`] of the type it is attached to.
 For example:
 
 ```rust
 #![feature(rustc_attrs)]
 
-#[rustc_layout(debug)]
+#[rustc_dump_layout(debug)]
 type T<'a> = &'a u32;
 ```
 
 Will emit the following:
 
 ```text
-error: layout_of(&'a u32) = Layout {
-    fields: Primitive,
-    variants: Single {
-        index: 0,
-    },
-    abi: Scalar(
-        Scalar {
-            value: Pointer,
-            valid_range: 1..=18446744073709551615,
-        },
-    ),
-    largest_niche: Some(
-        Niche {
-            offset: Size {
-                raw: 0,
-            },
-            scalar: Scalar {
-                value: Pointer,
-                valid_range: 1..=18446744073709551615,
-            },
-        },
-    ),
-    align: AbiAndPrefAlign {
-        abi: Align {
-            pow2: 3,
-        },
-        pref: Align {
-            pow2: 3,
-        },
-    },
-    size: Size {
-        raw: 8,
-    },
-}
+error: layout_of(&u32) = Layout {
+           size: Size(8 bytes),
+           align: AbiAlign {
+               abi: Align(8 bytes),
+           },
+           backend_repr: Scalar(
+               Initialized {
+                   value: Pointer(
+                       AddressSpace(
+                           0,
+                       ),
+                   ),
+                   valid_range: 1..=18446744073709551615,
+               },
+           ),
+           fields: Primitive,
+           largest_niche: Some(
+               Niche {
+                   offset: Size(0 bytes),
+                   value: Pointer(
+                       AddressSpace(
+                           0,
+                       ),
+                   ),
+                   valid_range: 1..=18446744073709551615,
+               },
+           ),
+           uninhabited: false,
+           variants: Single {
+               index: 0,
+           },
+           max_repr_align: None,
+           unadjusted_abi_align: Align(8 bytes),
+           randomization_seed: 281492156579847,
+       }
  --> src/lib.rs:4:1
   |
 4 | type T<'a> = &'a u32;

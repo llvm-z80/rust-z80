@@ -35,7 +35,7 @@ where
             // The softfloat ABI treats floats like integers, so they
             // do not get homogeneous aggregate treatment.
             RegKind::Float => cx.target_spec().rustc_abi != Some(RustcAbi::Softfloat),
-            RegKind::Vector => size.bits() == 64 || size.bits() == 128,
+            RegKind::Vector { .. } => size.bits() == 64 || size.bits() == 128,
         };
 
         valid_unit.then_some(Uniform::consecutive(unit, size))
@@ -56,7 +56,7 @@ fn softfloat_float_abi<Ty>(target: &Target, arg: &mut ArgAbi<'_, Ty>) {
         && let Primitive::Float(f) = s.primitive()
     {
         arg.cast_to(Reg { kind: RegKind::Integer, size: f.size() });
-    } else if let BackendRepr::ScalarPair(s1, s2) = arg.layout.backend_repr
+    } else if let BackendRepr::ScalarPair { a: s1, b: s2, b_offset: _ } = arg.layout.backend_repr
         && (matches!(s1.primitive(), Primitive::Float(_))
             || matches!(s2.primitive(), Primitive::Float(_)))
     {

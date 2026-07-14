@@ -108,6 +108,7 @@ pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
             Assign(e, _, _)
             | AssignOp(_, e, _)
             | Await(e, _)
+            | Move(e, _)
             | Use(e, _)
             | Binary(_, e, _)
             | Call(e, _)
@@ -154,6 +155,7 @@ pub fn leading_labeled_expr(mut expr: &ast::Expr) -> bool {
             | Yeet(..)
             | Yield(..)
             | UnsafeBinderCast(..)
+            | DirectConstArg(..)
             | Err(..)
             | Dummy => return false,
         }
@@ -183,6 +185,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<TrailingBrace<'_>> {
             | Ret(Some(e))
             | Unary(_, e)
             | Yeet(Some(e))
+            | Move(e, _)
             | Become(e) => {
                 expr = e;
             }
@@ -238,6 +241,7 @@ pub fn expr_trailing_brace(mut expr: &ast::Expr) -> Option<TrailingBrace<'_>> {
             | Try(_)
             | Yeet(None)
             | UnsafeBinderCast(..)
+            | DirectConstArg(..)
             | Err(_)
             | Dummy => {
                 break None;
@@ -299,6 +303,8 @@ fn type_trailing_braced_mac_call(mut ty: &ast::Ty) -> Option<&ast::MacCall> {
             | ast::TyKind::CVarArgs
             | ast::TyKind::Pat(..)
             | ast::TyKind::FieldOf(..)
+            | ast::TyKind::View(..)
+            | ast::TyKind::DirectConstArg(..)
             | ast::TyKind::Dummy
             | ast::TyKind::Err(..) => break None,
         }

@@ -43,11 +43,10 @@ impl<'a, 'tcx> Expectation<'tcx> {
     pub(super) fn try_structurally_resolve_and_adjust_for_branches(
         &self,
         fcx: &FnCtxt<'a, 'tcx>,
-        span: Span,
     ) -> Expectation<'tcx> {
         match *self {
             ExpectHasType(ety) => {
-                let ety = fcx.try_structurally_resolve_type(span, ety);
+                let ety = fcx.resolve_vars_with_obligations(ety);
                 if !ety.is_ty_var() { ExpectHasType(ety) } else { NoExpectation }
             }
             ExpectRvalueLikeUnsized(ety) => ExpectRvalueLikeUnsized(ety),
@@ -77,12 +76,12 @@ impl<'a, 'tcx> Expectation<'tcx> {
     pub(super) fn rvalue_hint(fcx: &FnCtxt<'a, 'tcx>, ty: Ty<'tcx>) -> Expectation<'tcx> {
         let span = match ty.kind() {
             ty::Adt(adt_def, _) => fcx.tcx.def_span(adt_def.did()),
-            _ => fcx.tcx.def_span(fcx.body_id),
+            _ => fcx.tcx.def_span(fcx.body_def_id),
         };
-        let cause = ObligationCause::misc(span, fcx.body_id);
+        let cause = ObligationCause::misc(span, fcx.body_def_id);
 
-        // FIXME: This is not right, even in the old solver...
-        match fcx.tcx.struct_tail_raw(ty, &cause, |ty| ty, || {}).kind() {
+        // FIXME(#155345): Missing normalization call
+        match fcx.tcx.struct_tail_raw(ty, &cause, |ty| ty.skip_normalization(), || {}).kind() {
             ty::Slice(_) | ty::Str | ty::Dynamic(..) => ExpectRvalueLikeUnsized(ty),
             _ => ExpectHasType(ty),
         }

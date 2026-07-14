@@ -9,6 +9,7 @@
     feature(abort_unwind)
 )]
 #![feature(rustc_private)]
+#![feature(dirfd)]
 #![feature(f16)]
 #![feature(float_gamma)]
 #![feature(float_erf)]
@@ -17,6 +18,7 @@
 #![feature(try_blocks)]
 #![feature(io_error_more)]
 #![feature(io_error_inprogress)]
+#![cfg_attr(not(bootstrap), feature(io_error_too_many_open_files))]
 #![feature(variant_count)]
 #![feature(yeet_expr)]
 #![feature(pointer_is_aligned_to)]
@@ -48,6 +50,7 @@
     clippy::too_long_first_doc_paragraph,
     clippy::len_zero,
     clippy::collapsible_match,
+    clippy::question_mark,
     // We are not implementing queries here so it's fine
     rustc::potential_query_instability,
 )]
@@ -69,6 +72,7 @@ extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_hir_analysis;
 extern crate rustc_index;
 extern crate rustc_log;
 extern crate rustc_middle;
@@ -105,8 +109,9 @@ pub use rustc_const_eval::interpret::*;
 // Resolve ambiguity.
 #[doc(no_inline)]
 pub use rustc_const_eval::interpret::{self, AllocMap, Provenance as _};
-use rustc_log::tracing::{self, info, trace};
-use rustc_middle::{bug, span_bug};
+pub use rustc_data_structures::either::Either;
+pub use rustc_log::tracing::{self, info, trace};
+pub use rustc_middle::{bug, span_bug};
 
 #[cfg(all(feature = "native-lib", unix))]
 pub mod native_lib {
@@ -132,8 +137,10 @@ pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
 pub use crate::borrow_tracker::{
     BorTag, BorrowTrackerMethod, EvalContextExt as _, TreeBorrowsParams,
 };
-pub use crate::clock::{Instant, MonotonicClock};
-pub use crate::concurrency::blocking_io::{BlockingIoManager, EvalContextExt as _, WithSource};
+pub use crate::clock::{Deadline, Instant, MonotonicClock, TimeoutClock, TimeoutStyle};
+pub use crate::concurrency::blocking_io::{
+    BlockingIoInterest, BlockingIoManager, EvalContextExt as _, SourceFileDescription,
+};
 pub use crate::concurrency::cpu_affinity::MAX_CPUS;
 pub use crate::concurrency::data_race::{
     AtomicFenceOrd, AtomicReadOrd, AtomicRwOrd, AtomicWriteOrd, EvalContextExt as _,
@@ -142,7 +149,7 @@ pub use crate::concurrency::init_once::{EvalContextExt as _, InitOnceRef};
 pub use crate::concurrency::sync::{CondvarRef, EvalContextExt as _, MutexRef, RwLockRef};
 pub use crate::concurrency::thread::{
     BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
-    ThreadManager, TimeoutAnchor, TimeoutClock, UnblockKind,
+    ThreadManager, TlsAllocAction, UnblockKind,
 };
 pub use crate::concurrency::{GenmcConfig, GenmcCtx, run_genmc_mode};
 pub use crate::data_structures::dedup_range_map::DedupRangeMap;
@@ -150,7 +157,7 @@ pub use crate::data_structures::mono_hash_map::MonoHashMap;
 pub use crate::diagnostics::{
     EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_result,
 };
-pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, eval_entry};
+pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, entry_fn, eval_entry};
 pub use crate::helpers::{EvalContextExt as _, ToU64 as _, ToUsize as _};
 pub use crate::intrinsics::EvalContextExt as _;
 pub use crate::machine::{
@@ -167,6 +174,10 @@ pub use crate::shims::foreign_items::{DynSym, EvalContextExt as _};
 pub use crate::shims::io_error::{EvalContextExt as _, IoError, LibcError};
 pub use crate::shims::os_str::EvalContextExt as _;
 pub use crate::shims::panic::EvalContextExt as _;
+pub use crate::shims::readiness::{
+    EvalContextExt as _, Readiness, ReadinessInterest, ReadinessInterestKey,
+    ReadinessInterestTable, ReadinessWatcher,
+};
 pub use crate::shims::sig::EvalContextExt as _;
 pub use crate::shims::time::EvalContextExt as _;
 pub use crate::shims::tls::TlsData;
@@ -180,10 +191,16 @@ pub const MIRI_DEFAULT_ARGS: &[&str] = &[
     "--cfg=miri",
     "-Zalways-encode-mir",
     "-Zextra-const-ub-checks",
-    "-Zmir-emit-retag",
     "-Zmir-preserve-ub",
     "-Zmir-opt-level=0",
+    // Disable passes that add checks for language UB -- we get better diagnostics if
+    // we let Miri do these checks.
     "-Zmir-enable-passes=-CheckAlignment,-CheckNull,-CheckEnums",
+    // FIXME: Disable some passes to make higher opt levels also work.
+    // - ReferencePropagation is incompatible with SB's ref-to-raw castb behavior.
+    //   The fix here is to ditch SB and use TB instead but we're not yet ready for that.
+    // - GVN is not yet adjusted for implicit retags during assignments.
+    "-Zmir-enable-passes=-ReferencePropagation,-GVN",
     // Deduplicating diagnostics means we miss events when tracking what happens during an
     // execution. Let's not do that.
     "-Zdeduplicate-diagnostics=no",

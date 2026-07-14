@@ -22,6 +22,7 @@ COPY scripts/cross-apt-packages.sh /scripts/
 RUN sh /scripts/cross-apt-packages.sh
 
 COPY scripts/crosstool-ng.sh /scripts/
+COPY scripts/crosstool-ng-sha256-20260705.diff /scripts/
 RUN sh /scripts/crosstool-ng.sh
 
 COPY scripts/rustbuild-setup.sh /scripts/
@@ -39,6 +40,8 @@ ENV \
 
 WORKDIR /build/
 COPY scripts/musl.sh /build/
+COPY scripts/musl-cve-2026-6042.diff /build/
+COPY scripts/musl-cve-2026-40200.diff /build/
 RUN CC=gcc CFLAGS="-m32 -Wa,-mrelax-relocations=no" \
     CXX=g++ CXXFLAGS="-m32 -Wa,-mrelax-relocations=no" \
     bash musl.sh i686 --target=i686 && \

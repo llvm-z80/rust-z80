@@ -6,14 +6,13 @@ use arrayvec::ArrayVec;
 use either::Either;
 use hir::{
     AssocItem, Crate, FieldSource, HasContainer, HasCrate, HasSource, HirDisplay, HirFileId,
-    InFile, LocalSource, ModuleSource, Name, Semantics, Symbol, db::ExpandDatabase, sym,
-    symbols::FileSymbol,
+    InFile, LocalSource, ModuleSource, Name, Semantics, Symbol, sym, symbols::FileSymbol,
 };
 use ide_db::{
     FileId, FileRange, RootDatabase, SymbolKind,
-    base_db::{CrateOrigin, LangCrateOrigin, RootQueryDb},
+    base_db::{CrateOrigin, LangCrateOrigin, all_crates},
     defs::{Definition, find_std_module},
-    documentation::{Documentation, HasDocs},
+    documentation::HasDocs,
     famous_defs::FamousDefs,
     ra_fixture::UpmapFromRaFixture,
 };
@@ -51,8 +50,6 @@ pub struct NavigationTarget {
     pub kind: Option<SymbolKind>,
     pub container_name: Option<Symbol>,
     pub description: Option<String>,
-    // FIXME: Use the database lifetime here.
-    pub docs: Option<Documentation<'static>>,
     /// In addition to a `name` field, a `NavigationTarget` may also be aliased
     /// In such cases we want a `NavigationTarget` to be accessible by its alias
     pub alias: Option<Symbol>,
@@ -71,7 +68,7 @@ impl fmt::Debug for NavigationTarget {
         f.field("file_id", &self.file_id).field("full_range", &self.full_range);
         opt!(focus_range);
         f.field("name", &self.name);
-        opt!(kind container_name description docs);
+        opt!(kind container_name description);
         f.finish()
     }
 }
@@ -108,7 +105,6 @@ impl UpmapFromRaFixture for NavigationTarget {
                 virtual_file_id,
                 real_file_id,
             )?,
-            docs: self.docs.upmap_from_ra_fixture(analysis, virtual_file_id, real_file_id)?,
             alias: self.alias.upmap_from_ra_fixture(analysis, virtual_file_id, real_file_id)?,
         })
     }
@@ -158,7 +154,6 @@ impl NavigationTarget {
                             full_range,
                             SymbolKind::Module,
                         );
-                        res.docs = module.docs(db).map(Documentation::into_owned);
                         res.description = Some(
                             module.display(db, module.krate(db).to_display_target(db)).to_string(),
                         );
@@ -235,7 +230,6 @@ impl NavigationTarget {
             focus_range,
             container_name: None,
             description: None,
-            docs: None,
             alias: None,
         }
     }
@@ -296,7 +290,6 @@ impl<'db> TryToNav for FileSymbol<'db> {
                         }
                         hir::ModuleDef::BuiltinType(_) => None,
                     },
-                    docs: None,
                 }
             }),
         )
@@ -460,7 +453,6 @@ where
                 D::KIND,
             )
             .map(|mut res| {
-                res.docs = self.docs(db).map(Documentation::into_owned);
                 res.description =
                     Some(self.display(db, self.krate(db).to_display_target(db)).to_string());
                 res.container_name = self.container_name(db);
@@ -547,7 +539,6 @@ impl TryToNav for hir::ExternCrateDecl {
                     SymbolKind::CrateRoot,
                 );
 
-                res.docs = self.docs(db).map(Documentation::into_owned);
                 res.description = Some(self.display(db, krate.to_display_target(db)).to_string());
                 res.container_name = container_name(db, *self);
                 res
@@ -569,7 +560,6 @@ impl TryToNav for hir::Field {
             FieldSource::Named(it) => {
                 NavigationTarget::from_named(db, src.with_value(it), SymbolKind::Field).map(
                     |mut res| {
-                        res.docs = self.docs(db).map(Documentation::into_owned);
                         res.description =
                             Some(self.display(db, krate.to_display_target(db)).to_string());
                         res
@@ -580,7 +570,7 @@ impl TryToNav for hir::Field {
                 |(FileRange { file_id, range: full_range }, focus_range)| {
                     NavigationTarget::from_syntax(
                         file_id,
-                        Symbol::integer(self.index()),
+                        sym::Integer::get(self.index()),
                         focus_range,
                         full_range,
                         SymbolKind::Field,
@@ -603,17 +593,11 @@ impl TryToNav for hir::Macro {
             Either::Left(it) => it,
             Either::Right(it) => it,
         };
-        Some(
-            NavigationTarget::from_named(
-                db,
-                src.as_ref().with_value(name_owner),
-                self.kind(db).into(),
-            )
-            .map(|mut res| {
-                res.docs = self.docs(db).map(Documentation::into_owned);
-                res
-            }),
-        )
+        Some(NavigationTarget::from_named(
+            db,
+            src.as_ref().with_value(name_owner),
+            self.kind(db).into(),
+        ))
     }
 }
 
@@ -685,7 +669,6 @@ impl ToNav for LocalSource {
                     focus_range,
                     container_name: None,
                     description: None,
-                    docs: None,
                 }
             },
         )
@@ -717,7 +700,6 @@ impl TryToNav for hir::Label {
                 focus_range,
                 container_name: None,
                 description: None,
-                docs: None,
             },
         ))
     }
@@ -757,7 +739,6 @@ impl TryToNav for hir::TypeParam {
                 focus_range,
                 container_name: None,
                 description: None,
-                docs: None,
             },
         ))
     }
@@ -791,7 +772,6 @@ impl TryToNav for hir::LifetimeParam {
                 focus_range,
                 container_name: None,
                 description: None,
-                docs: None,
             },
         ))
     }
@@ -824,7 +804,6 @@ impl TryToNav for hir::ConstParam {
                 focus_range,
                 container_name: None,
                 description: None,
-                docs: None,
             },
         ))
     }
@@ -849,7 +828,6 @@ impl TryToNav for hir::InlineAsmOperand {
                 focus_range,
                 container_name: None,
                 description: None,
-                docs: None,
             },
         ))
     }
@@ -861,8 +839,7 @@ impl TryToNav for hir::BuiltinType {
         sema: &Semantics<'_, RootDatabase>,
     ) -> Option<UpmappingResult<NavigationTarget>> {
         let db = sema.db;
-        let krate = db
-            .all_crates()
+        let krate = all_crates(db)
             .iter()
             .copied()
             .find(|&krate| matches!(krate.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Std)))
@@ -940,10 +917,9 @@ pub(crate) fn orig_range_with_focus_r(
 ) -> UpmappingResult<(FileRange, Option<TextRange>)> {
     let Some(name) = focus_range else { return orig_range_r(db, hir_file, value) };
 
-    let call = || db.lookup_intern_macro_call(hir_file.macro_file().unwrap());
+    let call = || hir_file.macro_file().unwrap().loc(db);
 
-    let def_range =
-        || db.lookup_intern_macro_call(hir_file.macro_file().unwrap()).def.definition_range(db);
+    let def_range = || hir_file.macro_file().unwrap().loc(db).def.definition_range(db);
 
     // FIXME: Also make use of the syntax context to determine which site we are at?
     let value_range = InFile::new(hir_file, value).original_node_file_range_opt(db);
@@ -967,7 +943,7 @@ pub(crate) fn orig_range_with_focus_r(
                             // *should* contain the name
                             _ => {
                                 let call = call();
-                                let kind = call.kind;
+                                let kind = &call.kind;
                                 let range = kind.clone().original_call_range_with_input(db);
                                 //If the focus range is in the attribute/derive body, we
                                 // need to point the call site to the entire body, if not, fall back

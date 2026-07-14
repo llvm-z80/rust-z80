@@ -75,6 +75,32 @@ pub(crate) struct Cycle {
     #[subdiagnostic]
     pub cycle_usage: Option<CycleUsage>,
     #[note(
+        "for more information, see <https://rustc-dev-guide.rust-lang.org/overview.html#queries> \
+         and <https://rustc-dev-guide.rust-lang.org/query.html>"
+    )]
+    pub note_span: (),
+}
+
+#[derive(Subdiagnostic)]
+#[note("...when {$stack_bottom}")]
+pub(crate) struct NestedCycleBottom {
+    pub stack_bottom: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("internal compiler error: query cycle when printing cycle detected")]
+pub(crate) struct NestedCycle {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub stack_bottom: NestedCycleBottom,
+    #[subdiagnostic]
+    pub cycle_stack: Vec<CycleStack>,
+    #[subdiagnostic]
+    pub stack_count: StackCount,
+    #[subdiagnostic]
+    pub cycle_usage: Option<CycleUsage>,
+    #[note(
         "see https://rustc-dev-guide.rust-lang.org/overview.html#queries and https://rustc-dev-guide.rust-lang.org/query.html for more information"
     )]
     pub note_span: (),

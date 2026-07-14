@@ -2,6 +2,13 @@ use test_utils::skip_slow_tests;
 
 use crate::support::Project;
 
+fn message_contains(message: &lsp_types::Message, p: &str) -> bool {
+    match message {
+        lsp_types::Message::String(s) => s.contains(p),
+        lsp_types::Message::MarkupContent(mc) => mc.value.contains(p),
+    }
+}
+
 #[test]
 fn test_flycheck_diagnostics_for_unused_variable() {
     if skip_slow_tests() {
@@ -29,7 +36,7 @@ fn main() {
 
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
@@ -63,7 +70,7 @@ fn main() {
     // Wait for the unused variable diagnostic to appear.
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
@@ -105,8 +112,50 @@ fn main() {}
 
     let diagnostics = server.wait_for_diagnostics();
     assert!(
-        diagnostics.diagnostics.iter().any(|d| d.message.contains("unused variable")),
+        diagnostics.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
         "expected unused variable diagnostic, got: {:?}",
         diagnostics.diagnostics,
     );
+}
+
+#[test]
+fn test_flycheck_diagnostics_with_override_command_cleared_after_fix() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    // Start with a program that is lint clean.
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/main.rs
+fn main() {}
+"#,
+    )
+    .with_config(serde_json::json!({
+        "checkOnSave": true,
+        "check": {
+        "overrideCommand": ["rustc", "--error-format=json", "$saved_file"]
+        }
+    }))
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    // Introduce an unused variable.
+    server.write_file_and_save("src/main.rs", "fn main() {\n    let x = 1;\n}\n".to_owned());
+
+    let diags = server.wait_for_diagnostics();
+    assert!(
+        diags.diagnostics.iter().any(|d| message_contains(&d.message, "unused variable")),
+        "expected unused variable diagnostic, got: {:?}",
+        diags.diagnostics,
+    );
+
+    // Fix it and verify that diagnostics are cleared.
+    server.write_file_and_save("src/main.rs", "fn main() {\n    let _x = 1;\n}\n".to_owned());
+    server.wait_for_diagnostics_cleared();
 }

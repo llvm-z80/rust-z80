@@ -1,5 +1,7 @@
+//@ aux-build: external-impl-restriction.rs
 #![feature(impl_restriction)]
-#![expect(incomplete_features)]
+
+extern crate external_impl_restriction as external;
 
 pub mod a {
     pub enum E {}
@@ -21,7 +23,7 @@ pub mod a {
 
         pub impl(in super::E) trait T6 {} //~ ERROR expected module, found enum `super::E` [E0577]
 
-        pub impl(in super::super::super) trait T7 {} //~ ERROR too many leading `super` keywords [E0433]
+        pub impl(in super::super::super) trait T7 {} //~ ERROR too many leading `super` keywords within `crate::a::b` [E0433]
 
         // OK paths
         pub impl(crate) trait T8 {}
@@ -51,7 +53,9 @@ pub impl(in crate::a::E) trait T14 {} //~ ERROR expected module, found enum `cra
 pub impl(crate) trait T15 {}
 pub impl(self) trait T16 {}
 
-pub impl(super) trait T17 {} //~ ERROR too many leading `super` keywords [E0433]
+pub impl(super) trait T17 {} //~ ERROR too many leading `super` keywords within `crate` [E0433]
+
+pub impl(in external) trait T18 {} //~ ERROR trait implementation can only be restricted to ancestor modules
 
 // Check if we can resolve paths referring to modules declared later.
 pub impl(in crate::j) trait L4 {} //~ ERROR trait implementation can only be restricted to ancestor modules

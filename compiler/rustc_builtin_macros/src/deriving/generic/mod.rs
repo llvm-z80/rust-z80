@@ -194,7 +194,7 @@ use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
 use thin_vec::{ThinVec, thin_vec};
 use ty::{Bounds, Path, Ref, Self_, Ty};
 
-use crate::{deriving, errors};
+use crate::{deriving, diagnostics};
 
 pub(crate) mod ty;
 
@@ -456,7 +456,7 @@ fn find_type_parameters(
         }
 
         fn visit_mac_call(&mut self, mac: &ast::MacCall) {
-            self.cx.dcx().emit_err(errors::DeriveMacroCall { span: mac.span() });
+            self.cx.dcx().emit_err(diagnostics::DeriveMacroCall { span: mac.span() });
         }
     }
 
@@ -493,7 +493,7 @@ impl<'a> TraitDef<'a> {
         match item {
             Annotatable::Item(item) => {
                 let is_packed = matches!(
-                    AttributeParser::parse_limited(cx.sess, &item.attrs, sym::repr, item.span, item.id, None),
+                    AttributeParser::parse_limited(cx.sess, &item.attrs, &[sym::repr]),
                     Some(Attribute::Parsed(AttributeKind::Repr { reprs, .. })) if reprs.iter().any(|(x, _)| matches!(x, ReprPacked(..)))
                 );
 
@@ -525,7 +525,7 @@ impl<'a> TraitDef<'a> {
                                 is_packed,
                             )
                         } else {
-                            cx.dcx().emit_err(errors::DeriveUnion { span: mitem.span });
+                            cx.dcx().emit_err(diagnostics::DeriveUnion { span: mitem.span });
                             return;
                         }
                     }
@@ -609,7 +609,6 @@ impl<'a> TraitDef<'a> {
                 vis: ast::Visibility {
                     span: self.span.shrink_to_lo(),
                     kind: ast::VisibilityKind::Inherited,
-                    tokens: None,
                 },
                 attrs: ast::AttrVec::new(),
                 kind: ast::AssocItemKind::Type(Box::new(ast::TyAlias {
@@ -617,7 +616,7 @@ impl<'a> TraitDef<'a> {
                     ident,
                     generics: Generics::default(),
                     after_where_clause: ast::WhereClause::default(),
-                    bounds: Vec::new(),
+                    bounds: ThinVec::new(),
                     ty: Some(type_def.to_ty(cx, self.span, type_ident, generics)),
                 })),
                 tokens: None,
@@ -639,7 +638,7 @@ impl<'a> TraitDef<'a> {
                     // Extra restrictions on the generics parameters to the
                     // type being derived upon.
                     let span = param.ident.span.with_ctxt(ctxt);
-                    let bounds: Vec<_> = self
+                    let bounds: ThinVec<_> = self
                         .additional_bounds
                         .iter()
                         .map(|p| {
@@ -723,7 +722,7 @@ impl<'a> TraitDef<'a> {
                     {
                         continue;
                     }
-                    let mut bounds: Vec<_> = self
+                    let mut bounds: ThinVec<_> = self
                         .additional_bounds
                         .iter()
                         .map(|p| {
@@ -831,7 +830,6 @@ impl<'a> TraitDef<'a> {
                                 .collect(),
                             },
                         )),
-                        tokens: None,
                     },
                     self.span,
                 ),
@@ -1027,7 +1025,7 @@ impl<'a> MethodDef<'a> {
 
             match ty {
                 // Selflike (`&Self`) arguments only occur in non-static methods.
-                Ref(box Self_, _) if !self.is_static() => selflike_args.push(arg_expr),
+                Ref(Self_, _) if !self.is_static() => selflike_args.push(arg_expr),
                 Self_ => cx.dcx().span_bug(span, "`Self` in non-return position"),
                 _ => nonselflike_args.push(arg_expr),
             }
@@ -1052,7 +1050,7 @@ impl<'a> MethodDef<'a> {
 
         let args = {
             let self_arg = explicit_self.map(|explicit_self| {
-                let ident = Ident::with_dummy_span(kw::SelfLower).with_span_pos(span);
+                let ident = Ident::new(kw::SelfLower, span);
                 ast::Param::from_self(ast::AttrVec::default(), explicit_self, ident)
             });
             let nonself_args =
@@ -1080,11 +1078,7 @@ impl<'a> MethodDef<'a> {
             id: ast::DUMMY_NODE_ID,
             attrs: self.attributes.clone(),
             span,
-            vis: ast::Visibility {
-                span: trait_lo_sp,
-                kind: ast::VisibilityKind::Inherited,
-                tokens: None,
-            },
+            vis: ast::Visibility { span: trait_lo_sp, kind: ast::VisibilityKind::Inherited },
             kind: ast::AssocItemKind::Fn(Box::new(ast::Fn {
                 defaultness,
                 sig,

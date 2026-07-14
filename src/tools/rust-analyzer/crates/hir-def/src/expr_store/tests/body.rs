@@ -652,11 +652,157 @@ fn async_fn_weird_param_patterns() {
 async fn main(&self, param1: i32, ref mut param2: i32, _: i32, param4 @ _: i32, 123: i32) {}
 "#,
         expect![[r#"
-        fn main(self, param1, mut param2, mut <ra@gennew>0, param4 @ _, mut <ra@gennew>1) async {
-            let ref mut param2 = param2;
-            let _ = <ra@gennew>0;
-            let 123 = <ra@gennew>1;
-            {}
-        }"#]],
+            fn main(self, mut param1, mut param2, mut <ra@gennew>0, mut param4, mut <ra@gennew>1) async {
+                let self = self;
+                let param1 = param1;
+                let mut param2 = param2;
+                let ref mut param2 = param2;
+                let mut <ra@gennew>0 = <ra@gennew>0;
+                let _ = <ra@gennew>0;
+                let mut param4 = param4;
+                let param4 @ _ = param4;
+                let mut <ra@gennew>1 = <ra@gennew>1;
+                let 123 = <ra@gennew>1;
+                {}
+            }"#]],
     )
+}
+
+#[test]
+fn array_element_cfg() {
+    pretty_print(
+        r#"
+fn foo() {
+    [
+        (),
+        #[cfg(false)]
+        ()
+    ];
+}
+    "#,
+        expect![[r#"
+        fn foo() {
+            [
+                (),
+            ];
+        }"#]],
+    );
+}
+
+#[test]
+fn block_tail_cfg() {
+    pretty_print(
+        r#"
+macro_rules! foo {
+    () => {
+        1
+    };
+}
+
+fn foo() -> i64 {
+    #[cfg(true)]
+    {
+        5
+    }
+    #[cfg(false)]
+    foo!()
+}
+    "#,
+        expect![[r#"
+            fn foo() {
+                {
+                    5
+                }
+            }"#]],
+    );
+    pretty_print(
+        r#"
+fn foo() -> i64 {
+    #[cfg(true)]
+    {
+        5
+    }
+    #[cfg(false)]
+    {
+        4
+    }
+    #[cfg(false)]
+    {
+        3
+    }
+}
+    "#,
+        expect![[r#"
+            fn foo() {
+                {
+                    5
+                }
+            }"#]],
+    );
+    pretty_print(
+        r#"
+macro_rules! m {
+    () => {
+        { 5 }
+        #[cfg(false)]
+        { 4 }
+    };
+}
+
+fn foo() -> i64 {
+    m!()
+}
+    "#,
+        expect![[r#"
+            fn foo() {
+                {
+                    5
+                }
+            }"#]],
+    );
+}
+
+#[test]
+fn weird_cfgs() {
+    pretty_print(
+        r#"
+macro_rules! falsify {
+    ( $($t:tt)* ) => { #[cfg(false)] $($t)* };
+}
+
+struct Foo();
+
+fn foo() {
+    foo(falsify!(1));
+    (falsify!(1),);
+    [falsify!(1)];
+    Foo(falsify!(1));
+    foo(#[cfg(false)] 1);
+    (#[cfg(false)] 1,);
+    [#[cfg(false)] 1];
+    Foo(#[cfg(false)] 1);
+    (|#[cfg(false)] a| {})();
+
+    builtin # asm(
+        "",
+        #[cfg(false)] x = const 4,
+        #[cfg(false)] options(),
+        #[cfg(false)] clobber_abi("C"),
+    );
+}
+    "#,
+        expect![[r#"
+            fn foo() {
+                foo();
+                ();
+                [];
+                Foo();
+                foo();
+                ();
+                [];
+                Foo();
+                (|| {})();
+                builtin#asm(_);
+            }"#]],
+    );
 }

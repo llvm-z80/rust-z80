@@ -953,7 +953,7 @@ You can match on the following names and values, using `name = "value"`:
    Only `"MainFunctionType"` is supported.
  - `from_desugaring`: Match against a particular variant of the `DesugaringKind` enum.
    The desugaring is identified by its variant name, for example
-   `"QuestionMark"` for `?` desugaring or `"TryBlock"` for `try` blocks.
+   `"QuestionMark"` for `?` desugaring, or `"TryBlock"` for `try` blocks.
  - `Self` and any generic arguments of the trait, like `Self = "alloc::string::String"`
    or `Rhs="i32"`.
 
@@ -964,6 +964,7 @@ The compiler can provide several values to match on, for example:
   - references to said slices and arrays.
   - `"fn"`, `"unsafe fn"` or `"#[target_feature] fn"` when self is a function.
   - `"{integer}"` and `"{float}"` if the type is a number but we haven't inferred it yet.
+  - `"{struct}"`, `"{enum}"` and `"{union}"` to match self as an ADT
   - combinations of the above, like `"[{integral}; _]"`.
 
 For example, the `Iterator` trait can be filtered in the following way:
@@ -1017,12 +1018,13 @@ pub trait From<T>: Sized {
 ### Formatting
 
 The string literals are format strings that accept parameters wrapped in braces
-but positional and listed parameters and format specifiers are not accepted.
+but positional and listed parameters are not accepted.
 The following parameter names are valid:
 - `Self` and all generic parameters of the trait.
 - `This`: the name of the trait the attribute is on, without generics.
-- `Trait`: the name of the "sugared" trait.
-  See `TraitRefPrintSugared`.
+- `This:path`: the full path of the trait the attribute is on, with unresolved generics.
+- `This:resolved`: the full path of the trait the attribute is on, with resolved generics.
+Additionally, this will "sugar" the `Fn(...)` traits.
 - `ItemContext`: the kind of `hir::Node` we're in, things like `"an async block"`,
    `"a function"`, `"an async function"`, etc.
 

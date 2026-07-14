@@ -43,7 +43,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             match *op {
                 InlineAsmOperandRef::Out { reg, late, place } => {
                     let is_target_supported = |reg_class: InlineAsmRegClass| {
-                        for &(_, feature) in reg_class.supported_types(asm_arch, true) {
+                        for &(_, feature) in reg_class.supported_types(asm_arch, true).as_ref() {
                             if let Some(feature) = feature {
                                 if self
                                     .tcx
@@ -229,6 +229,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 InlineAsmArch::AArch64 | InlineAsmArch::Arm64EC | InlineAsmArch::Arm => {
                     constraints.push("~{cc}".to_string());
                 }
+                InlineAsmArch::Amdgpu => {}
                 InlineAsmArch::X86 | InlineAsmArch::X86_64 => {
                     constraints.extend_from_slice(&[
                         "~{dirflag}".to_string(),
@@ -278,6 +279,7 @@ impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 }
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 | InlineAsmArch::Wasm64 => {}
+                InlineAsmArch::Xtensa => {}
                 InlineAsmArch::Bpf => {}
                 InlineAsmArch::Msp430 => {
                     constraints.push("~{sr}".to_string());
@@ -578,6 +580,52 @@ fn a64_vreg_index(reg: InlineAsmReg) -> Option<u32> {
     }
 }
 
+/// If the register is a Hexagon register pair then return its LLVM double register index.
+/// LLVM uses `d0`, `d1`, ... for Hexagon double registers in inline asm constraints,
+/// not the assembly-printed `r1:0`, `r3:2`, ... format.
+fn hexagon_reg_pair_index(reg: InlineAsmReg) -> Option<u32> {
+    match reg {
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r1_0) => Some(0),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r3_2) => Some(1),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r5_4) => Some(2),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r7_6) => Some(3),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r9_8) => Some(4),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r11_10) => Some(5),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r13_12) => Some(6),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r15_14) => Some(7),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r17_16) => Some(8),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r21_20) => Some(10),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r23_22) => Some(11),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r25_24) => Some(12),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::r27_26) => Some(13),
+        _ => None,
+    }
+}
+
+/// If the register is a Hexagon HVX vector pair then return its LLVM W-register index.
+/// LLVM uses `w0`, `w1`, ... for Hexagon vector pair registers in inline asm constraints.
+fn hexagon_vreg_pair_index(reg: InlineAsmReg) -> Option<u32> {
+    match reg {
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v1_0) => Some(0),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v3_2) => Some(1),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v5_4) => Some(2),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v7_6) => Some(3),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v9_8) => Some(4),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v11_10) => Some(5),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v13_12) => Some(6),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v15_14) => Some(7),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v17_16) => Some(8),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v19_18) => Some(9),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v21_20) => Some(10),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v23_22) => Some(11),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v25_24) => Some(12),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v27_26) => Some(13),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v29_28) => Some(14),
+        InlineAsmReg::Hexagon(HexagonInlineAsmReg::v31_30) => Some(15),
+        _ => None,
+    }
+}
+
 /// Converts a register class to an LLVM constraint code.
 fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) -> String {
     use InlineAsmRegClass::*;
@@ -627,6 +675,12 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
                     'q'
                 };
                 format!("{{{}{}}}", class, idx)
+            } else if let Some(idx) = hexagon_reg_pair_index(reg) {
+                // LLVM uses `dN` for Hexagon double registers, not the `rN+1:N` asm syntax.
+                format!("{{d{}}}", idx)
+            } else if let Some(idx) = hexagon_vreg_pair_index(reg) {
+                // LLVM uses `wN` for Hexagon HVX vector pair registers.
+                format!("{{w{}}}", idx)
             } else if reg == InlineAsmReg::Arm(ArmInlineAsmReg::r14) {
                 // LLVM doesn't recognize r14
                 "{lr}".to_string()
@@ -649,10 +703,18 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             | Arm(ArmInlineAsmRegClass::dreg_low8)
             | Arm(ArmInlineAsmRegClass::qreg_low4) => "x",
             Arm(ArmInlineAsmRegClass::dreg) | Arm(ArmInlineAsmRegClass::qreg) => "w",
+            Amdgpu(AmdgpuInlineAsmRegClass::Sgpr(_)) => "s",
+            Amdgpu(AmdgpuInlineAsmRegClass::Vgpr(_)) => "v",
             Hexagon(HexagonInlineAsmRegClass::reg) => "r",
+            Hexagon(HexagonInlineAsmRegClass::reg_pair) => "r",
             Hexagon(HexagonInlineAsmRegClass::preg) => unreachable!("clobber-only"),
+            Hexagon(HexagonInlineAsmRegClass::vreg) => "v",
+            Hexagon(HexagonInlineAsmRegClass::vreg_pair) => "v",
+            Hexagon(HexagonInlineAsmRegClass::qreg) => unreachable!("clobber-only"),
             LoongArch(LoongArchInlineAsmRegClass::reg) => "r",
-            LoongArch(LoongArchInlineAsmRegClass::freg) => "f",
+            LoongArch(LoongArchInlineAsmRegClass::freg)
+            | LoongArch(LoongArchInlineAsmRegClass::vreg)
+            | LoongArch(LoongArchInlineAsmRegClass::xreg) => "f",
             Mips(MipsInlineAsmRegClass::reg) => "r",
             Mips(MipsInlineAsmRegClass::freg) => "f",
             Nvptx(NvptxInlineAsmRegClass::reg16) => "h",
@@ -687,6 +749,11 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
                 | X86InlineAsmRegClass::kreg0
                 | X86InlineAsmRegClass::tmm_reg,
             ) => unreachable!("clobber-only"),
+            Xtensa(XtensaInlineAsmRegClass::freg) => "f",
+            Xtensa(XtensaInlineAsmRegClass::reg) => "r",
+            Xtensa(XtensaInlineAsmRegClass::sreg | XtensaInlineAsmRegClass::breg) => {
+                unreachable!("clobber-only")
+            }
             Wasm(WasmInlineAsmRegClass::local) => "r",
             Bpf(BpfInlineAsmRegClass::reg) => "r",
             Bpf(BpfInlineAsmRegClass::wreg) => "w",
@@ -752,8 +819,24 @@ fn modifier_to_llvm(
                 modifier
             }
         }
+        Amdgpu(_) => None,
         Hexagon(_) => None,
-        LoongArch(_) => None,
+        LoongArch(LoongArchInlineAsmRegClass::reg) => None,
+        LoongArch(LoongArchInlineAsmRegClass::freg) => modifier,
+        LoongArch(LoongArchInlineAsmRegClass::vreg) => {
+            if modifier.is_none() {
+                Some('w')
+            } else {
+                modifier
+            }
+        }
+        LoongArch(LoongArchInlineAsmRegClass::xreg) => {
+            if modifier.is_none() {
+                Some('u')
+            } else {
+                modifier
+            }
+        }
         Mips(_) => None,
         Nvptx(_) => None,
         PowerPC(PowerPCInlineAsmRegClass::vsreg) => {
@@ -794,6 +877,7 @@ fn modifier_to_llvm(
             | X86InlineAsmRegClass::kreg0
             | X86InlineAsmRegClass::tmm_reg,
         ) => unreachable!("clobber-only"),
+        Xtensa(_) => None,
         Wasm(WasmInlineAsmRegClass::local) => None,
         Bpf(_) => None,
         Avr(AvrInlineAsmRegClass::reg_pair)
@@ -833,10 +917,31 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         Arm(ArmInlineAsmRegClass::qreg)
         | Arm(ArmInlineAsmRegClass::qreg_low8)
         | Arm(ArmInlineAsmRegClass::qreg_low4) => cx.type_vector(cx.type_i64(), 2),
+        Amdgpu(_) => cx.type_i32(),
         Hexagon(HexagonInlineAsmRegClass::reg) => cx.type_i32(),
+        Hexagon(HexagonInlineAsmRegClass::reg_pair) => cx.type_i64(),
         Hexagon(HexagonInlineAsmRegClass::preg) => unreachable!("clobber-only"),
+        Hexagon(HexagonInlineAsmRegClass::vreg) => {
+            // HVX vector register size depends on the HVX mode.
+            // LLVM's "v" constraint requires the exact vector width.
+            if cx.tcx.sess.unstable_target_features.contains(&sym::hvx_length128b) {
+                cx.type_vector(cx.type_i32(), 32) // 1024-bit for 128B mode
+            } else {
+                cx.type_vector(cx.type_i32(), 16) // 512-bit for 64B mode
+            }
+        }
+        Hexagon(HexagonInlineAsmRegClass::vreg_pair) => {
+            if cx.tcx.sess.unstable_target_features.contains(&sym::hvx_length128b) {
+                cx.type_vector(cx.type_i32(), 64) // 2048-bit for 128B mode
+            } else {
+                cx.type_vector(cx.type_i32(), 32) // 1024-bit for 64B mode
+            }
+        }
+        Hexagon(HexagonInlineAsmRegClass::qreg) => unreachable!("clobber-only"),
         LoongArch(LoongArchInlineAsmRegClass::reg) => cx.type_i32(),
         LoongArch(LoongArchInlineAsmRegClass::freg) => cx.type_f32(),
+        LoongArch(LoongArchInlineAsmRegClass::vreg) => cx.type_vector(cx.type_i32(), 4),
+        LoongArch(LoongArchInlineAsmRegClass::xreg) => cx.type_vector(cx.type_i32(), 8),
         Mips(MipsInlineAsmRegClass::reg) => cx.type_i32(),
         Mips(MipsInlineAsmRegClass::freg) => cx.type_f32(),
         Nvptx(NvptxInlineAsmRegClass::reg16) => cx.type_i16(),
@@ -871,6 +976,11 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
             | X86InlineAsmRegClass::kreg0
             | X86InlineAsmRegClass::tmm_reg,
         ) => unreachable!("clobber-only"),
+        Xtensa(XtensaInlineAsmRegClass::reg) => cx.type_i32(),
+        Xtensa(XtensaInlineAsmRegClass::freg) => cx.type_f32(),
+        Xtensa(XtensaInlineAsmRegClass::sreg | XtensaInlineAsmRegClass::breg) => {
+            unreachable!("clobber-only")
+        }
         Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
         Bpf(BpfInlineAsmRegClass::reg) => cx.type_i64(),
         Bpf(BpfInlineAsmRegClass::wreg) => cx.type_i32(),

@@ -5,6 +5,7 @@ use ide_db::{
 };
 use syntax::{
     SyntaxKind, T,
+    algo::{next_non_trivia_token, previous_non_trivia_token},
     ast::{
         self, AstNode, HasArgList, HasAttrs, HasGenericParams, HasVisibility,
         syntax_factory::SyntaxFactory,
@@ -58,7 +59,7 @@ use crate::{
 // ```
 pub(crate) fn convert_tuple_struct_to_named_struct(
     acc: &mut Assists,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
 ) -> Option<()> {
     let strukt_or_variant = ctx
         .find_node_at_offset::<ast::Struct>()
@@ -86,32 +87,32 @@ pub(crate) fn convert_tuple_struct_to_named_struct(
         "Convert to named struct",
         target,
         |edit| {
-            let names = generate_names(tuple_fields.fields());
+            let editor = edit.make_editor(syntax);
+            let names = generate_names(tuple_fields.fields(), editor.make());
             edit_field_references(ctx, edit, tuple_fields.fields(), &names);
-            let mut editor = edit.make_editor(syntax);
             edit_struct_references(ctx, edit, strukt_def, &names);
-            edit_struct_def(&mut editor, &strukt_or_variant, tuple_fields, names);
+            edit_struct_def(&editor, &strukt_or_variant, tuple_fields, names);
             edit.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )
 }
 
 fn edit_struct_def(
-    editor: &mut SyntaxEditor,
+    editor: &SyntaxEditor,
     strukt: &Either<ast::Struct, ast::Variant>,
     tuple_fields: ast::TupleFieldList,
     names: Vec<ast::Name>,
 ) {
+    let make = editor.make();
     let record_fields = tuple_fields.fields().zip(names).filter_map(|(f, name)| {
-        let field = ast::make::record_field(f.visibility(), name, f.ty()?);
-        let mut field_editor = SyntaxEditor::new(field.syntax().clone());
+        let (field_editor, field) =
+            SyntaxEditor::with_ast_node(&make.record_field(f.visibility(), name, f.ty()?));
         field_editor.insert_all(
             Position::first_child_of(field.syntax()),
-            f.attrs().map(|attr| attr.syntax().clone_subtree().clone_for_update().into()).collect(),
+            f.attrs().map(|attr| attr.syntax().clone().into()).collect(),
         );
         ast::RecordField::cast(field_editor.finish().new_root().clone())
     });
-    let make = SyntaxFactory::without_mappings();
     let record_fields = make.record_field_list(record_fields);
     let tuple_fields_before = Position::before(tuple_fields.syntax());
 
@@ -119,28 +120,28 @@ fn edit_struct_def(
         if let Some(w) = strukt.where_clause() {
             editor.delete(w.syntax());
             let mut insert_element = Vec::new();
-            insert_element.push(ast::make::tokens::single_newline().syntax_element());
-            insert_element.push(w.syntax().clone_for_update().syntax_element());
+            insert_element.push(make.whitespace("\n").syntax_element());
+            insert_element.push(w.syntax().syntax_element());
             if w.syntax().last_token().is_none_or(|t| t.kind() != SyntaxKind::COMMA) {
-                insert_element.push(ast::make::token(T![,]).into());
+                insert_element.push(make.token(T![,]).into());
             }
-            insert_element.push(ast::make::tokens::single_newline().syntax_element());
+            insert_element.push(make.whitespace("\n").syntax_element());
             editor.insert_all(tuple_fields_before, insert_element);
         } else {
-            editor.insert(tuple_fields_before, ast::make::tokens::single_space());
+            editor.insert(tuple_fields_before, make.whitespace(" "));
         }
         if let Some(t) = strukt.semicolon_token() {
             editor.delete(t);
         }
     } else {
-        editor.insert(tuple_fields_before, ast::make::tokens::single_space());
+        editor.insert(tuple_fields_before, make.whitespace(" "));
     }
 
     editor.replace(tuple_fields.syntax(), record_fields.syntax());
 }
 
 fn edit_struct_references(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     edit: &mut SourceChangeBuilder,
     strukt: Either<hir::Struct, hir::EnumVariant>,
     names: &[ast::Name],
@@ -153,10 +154,10 @@ fn edit_struct_references(
 
     for (file_id, refs) in usages {
         let source = ctx.sema.parse(file_id);
-        let mut editor = edit.make_editor(source.syntax());
+        let editor = edit.make_editor(source.syntax());
 
         for r in refs {
-            process_struct_name_reference(ctx, r, &mut editor, &source, &strukt_def, names);
+            process_struct_name_reference(ctx, r, &editor, &source, &strukt_def, names);
         }
 
         edit.add_file_edits(file_id.file_id(ctx.db()), editor);
@@ -164,14 +165,14 @@ fn edit_struct_references(
 }
 
 fn process_struct_name_reference(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     r: FileReference,
-    editor: &mut SyntaxEditor,
+    editor: &SyntaxEditor,
     source: &ast::SourceFile,
     strukt_def: &Definition,
     names: &[ast::Name],
 ) -> Option<()> {
-    let make = SyntaxFactory::without_mappings();
+    let make = editor.make();
     let name_ref = r.name.as_name_ref()?;
     let path_segment = name_ref.syntax().parent().and_then(ast::PathSegment::cast)?;
     let full_path = path_segment.syntax().parent().and_then(ast::Path::cast)?.top_path();
@@ -186,12 +187,39 @@ fn process_struct_name_reference(
     match_ast! {
         match parent {
             ast::TupleStructPat(tuple_struct_pat) => {
-                let range = ctx.sema.original_range_opt(tuple_struct_pat.syntax())?.range;
-                let new = make.record_pat_with_fields(
-                    full_path,
-                    generate_record_pat_list(&tuple_struct_pat, names),
-                );
-                editor.replace_all(cover_edit_range(source.syntax(), range), vec![new.syntax().clone().into()]);
+                let (targets, rest_pat) = tuple_pat_field_targets(&tuple_struct_pat, names);
+
+                let mut first_insert = vec![];
+                for (pat, name) in targets {
+                    let range = ctx.sema.original_range_opt(pat.syntax())?.range;
+                    let place = cover_edit_range(source.syntax(), range);
+                    let elements = vec![
+                        make.name_ref(&name.text()).syntax().clone().into(),
+                        make.token(T![:]).into(),
+                        make.whitespace(" ").into(),
+                    ];
+                    if first_insert.is_empty() {
+                        // XXX: SyntaxEditor cannot insert after deleted element
+                        first_insert = elements;
+                    } else {
+                        editor.insert_all(Position::before(place.start()), elements);
+                    }
+                }
+
+                // Record patterns only allow `..` as the trailing field, so it can't stay
+                // in place like the other fields; relocate it to just before the closing brace.
+                let mut trailing_insert = vec![];
+                if let Some(rest_pat) = rest_pat {
+                    if !first_insert.is_empty() {
+                        trailing_insert.push(make.token(T![,]).into());
+                        trailing_insert.push(make.whitespace(" ").into());
+                    }
+                    trailing_insert.push(make.rest_pat().syntax().clone().into());
+                    delete_rest_pat(ctx, source, editor, &rest_pat);
+                }
+
+                let (l_paren, r_paren) = tuple_struct_pat_parens(ctx, source, &tuple_struct_pat)?;
+                process_delimiter(editor, l_paren, r_paren, first_insert, trailing_insert);
             },
             ast::PathExpr(path_expr) => {
                 let call_expr = path_expr.syntax().parent().and_then(ast::CallExpr::cast)?;
@@ -220,7 +248,11 @@ fn process_struct_name_reference(
                         editor.insert_all(Position::before(place.start()), elements);
                     }
                 }
-                process_delimiter(ctx, source, editor, &arg_list, first_insert);
+                let range = ctx.sema.original_range_opt(arg_list.syntax())?.range;
+                let place = cover_edit_range(source.syntax(), range);
+                let l_paren = first_token_of(place.start().clone())?;
+                let r_paren = last_token_of(place.end().clone())?;
+                process_delimiter(editor, l_paren, r_paren, first_insert, vec![]);
             },
             _ => {}
         }
@@ -229,28 +261,14 @@ fn process_struct_name_reference(
 }
 
 fn process_delimiter(
-    ctx: &AssistContext<'_>,
-    source: &ast::SourceFile,
-    editor: &mut SyntaxEditor,
-    list: &impl AstNode,
+    editor: &SyntaxEditor,
+    l_paren: syntax::SyntaxToken,
+    r_paren: syntax::SyntaxToken,
     first_insert: Vec<syntax::SyntaxElement>,
+    trailing_insert: Vec<syntax::SyntaxElement>,
 ) {
-    let Some(range) = ctx.sema.original_range_opt(list.syntax()) else { return };
-    let place = cover_edit_range(source.syntax(), range.range);
-
-    let l_paren = match place.start() {
-        syntax::NodeOrToken::Node(node) => node.first_token(),
-        syntax::NodeOrToken::Token(t) => Some(t.clone()),
-    };
-    let r_paren = match place.end() {
-        syntax::NodeOrToken::Node(node) => node.last_token(),
-        syntax::NodeOrToken::Token(t) => Some(t.clone()),
-    };
-
-    let make = SyntaxFactory::without_mappings();
-    if let Some(l_paren) = l_paren
-        && l_paren.kind() == T!['(']
-    {
+    let make = editor.make();
+    if l_paren.kind() == T!['('] {
         let mut open_delim = vec![
             make.whitespace(" ").into(),
             make.token(T!['{']).into(),
@@ -259,18 +277,69 @@ fn process_delimiter(
         open_delim.extend(first_insert);
         editor.replace_with_many(l_paren, open_delim);
     }
-    if let Some(r_paren) = r_paren
-        && r_paren.kind() == T![')']
-    {
-        editor.replace_with_many(
-            r_paren,
-            vec![make.whitespace(" ").into(), make.token(T!['}']).into()],
-        );
+    if r_paren.kind() == T![')'] {
+        let mut close_delim = trailing_insert;
+        close_delim.push(make.whitespace(" ").into());
+        close_delim.push(make.token(T!['}']).into());
+        editor.replace_with_many(r_paren, close_delim);
     }
 }
 
+fn first_token_of(elem: syntax::SyntaxElement) -> Option<syntax::SyntaxToken> {
+    match elem {
+        syntax::NodeOrToken::Node(node) => node.first_token(),
+        syntax::NodeOrToken::Token(t) => Some(t),
+    }
+}
+
+fn last_token_of(elem: syntax::SyntaxElement) -> Option<syntax::SyntaxToken> {
+    match elem {
+        syntax::NodeOrToken::Node(node) => node.last_token(),
+        syntax::NodeOrToken::Token(t) => Some(t),
+    }
+}
+
+/// Locates the `(` and `)` delimiting `pat`'s fields, skipping over its path. Unlike
+/// [`ast::ArgList`], a [`ast::TupleStructPat`] has no dedicated field-list node to anchor on.
+fn tuple_struct_pat_parens(
+    ctx: &AssistContext<'_, '_>,
+    source: &ast::SourceFile,
+    pat: &ast::TupleStructPat,
+) -> Option<(syntax::SyntaxToken, syntax::SyntaxToken)> {
+    let path_range = ctx.sema.original_range_opt(pat.path()?.syntax())?.range;
+    let l_paren =
+        next_non_trivia_token(cover_edit_range(source.syntax(), path_range).end().clone())?;
+
+    let pat_range = ctx.sema.original_range_opt(pat.syntax())?.range;
+    let r_paren = last_token_of(cover_edit_range(source.syntax(), pat_range).end().clone())?;
+    Some((l_paren, r_paren))
+}
+
+/// Deletes `rest_pat` along with exactly one neighboring comma, so the surviving fields
+/// keep a single separator between them (the caller re-inserts `..` at the new position).
+fn delete_rest_pat(
+    ctx: &AssistContext<'_, '_>,
+    source: &ast::SourceFile,
+    editor: &SyntaxEditor,
+    rest_pat: &ast::RestPat,
+) -> Option<()> {
+    let range = ctx.sema.original_range_opt(rest_pat.syntax())?.range;
+    let place = cover_edit_range(source.syntax(), range);
+    editor.delete_all(place.clone());
+
+    let following = next_non_trivia_token(place.end().clone()).filter(|t| t.kind() == T![,]);
+    let preceding = previous_non_trivia_token(place.start().clone()).filter(|t| t.kind() == T![,]);
+    if let Some(comma) = following.or(preceding) {
+        if let Some(ws) = comma.next_token().filter(|t| t.kind() == SyntaxKind::WHITESPACE) {
+            editor.delete(ws);
+        }
+        editor.delete(comma);
+    }
+    Some(())
+}
+
 fn edit_field_references(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     edit: &mut SourceChangeBuilder,
     fields: impl Iterator<Item = ast::TupleField>,
     names: &[ast::Name],
@@ -284,7 +353,7 @@ fn edit_field_references(
         let usages = def.usages(&ctx.sema).all();
         for (file_id, refs) in usages {
             let source = ctx.sema.parse(file_id);
-            let mut editor = edit.make_editor(source.syntax());
+            let editor = edit.make_editor(source.syntax());
             for r in refs {
                 if let Some(name_ref) = r.name.as_name_ref()
                     && let Some(original) = ctx.sema.original_range_opt(name_ref.syntax())
@@ -300,8 +369,10 @@ fn edit_field_references(
     }
 }
 
-fn generate_names(fields: impl Iterator<Item = ast::TupleField>) -> Vec<ast::Name> {
-    let make = SyntaxFactory::without_mappings();
+fn generate_names(
+    fields: impl Iterator<Item = ast::TupleField>,
+    make: &SyntaxFactory,
+) -> Vec<ast::Name> {
     fields
         .enumerate()
         .map(|(i, _)| {
@@ -311,22 +382,21 @@ fn generate_names(fields: impl Iterator<Item = ast::TupleField>) -> Vec<ast::Nam
         .collect()
 }
 
-fn generate_record_pat_list(
+/// Pairs each non-`..` field with its generated name. The `..` rest pattern (if any) has
+/// no name and is returned separately, since it needs different handling (see [`delete_rest_pat`]).
+fn tuple_pat_field_targets(
     pat: &ast::TupleStructPat,
     names: &[ast::Name],
-) -> ast::RecordPatFieldList {
+) -> (Vec<(ast::Pat, ast::Name)>, Option<ast::RestPat>) {
     let pure_fields = pat.fields().filter(|p| !matches!(p, ast::Pat::RestPat(_)));
     let rest_len = names.len().saturating_sub(pure_fields.clone().count());
     let rest_pat = pat.fields().find_map(|p| ast::RestPat::cast(p.syntax().clone()));
     let rest_idx =
         pat.fields().position(|p| ast::RestPat::can_cast(p.syntax().kind())).unwrap_or(names.len());
-    let before_rest = pat.fields().zip(names).take(rest_idx);
-    let after_rest = pure_fields.zip(names.iter().skip(rest_len)).skip(rest_idx);
+    let before_rest = pat.fields().zip(names.iter().cloned()).take(rest_idx);
+    let after_rest = pure_fields.zip(names.iter().skip(rest_len).cloned()).skip(rest_idx);
 
-    let fields = before_rest
-        .chain(after_rest)
-        .map(|(pat, name)| ast::make::record_pat_field(ast::make::name_ref(&name.text()), pat));
-    ast::make::record_pat_field_list(fields, rest_pat)
+    (before_rest.chain(after_rest).collect(), rest_pat)
 }
 
 #[cfg(test)]
@@ -800,7 +870,6 @@ fn test(t: T) {
     }
 
     #[test]
-    #[ignore = "FIXME overlap edits in nested uses self"]
     fn convert_pat_uses_self() {
         check_assist(
             convert_tuple_struct_to_named_struct,

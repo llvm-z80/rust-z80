@@ -39,7 +39,6 @@ use crate::visitor::FmtVisitor;
 const DEFAULT_VISIBILITY: ast::Visibility = ast::Visibility {
     kind: ast::VisibilityKind::Inherited,
     span: DUMMY_SP,
-    tokens: None,
 };
 
 fn type_annotation_separator(config: &Config) -> &str {
@@ -960,6 +959,7 @@ fn format_impl_ref_and_type(
 
     if let Some(of_trait) = of_trait.as_deref() {
         result.push_str(format_defaultness(of_trait.defaultness));
+        result.push_str(format_constness(*constness));
         result.push_str(format_safety(of_trait.safety));
     } else {
         result.push_str(format_constness(*constness));
@@ -980,7 +980,6 @@ fn format_impl_ref_and_type(
 
     let trait_ref_overhead;
     if let Some(of_trait) = of_trait.as_deref() {
-        result.push_str(format_constness_right(*constness));
         let polarity_str = match of_trait.polarity {
             ast::ImplPolarity::Negative(_) => "!",
             ast::ImplPolarity::Positive => "",
@@ -1155,10 +1154,10 @@ pub(crate) fn format_trait(
     offset: Indent,
 ) -> RewriteResult {
     let ast::Trait {
+        ref impl_restriction,
         constness,
         is_auto,
         safety,
-        ref impl_restriction,
         ident,
         ref generics,
         ref bounds,
@@ -1169,10 +1168,10 @@ pub(crate) fn format_trait(
     let header = format!(
         "{}{}{}{}{}trait ",
         format_visibility(context, &item.vis),
+        format_impl_restriction(context, impl_restriction),
         format_constness(constness),
         format_safety(safety),
         format_auto(is_auto),
-        format_impl_restriction(context, impl_restriction),
     );
     result.push_str(&header);
 
@@ -1889,15 +1888,16 @@ pub(crate) fn rewrite_struct_field_prefix(
     field: &ast::FieldDef,
 ) -> RewriteResult {
     let vis = format_visibility(context, &field.vis);
+    let mut_restriction = format_mut_restriction(context, &field.mut_restriction);
     let safety = format_safety(field.safety);
     let type_annotation_spacing = type_annotation_spacing(context.config);
     Ok(match field.ident {
         Some(name) => format!(
-            "{vis}{safety}{}{}:",
+            "{vis}{mut_restriction}{safety}{}{}:",
             rewrite_ident(context, name),
             type_annotation_spacing.0
         ),
-        None => format!("{vis}{safety}"),
+        None => format!("{vis}{mut_restriction}{safety}"),
     })
 }
 

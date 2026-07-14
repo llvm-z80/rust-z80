@@ -5,10 +5,6 @@ expression: test --skip=tests
 [Test] test::Tidy
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/tools/tidy})
-[Test] test::Coverage
-    targets: [aarch64-unknown-linux-gnu]
-    - Set({test::coverage-map})
-    - Set({test::coverage-run})
 [Test] test::CodegenCranelift
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::compiler/rustc_codegen_cranelift})
@@ -109,8 +105,7 @@ expression: test --skip=tests
     - Set({test::compiler/rustc_windows_rc})
 [Test] test::CrateRustdoc
     targets: [x86_64-unknown-linux-gnu]
-    - Set({test::src/librustdoc})
-    - Set({test::src/tools/rustdoc})
+    - Set({test::src/librustdoc, test::src/tools/rustdoc})
 [Test] test::CrateRustdocJsonTypes
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/rustdoc-json-types})
@@ -145,6 +140,9 @@ expression: test --skip=tests
 [Test] test::RustcBook
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/doc/rustc})
+[Test] test::StdarchVerify
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({test::library/stdarch/crates/stdarch-verify})
 [Test] test::RustdocTheme
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/tools/rustdoc-themes})

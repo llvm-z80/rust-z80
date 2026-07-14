@@ -8,8 +8,8 @@
 //! * Functions called by the compiler itself.
 
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_macros::{BlobDecodable, Encodable, HashStable_Generic, PrintAttribute};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
+use rustc_macros::{BlobDecodable, Encodable, PrintAttribute, StableHash};
 use rustc_span::{Symbol, kw, sym};
 
 use crate::attrs::PrintAttribute;
@@ -18,7 +18,7 @@ use crate::{MethodKind, Target};
 
 /// All of the lang items, defined or not.
 /// Defined lang items can come from the current crate or its dependencies.
-#[derive(HashStable_Generic, Debug)]
+#[derive(StableHash, Debug)]
 pub struct LanguageItems {
     /// Mappings from lang items to their possibly found [`DefId`]s.
     /// The index corresponds to the order in [`LangItem`].
@@ -65,6 +65,11 @@ impl LanguageItems {
             .iter()
             .enumerate()
             .filter_map(|(i, id)| id.map(|id| (LangItem::from_u32(i as u32).unwrap(), id)))
+    }
+
+    /// Remove any missing items from the list that aren't actually missing
+    pub fn trim_missing(&mut self) {
+        self.missing.retain(|&item| self.items[item as usize].is_none());
     }
 }
 
@@ -144,8 +149,8 @@ macro_rules! language_item_table {
     }
 }
 
-impl<CTX> HashStable<CTX> for LangItem {
-    fn hash_stable(&self, _: &mut CTX, hasher: &mut StableHasher) {
+impl StableHash for LangItem {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, hasher: &mut StableHasher) {
         ::std::hash::Hash::hash(self, hasher);
     }
 }
@@ -221,6 +226,7 @@ language_item_table! {
     UnsafeCell,              sym::unsafe_cell,         unsafe_cell_type,           Target::Struct,         GenericRequirement::None;
     UnsafePinned,            sym::unsafe_pinned,       unsafe_pinned_type,         Target::Struct,         GenericRequirement::None;
 
+    VaArgSafe,               sym::va_arg_safe,         va_arg_safe,                Target::Trait,          GenericRequirement::None;
     VaList,                  sym::va_list,             va_list,                    Target::Struct,         GenericRequirement::None;
 
     Deref,                   sym::deref,               deref_trait,                Target::Trait,          GenericRequirement::Exact(0);
@@ -285,7 +291,7 @@ language_item_table! {
     PanicMisalignedPointerDereference, sym::panic_misaligned_pointer_dereference, panic_misaligned_pointer_dereference_fn, Target::Fn, GenericRequirement::Exact(0);
     PanicInfo,               sym::panic_info,          panic_info,                 Target::Struct,         GenericRequirement::None;
     PanicLocation,           sym::panic_location,      panic_location,             Target::Struct,         GenericRequirement::None;
-    PanicImpl,               sym::panic_impl,          panic_impl,                 Target::Fn,             GenericRequirement::None;
+    PanicImpl,               sym::panic_impl,          panic_impl,                 Target::ForeignFn,      GenericRequirement::None;
     PanicCannotUnwind,       sym::panic_cannot_unwind, panic_cannot_unwind,        Target::Fn,             GenericRequirement::Exact(0);
     PanicInCleanup,          sym::panic_in_cleanup,    panic_in_cleanup,           Target::Fn,             GenericRequirement::Exact(0);
     /// Constant panic messages, used for codegen of MIR asserts.
@@ -308,6 +314,7 @@ language_item_table! {
     PanicAsyncGenFnResumedPanic, sym::panic_const_async_gen_fn_resumed_panic, panic_const_async_gen_fn_resumed_panic, Target::Fn, GenericRequirement::None;
     PanicGenFnNonePanic, sym::panic_const_gen_fn_none_panic, panic_const_gen_fn_none_panic, Target::Fn, GenericRequirement::None;
     PanicNullPointerDereference, sym::panic_null_pointer_dereference, panic_null_pointer_dereference, Target::Fn, GenericRequirement::None;
+    PanicNullReferenceConstructed, sym::panic_null_reference_constructed, panic_null_reference_constructed, Target::Fn, GenericRequirement::None;
     PanicInvalidEnumConstruction, sym::panic_invalid_enum_construction, panic_invalid_enum_construction, Target::Fn, GenericRequirement::None;
     PanicCoroutineResumedDrop, sym::panic_const_coroutine_resumed_drop, panic_const_coroutine_resumed_drop, Target::Fn, GenericRequirement::None;
     PanicAsyncFnResumedDrop, sym::panic_const_async_fn_resumed_drop, panic_const_async_fn_resumed_drop, Target::Fn, GenericRequirement::None;
@@ -320,7 +327,8 @@ language_item_table! {
     FormatArgument,          sym::format_argument,     format_argument,            Target::Struct,         GenericRequirement::None;
     FormatArguments,         sym::format_arguments,    format_arguments,           Target::Struct,         GenericRequirement::None;
 
-    DropInPlace,             sym::drop_in_place,       drop_in_place_fn,           Target::Fn,             GenericRequirement::Minimum(1);
+    // Compiler-generated drop glue function, aka `core::ptr::drop_glue`
+    DropGlue,                sym::drop_glue,           drop_glue_fn,               Target::Fn,             GenericRequirement::Exact(1);
     AllocLayout,             sym::alloc_layout,        alloc_layout,               Target::Struct,         GenericRequirement::None;
 
     /// For all binary crates without `#![no_main]`, Rust will generate a "main" function.
@@ -330,7 +338,6 @@ language_item_table! {
     Start,                   sym::start,               start_fn,                   Target::Fn,             GenericRequirement::Exact(1);
 
     EhPersonality,           sym::eh_personality,      eh_personality,             Target::Fn,             GenericRequirement::None;
-    EhCatchTypeinfo,         sym::eh_catch_typeinfo,   eh_catch_typeinfo,          Target::Static,         GenericRequirement::None;
 
     // Profiling markers for move/copy operations (used by -Z annotate-moves)
     CompilerMove,            sym::compiler_move,       compiler_move_fn,           Target::Fn,             GenericRequirement::Exact(2);
@@ -435,7 +442,7 @@ language_item_table! {
 
     // Reborrowing related lang-items
     Reborrow,                sym::reborrow,            reborrow,                   Target::Trait,          GenericRequirement::Exact(0);
-    CoerceShared,            sym::coerce_shared,       coerce_shared,              Target::Trait,          GenericRequirement::Exact(0);
+    CoerceShared,            sym::coerce_shared,       coerce_shared,              Target::Trait,          GenericRequirement::Exact(1);
 
     // Field representing types.
     FieldRepresentingType,   sym::field_representing_type, field_representing_type,    Target::Struct,         GenericRequirement::Exact(3);
@@ -443,6 +450,17 @@ language_item_table! {
     FieldBase,               sym::field_base,              field_base,                 Target::AssocTy,        GenericRequirement::Exact(0);
     FieldType,               sym::field_type,              field_type,                 Target::AssocTy,        GenericRequirement::Exact(0);
     FieldOffset,             sym::field_offset,            field_offset,               Target::AssocConst,     GenericRequirement::Exact(0);
+
+    // Used to fallback `{float}` to `f32` when `f32: From<{float}>`
+    From,                    sym::From,                from_trait,                 Target::Trait,          GenericRequirement::Exact(1);
+
+    // Runtime symbols
+    MemCpy,                  sym::memcpy_fn,           memcpy_fn,                  Target::ForeignFn,             GenericRequirement::None;
+    MemMove,                 sym::memmove_fn,          memmove_fn,                 Target::ForeignFn,             GenericRequirement::None;
+    MemSet,                  sym::memset_fn,           memset_fn,                  Target::ForeignFn,             GenericRequirement::None;
+    MemCmp,                  sym::memcmp_fn,           memcmp_fn,                  Target::ForeignFn,             GenericRequirement::None;
+    Bcmp,                    sym::bcmp_fn,             bcmp_fn,                    Target::ForeignFn,             GenericRequirement::None;
+    StrLen,                  sym::strlen_fn,           strlen_fn,                  Target::ForeignFn,             GenericRequirement::None;
 }
 
 /// The requirement imposed on the generics of a lang item

@@ -3,7 +3,7 @@ use std::hash::Hash;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def_id::DefIndex;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::ty::{Binder, EarlyBinder};
+use rustc_middle::ty::{Binder, EarlyBinder, GenericArg, Region};
 use rustc_span::Symbol;
 
 use crate::rmeta::{LazyArray, LazyValue};
@@ -48,6 +48,14 @@ impl<T: ParameterizedOverTcx> ParameterizedOverTcx for LazyArray<T> {
     type Value<'tcx> = LazyArray<T::Value<'tcx>>;
 }
 
+impl ParameterizedOverTcx for Region<'static> {
+    type Value<'tcx> = Region<'tcx>;
+}
+
+impl ParameterizedOverTcx for GenericArg<'static> {
+    type Value<'tcx> = GenericArg<'tcx>;
+}
+
 macro_rules! trivially_parameterized_over_tcx {
     ($($ty:ty),+ $(,)?) => {
         $(
@@ -61,6 +69,7 @@ macro_rules! trivially_parameterized_over_tcx {
 
 trivially_parameterized_over_tcx! {
     bool,
+    u32,
     u64,
     usize,
     std::string::String,
@@ -70,6 +79,7 @@ trivially_parameterized_over_tcx! {
     crate::rmeta::CrateHeader,
     crate::rmeta::CrateRoot,
     crate::rmeta::IncoherentImpls,
+    crate::rmeta::ProcMacroKind,
     crate::rmeta::RawDefId,
     crate::rmeta::TraitImpls,
     crate::rmeta::VariantData,
@@ -120,6 +130,7 @@ trivially_parameterized_over_tcx! {
     rustc_middle::ty::adjustment::CoerceUnsizedInfo,
     rustc_middle::ty::fast_reject::SimplifiedType,
     rustc_session::config::TargetModifier,
+    rustc_session::config::mitigation_coverage::DeniedPartialMitigation,
     rustc_session::cstore::ForeignModule,
     rustc_session::cstore::LinkagePreference,
     rustc_session::cstore::NativeLib,

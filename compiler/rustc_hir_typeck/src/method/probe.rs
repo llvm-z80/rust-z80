@@ -18,7 +18,7 @@ use rustc_middle::ty::elaborate::supertrait_def_ids;
 use rustc_middle::ty::fast_reject::{DeepRejectCtxt, TreatParams, simplify_type};
 use rustc_middle::ty::{
     self, AssocContainer, AssocItem, GenericArgs, GenericArgsRef, GenericParamDefKind, ParamEnvAnd,
-    Ty, TyCtxt, TypeVisitableExt, Upcast,
+    Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint;
@@ -26,7 +26,7 @@ use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::edit_distance::{
     edit_distance_with_substrings, find_best_match_for_name_with_substrings,
 };
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
+use rustc_span::{DUMMY_SP, Ident, Span, Symbol};
 use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
 use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::solve::Goal;
@@ -86,6 +86,15 @@ pub(crate) struct ProbeContext<'a, 'tcx> {
     /// machinery, since we don't particularly care about, for example, similarly named
     /// candidates if we're *reporting* similarly named candidates.
     is_suggestion: IsSuggestion,
+
+    /// Hack for applying method probing routine for arbitrary types
+    /// in order to get adjustments as if they were at receiver position.
+    /// Used only for delegation's `Self` arguments mapping.
+    /// FIXME(fn_delegation): now this hack is used, however in perfect world
+    /// we would like to separate adjustments finding logic from probe context,
+    /// if we do so we will be able to find wanted adjustments given only two
+    /// types without reusing the whole method probing routine
+    self_ty_override: Option<Ty<'tcx>>,
 }
 
 impl<'a, 'tcx> Deref for ProbeContext<'a, 'tcx> {
@@ -259,10 +268,10 @@ pub(crate) enum Mode {
     Path,
 }
 
-#[derive(PartialEq, Eq, Copy, Clone, Debug)]
-pub(crate) enum ProbeScope {
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) enum ProbeScope<'tcx> {
     // Single candidate coming from pre-resolved delegation method.
-    Single(DefId),
+    Single(DefId, Option<Ty<'tcx>> /* self_ty override */),
 
     // Assemble candidates coming only from traits in scope.
     TraitsInScope,
@@ -330,7 +339,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         is_suggestion: IsSuggestion,
         self_ty: Ty<'tcx>,
         scope_expr_id: HirId,
-        scope: ProbeScope,
+        scope: ProbeScope<'tcx>,
     ) -> PickResult<'tcx> {
         self.probe_op(
             item_name.span,
@@ -354,7 +363,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         is_suggestion: IsSuggestion,
         self_ty: Ty<'tcx>,
         scope_expr_id: HirId,
-        scope: ProbeScope,
+        scope: ProbeScope<'tcx>,
     ) -> Result<Vec<Candidate<'tcx>>, MethodError<'tcx>> {
         self.probe_op(
             item_name.span,
@@ -384,7 +393,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         is_suggestion: IsSuggestion,
         self_ty: Ty<'tcx>,
         scope_expr_id: HirId,
-        scope: ProbeScope,
+        scope: ProbeScope<'tcx>,
         op: OP,
     ) -> Result<R, MethodError<'tcx>>
     where
@@ -511,7 +520,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             && !self.tcx.features().arbitrary_self_types();
 
                         let mut err = self.err_ctxt().emit_inference_failure_err(
-                            self.body_id,
+                            self.body_def_id,
                             err_span,
                             ty.into(),
                             TypeAnnotationNeeded::E0282,
@@ -556,7 +565,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     probe_cx.assemble_inherent_candidates();
                     probe_cx.assemble_extension_candidates_for_all_traits();
                 }
-                ProbeScope::Single(def_id) => {
+                ProbeScope::Single(def_id, self_ty_override) => {
                     let item = self.tcx.associated_item(def_id);
                     // FIXME(fn_delegation): Delegation to inherent methods is not yet supported.
                     assert_eq!(item.container, AssocContainer::Trait);
@@ -567,6 +576,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let trait_args = self.fresh_args_for_item(trait_span, trait_def_id);
                     let trait_ref = ty::TraitRef::new_from_args(self.tcx, trait_def_id, trait_args);
 
+                    probe_cx.self_ty_override = self_ty_override;
                     probe_cx.push_candidate(
                         Candidate {
                             item,
@@ -782,6 +792,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             static_candidates: RefCell::new(Vec::new()),
             scope_expr_id,
             is_suggestion,
+            self_ty_override: None,
         }
     }
 
@@ -810,9 +821,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     fn push_candidate(&mut self, candidate: Candidate<'tcx>, is_inherent: bool) {
         let is_accessible = if let Some(name) = self.method_name {
             let item = candidate.item;
-            let hir_id = self.tcx.local_def_id_to_hir_id(self.body_id);
+            let container_id = item.container_id(self.tcx);
             let def_scope =
-                self.tcx.adjust_ident_and_get_scope(name, item.container_id(self.tcx), hir_id).1;
+                self.tcx.adjust_ident_and_get_scope(name, container_id, self.body_def_id).1;
             item.visibility(self.tcx).is_accessible_from(def_scope, self.tcx)
         } else {
             true
@@ -995,12 +1006,12 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         // We use `DeepRejectCtxt` here which may return false positive on where clauses
         // with alias self types. We need to later on reject these as inherent candidates
         // in `consider_probe`.
-        let bounds = self.param_env.caller_bounds().iter().filter_map(|predicate| {
-            let bound_predicate = predicate.kind();
-            match bound_predicate.skip_binder() {
+        let bounds = self.param_env.caller_bounds().iter().filter_map(|clause| {
+            let bound_clause = clause.kind();
+            match bound_clause.skip_binder() {
                 ty::ClauseKind::Trait(trait_predicate) => DeepRejectCtxt::relate_rigid_rigid(tcx)
                     .types_may_unify(param_ty, trait_predicate.trait_ref.self_ty())
-                    .then(|| bound_predicate.rebind(trait_predicate.trait_ref)),
+                    .then(|| bound_clause.rebind(trait_predicate.trait_ref)),
                 ty::ClauseKind::RegionOutlives(_)
                 | ty::ClauseKind::TypeOutlives(_)
                 | ty::ClauseKind::Projection(_)
@@ -1073,7 +1084,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         match method.kind {
             ty::AssocKind::Fn { .. } => self.probe(|_| {
                 let args = self.fresh_args_for_item(self.span, method.def_id);
-                let fty = self.tcx.fn_sig(method.def_id).instantiate(self.tcx, args);
+                let fty =
+                    self.tcx.fn_sig(method.def_id).instantiate(self.tcx, args).skip_norm_wip();
                 let fty = self.instantiate_binder_with_fresh_vars(
                     self.span,
                     BoundRegionConversionTime::FnCall,
@@ -1880,13 +1892,19 @@ impl<'tcx> Pick<'tcx> {
 }
 
 impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
-    fn select_trait_candidate(
+    fn select_trait_candidate_for_diagnostics(
         &self,
         trait_ref: ty::TraitRef<'tcx>,
     ) -> traits::SelectionResult<'tcx, traits::Selection<'tcx>> {
         let obligation =
             traits::Obligation::new(self.tcx, self.misc(self.span), self.param_env, trait_ref);
-        traits::SelectionContext::new(self).select(&obligation)
+        let candidate = traits::SelectionContext::new(self).select(&obligation);
+        if let Ok(Some(traits::ImplSource::UserDefined(impl_source_user_defined_data))) = &candidate
+            && self.infcx.tcx.do_not_recommend_impl(impl_source_user_defined_data.impl_def_id)
+        {
+            return Err(traits::SelectionError::Unimplemented);
+        }
+        candidate
     }
 
     /// Used for ambiguous method call error reporting. Uses probing that throws away the result internally,
@@ -1914,7 +1932,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     xform_self_ty,
                     self_ty,
                 );
-                match self.select_trait_candidate(trait_ref) {
+                match self.select_trait_candidate_for_diagnostics(trait_ref) {
                     Ok(Some(traits::ImplSource::UserDefined(ref impl_data))) => {
                         // If only a single impl matches, make the error message point
                         // to that impl.
@@ -1935,7 +1953,6 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         }
     }
 
-    #[instrument(level = "debug", skip(self, possibly_unsatisfied_predicates), ret)]
     fn consider_probe(
         &self,
         self_ty: Ty<'tcx>,
@@ -1971,10 +1988,15 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
             match probe.kind {
                 InherentImplCandidate { impl_def_id, .. } => {
                     let impl_args = self.fresh_args_for_item(self.span, impl_def_id);
-                    let impl_ty = self.tcx.type_of(impl_def_id).instantiate(self.tcx, impl_args);
+                    let impl_ty = self
+                        .tcx
+                        .type_of(impl_def_id)
+                        .instantiate(self.tcx, impl_args)
+                        .skip_norm_wip();
                     (xform_self_ty, xform_ret_ty) =
                         self.xform_self_ty(probe.item, impl_ty, impl_args);
-                    xform_self_ty = ocx.normalize(cause, self.param_env, xform_self_ty);
+                    xform_self_ty =
+                        ocx.normalize(cause, self.param_env, Unnormalized::new_wip(xform_self_ty));
                     match ocx.relate(cause, self.param_env, self.variance(), self_ty, xform_self_ty)
                     {
                         Ok(()) => {}
@@ -1984,12 +2006,12 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                         }
                     }
                     // FIXME: Weirdly, we normalize the ret ty in this candidate, but no other candidates.
-                    xform_ret_ty = ocx.normalize(cause, self.param_env, xform_ret_ty);
+                    xform_ret_ty =
+                        ocx.normalize(cause, self.param_env, Unnormalized::new_wip(xform_ret_ty));
                     // Check whether the impl imposes obligations we have to worry about.
                     let impl_def_id = probe.item.container_id(self.tcx);
                     let impl_bounds =
                         self.tcx.predicates_of(impl_def_id).instantiate(self.tcx, impl_args);
-                    let impl_bounds = ocx.normalize(cause, self.param_env, impl_bounds);
                     // Convert the bounds into obligations.
                     ocx.register_obligations(traits::predicates_for_generics(
                         |idx, span| {
@@ -2001,6 +2023,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                             );
                             self.cause(self.span, code)
                         },
+                        |pred| ocx.normalize(cause, self.param_env, pred),
                         self.param_env,
                         impl_bounds,
                     ));
@@ -2033,17 +2056,19 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                         BoundRegionConversionTime::FnCall,
                         poly_trait_ref,
                     );
-                    let trait_ref = ocx.normalize(cause, self.param_env, trait_ref);
+                    let trait_ref =
+                        ocx.normalize(cause, self.param_env, Unnormalized::new_wip(trait_ref));
                     (xform_self_ty, xform_ret_ty) =
                         self.xform_self_ty(probe.item, trait_ref.self_ty(), trait_ref.args);
-                    xform_self_ty = ocx.normalize(cause, self.param_env, xform_self_ty);
+                    xform_self_ty =
+                        ocx.normalize(cause, self.param_env, Unnormalized::new_wip(xform_self_ty));
                     match self_ty.kind() {
                         // HACK: opaque types will match anything for which their bounds hold.
                         // Thus we need to prevent them from trying to match the `&_` autoref
                         // candidates that get created for `&self` trait methods.
-                        ty::Alias(ty::Opaque, alias_ty)
+                        &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. })
                             if !self.next_trait_solver()
-                                && self.infcx.can_define_opaque_ty(alias_ty.def_id)
+                                && self.infcx.can_define_opaque_ty(def_id)
                                 && !xform_self_ty.is_ty_var() =>
                         {
                             return ProbeResult::NoMatch;
@@ -2075,7 +2100,9 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                         ocx.register_obligation(obligation);
                     } else {
                         result = ProbeResult::NoMatch;
-                        if let Ok(Some(candidate)) = self.select_trait_candidate(trait_ref) {
+                        if let Ok(Some(candidate)) =
+                            self.select_trait_candidate_for_diagnostics(trait_ref)
+                        {
                             for nested_obligation in candidate.nested_obligations() {
                                 if !self.infcx.predicate_may_hold(&nested_obligation) {
                                     possibly_unsatisfied_predicates.push((
@@ -2103,25 +2130,19 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                         // `WhereClauseCandidate` requires that the self type is a param,
                         // because it has special behavior with candidate preference as an
                         // inherent pick.
-                        match ocx.structurally_normalize_ty(
+                        let ty = ocx.normalize(
                             cause,
                             self.param_env,
-                            trait_ref.self_ty(),
-                        ) {
-                            Ok(ty) => {
-                                if !matches!(ty.kind(), ty::Param(_)) {
-                                    debug!("--> not a param ty: {xform_self_ty:?}");
-                                    return ProbeResult::NoMatch;
-                                }
-                            }
-                            Err(errors) => {
-                                debug!("--> cannot relate self-types {:?}", errors);
-                                return ProbeResult::NoMatch;
-                            }
+                            Unnormalized::new_wip(trait_ref.self_ty()),
+                        );
+                        if !matches!(ty.kind(), ty::Param(_)) {
+                            debug!("--> not a param ty: {xform_self_ty:?}");
+                            return ProbeResult::NoMatch;
                         }
                     }
 
-                    xform_self_ty = ocx.normalize(cause, self.param_env, xform_self_ty);
+                    xform_self_ty =
+                        ocx.normalize(cause, self.param_env, Unnormalized::new_wip(xform_self_ty));
                     match ocx.relate(cause, self.param_env, self.variance(), self_ty, xform_self_ty)
                     {
                         Ok(()) => {}
@@ -2184,7 +2205,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                 // but `self.return_type` is only set on the diagnostic-path, so we
                 // should be okay doing it here.
                 if !matches!(probe.kind, InherentImplCandidate { .. }) {
-                    xform_ret_ty = ocx.normalize(&cause, self.param_env, xform_ret_ty);
+                    xform_ret_ty =
+                        ocx.normalize(&cause, self.param_env, Unnormalized::new_wip(xform_ret_ty));
                 }
 
                 debug!("comparing return_ty {:?} with xform ret ty {:?}", return_ty, xform_ret_ty);
@@ -2355,6 +2377,10 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     /// multiple conflicting picks if there is one pick whose trait container is a subtrait
     /// of the trait containers of all of the other picks.
     ///
+    /// This is the method-probe analogue of
+    /// `rustc_hir_analysis::hir_ty_lowering::HirTyLowerer::collapse_candidates_to_subtrait_pick`;
+    /// keep both implementations in sync.
+    ///
     /// This implements RFC #3624.
     fn collapse_candidates_to_subtrait_pick(
         &self,
@@ -2377,8 +2403,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     continue;
                 }
 
-                // This pick is not a supertrait of the `child_pick`.
-                // Check if it's a subtrait of the `child_pick`, instead.
+                // This candidate is not a supertrait of the `child_trait`.
+                // Check if it's a subtrait of the `child_trait`, instead.
                 // If it is, then it must have been a subtrait of every
                 // other pick we've eliminated at this point. It will
                 // take over at this point.
@@ -2392,7 +2418,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     continue;
                 }
 
-                // `child_pick` is not a supertrait of this pick.
+                // Neither `child_trait` or the current candidate are
+                // supertraits of each other.
                 // Don't bail here, since we may be comparing two supertraits
                 // of a common subtrait. These two supertraits won't be related
                 // at all, but we will pick them up next round when we find their
@@ -2535,7 +2562,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     ) -> (Ty<'tcx>, Option<Ty<'tcx>>) {
         if item.is_fn() && self.mode == Mode::MethodCall {
             let sig = self.xform_method_sig(item.def_id, args);
-            (sig.inputs()[0], Some(sig.output()))
+            (self.self_ty_override.unwrap_or(sig.inputs()[0]), Some(sig.output()))
         } else {
             (impl_ty, None)
         }
@@ -2557,7 +2584,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         assert_eq!(args.len(), generics.parent_count);
 
         let xform_fn_sig = if generics.is_own_empty() {
-            fn_sig.instantiate(self.tcx, args)
+            fn_sig.instantiate(self.tcx, args).skip_norm_wip()
         } else {
             let args = GenericArgs::for_item(self.tcx, method, |param, _| {
                 let i = param.index as usize;
@@ -2575,7 +2602,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     }
                 }
             });
-            fn_sig.instantiate(self.tcx, args)
+            fn_sig.instantiate(self.tcx, args).skip_norm_wip()
         };
 
         self.tcx.instantiate_bound_regions_with_erased(xform_fn_sig)
@@ -2591,38 +2618,25 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     }
 
     /// Determine if the associated item with the given DefId matches
-    /// the desired name via a doc alias.
+    /// the desired name via a doc alias or rustc_confusables
     fn matches_by_doc_alias(&self, def_id: DefId) -> bool {
         let Some(method) = self.method_name else {
             return false;
         };
-        let Some(local_def_id) = def_id.as_local() else {
-            return false;
-        };
-        let hir_id = self.fcx.tcx.local_def_id_to_hir_id(local_def_id);
-        let attrs = self.fcx.tcx.hir_attrs(hir_id);
 
-        if let Some(d) = find_attr!(attrs, Doc(d) => d)
+        if let Some(d) = find_attr!(self.tcx, def_id, Doc(d) => d)
             && d.aliases.contains_key(&method.name)
         {
             return true;
         }
 
-        for attr in attrs {
-            if attr.has_name(sym::rustc_confusables) {
-                let Some(confusables) = attr.meta_item_list() else {
-                    continue;
-                };
-                // #[rustc_confusables("foo", "bar"))]
-                for n in confusables {
-                    if let Some(lit) = n.lit()
-                        && method.name == lit.symbol
-                    {
-                        return true;
-                    }
-                }
-            }
+        if let Some(confusables) =
+            find_attr!(self.tcx, def_id, RustcConfusables{ confusables } => confusables)
+            && confusables.contains(&method.name)
+        {
+            return true;
         }
+
         false
     }
 

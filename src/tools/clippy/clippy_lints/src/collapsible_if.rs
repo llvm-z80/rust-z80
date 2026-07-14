@@ -1,8 +1,8 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use clippy_utils::msrvs::Msrv;
-use clippy_utils::source::{HasSession, IntoSpan as _, SpanRangeExt, snippet, snippet_block_with_applicability};
-use clippy_utils::{can_use_if_let_chains, span_contains_non_whitespace, sym, tokenize_with_text};
+use clippy_utils::source::{IntoSpan as _, SpanExt, snippet, snippet_block_with_applicability};
+use clippy_utils::{can_use_if_let_chains, span_contains_cfg, span_contains_non_whitespace, sym, tokenize_with_text};
 use rustc_ast::{BinOpKind, MetaItemInner};
 use rustc_errors::Applicability;
 use rustc_hir::{Block, Expr, ExprKind, StmtKind};
@@ -140,6 +140,8 @@ impl CollapsibleIf {
 
                     // Prevent "elseif"
                     // Check that the "else" is followed by whitespace
+                    // Note: We intentionally use char::is_whitespace instead of rustc_lexer::is_whitespace here to
+                    // avoid visual issues with zero-width spaces. See ui tests.
                     let requires_space = snippet(cx, up_to_else, "..").ends_with(|c: char| !c.is_whitespace());
                     let mut applicability = Applicability::MachineApplicable;
                     diag.span_suggestion(
@@ -169,6 +171,11 @@ impl CollapsibleIf {
             && self.eligible_condition(cx, check_inner)
             && expr.span.eq_ctxt(inner.span)
             && self.check_significant_tokens_and_expect_attrs(cx, then, inner, sym::collapsible_if)
+            && let then_closing_bracket = {
+                let end = then.span.shrink_to_hi();
+                end.with_lo(end.lo() - BytePos(1))
+            }
+            && !span_contains_cfg(cx, inner.span.between(then_closing_bracket))
         {
             span_lint_hir_and_then(
                 cx,
@@ -178,12 +185,7 @@ impl CollapsibleIf {
                 "this `if` statement can be collapsed",
                 |diag| {
                     let then_open_bracket = then.span.split_at(1).0.with_leading_whitespace(cx).into_span();
-                    let then_closing_bracket = {
-                        let end = then.span.shrink_to_hi();
-                        end.with_lo(end.lo() - BytePos(1))
-                            .with_leading_whitespace(cx)
-                            .into_span()
-                    };
+                    let then_closing_bracket = then_closing_bracket.with_leading_whitespace(cx).into_span();
                     let (paren_start, inner_if_span, paren_end) = peel_parens(cx, inner.span);
                     let inner_if = inner_if_span.split_at(2).0;
                     let mut sugg = vec![
@@ -238,7 +240,7 @@ impl CollapsibleIf {
             },
 
             [attr]
-                if matches!(Level::from_attr(attr), Some((Level::Expect, _)))
+                if matches!(Level::from_opt_symbol(attr.name()), Some(Level::Expect))
                     && let Some(metas) = attr.meta_item_list()
                     && let Some(MetaItemInner::MetaItem(meta_item)) = metas.first()
                     && let [tool, lint_name] = meta_item.path.segments.as_slice()
@@ -317,7 +319,7 @@ pub(super) fn parens_around(expr: &Expr<'_>) -> Vec<(Span, String)> {
     }
 }
 
-fn span_extract_keyword(cx: &impl HasSession, span: Span, keyword: &str) -> Option<Span> {
+fn span_extract_keyword(cx: &LateContext<'_>, span: Span, keyword: &str) -> Option<Span> {
     span.with_source_text(cx, |snippet| {
         tokenize_with_text(snippet)
             .filter(|(t, s, _)| matches!(t, TokenKind::Ident if *s == keyword))
@@ -333,7 +335,7 @@ fn span_extract_keyword(cx: &impl HasSession, span: Span, keyword: &str) -> Opti
 }
 
 /// Peel the parentheses from an `if` expression, e.g. `((if true {} else {}))`.
-pub(super) fn peel_parens(cx: &impl HasSession, mut span: Span) -> (Span, Span, Span) {
+pub(super) fn peel_parens(cx: &LateContext<'_>, mut span: Span) -> (Span, Span, Span) {
     use crate::rustc_span::Pos;
 
     let start = span.shrink_to_lo();

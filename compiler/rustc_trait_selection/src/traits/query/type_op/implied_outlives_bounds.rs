@@ -7,7 +7,7 @@ use rustc_infer::traits::query::type_op::ImpliedOutlivesBounds;
 use rustc_middle::infer::canonical::CanonicalQueryResponse;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::outlives::{Component, push_outlives_components};
-use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{self, ParamEnvAnd, Ty, TyCtxt, TypeVisitable, TypeVisitor, Unnormalized};
 use rustc_span::def_id::CRATE_DEF_ID;
 use rustc_span::{DUMMY_SP, Span, sym};
 use smallvec::{SmallVec, smallvec};
@@ -73,7 +73,11 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
     // for example, if we have some constrained param type like `T: Trait<Out = U>`,
     // and we know that `&'a T::Out` is WF, then we want to imply `U: 'a`.
     let normalized_ty = ocx
-        .deeply_normalize(&ObligationCause::dummy_with_span(span), param_env, ty)
+        .deeply_normalize(
+            &ObligationCause::dummy_with_span(span),
+            param_env,
+            Unnormalized::new_wip(ty),
+        )
         .map_err(|_| NoSolution)?;
 
     // Sometimes when we ask what it takes for T: WF, we get back that
@@ -94,14 +98,13 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
         // From the full set of obligations, just filter down to the region relationships.
         for obligation in
             wf::unnormalized_obligations(ocx.infcx, param_env, arg, DUMMY_SP, CRATE_DEF_ID)
-                .into_iter()
-                .flatten()
+                .into_flat_iter()
         {
             let pred = ocx
                 .deeply_normalize(
                     &ObligationCause::dummy_with_span(span),
                     param_env,
-                    obligation.predicate,
+                    Unnormalized::new_wip(obligation.predicate),
                 )
                 .map_err(|_| NoSolution)?;
             let Some(pred) = pred.kind().no_bound_vars() else {
@@ -121,8 +124,7 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
                 | ty::PredicateKind::ConstEquate(..)
                 | ty::PredicateKind::Ambiguous
                 | ty::PredicateKind::NormalizesTo(..)
-                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
-                | ty::PredicateKind::AliasRelate(..) => {}
+                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_)) => {}
 
                 // We need to search through *all* WellFormed predicates
                 ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {

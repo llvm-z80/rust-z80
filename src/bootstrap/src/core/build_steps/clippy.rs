@@ -13,8 +13,6 @@
 //! to pass a prebuilt Clippy from the outside when running `cargo clippy`, but that would be
 //! (as usual) a massive undertaking/refactoring.
 
-use build_helper::exit;
-
 use super::compile::{ArtifactKeepMode, run_cargo, rustc_cargo, std_cargo};
 use super::tool::{SourceType, prepare_tool_cargo};
 use crate::builder::{Builder, ShouldRun};
@@ -23,7 +21,7 @@ use crate::core::build_steps::compile::std_crates_for_run_make;
 use crate::core::builder;
 use crate::core::builder::{Alias, Kind, RunConfig, Step, StepMetadata, crate_description};
 use crate::utils::build_stamp::{self, BuildStamp};
-use crate::{Compiler, Mode, Subcommand, TargetSelection};
+use crate::{Compiler, Mode, Subcommand, TargetSelection, exit};
 
 /// Disable the most spammy clippy lints
 const IGNORED_RULES_FOR_STD_AND_RUSTC: &[&str] = &[
@@ -607,6 +605,7 @@ impl Step for CI {
                 "clippy::single_char_add_str".into(),
                 "clippy::to_string_in_format_args".into(),
                 "clippy::unconditional_recursion".into(),
+                "clippy::mem_replace_with_default".into(),
             ],
             forbid: vec![],
         };

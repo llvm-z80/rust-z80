@@ -1,5 +1,5 @@
 use either::Either;
-use hir::{HasSource, HirDisplay, Semantics, VariantId, db::ExpandDatabase};
+use hir::{HasSource, HirDisplay, Semantics, VariantId};
 use ide_db::text_edit::TextEdit;
 use ide_db::{EditionedFileId, RootDatabase, source_change::SourceChange};
 use syntax::{
@@ -15,7 +15,7 @@ use crate::{
 // Diagnostic: no-such-field
 //
 // This diagnostic is triggered if created structure does not have field provided in record.
-pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Diagnostic {
+pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Diagnostic {
     let (code, message) = if d.private.is_some() {
         ("E0451", "field is private")
     } else if let VariantId::EnumVariantId(_) = d.variant {
@@ -30,9 +30,9 @@ pub(crate) fn no_such_field(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) 
         .with_fixes(fixes(ctx, d))
 }
 
-fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
+fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NoSuchField) -> Option<Vec<Assist>> {
     // FIXME: quickfix for pattern
-    let root = ctx.sema.db.parse_or_expand(d.field.file_id);
+    let root = d.field.file_id.parse_or_expand(ctx.sema.db);
     match &d.field.value.to_node(&root) {
         Either::Left(node) => {
             if let Some(private_field) = d.private {
@@ -116,14 +116,13 @@ fn missing_record_expr_field_fixes(
 
     let mut new_field = new_field.to_string();
     // FIXME: check submodule instead of FileId
-    if usage_file_id != def_file_id && !matches!(def_id, hir::Variant::EnumVariant(_)) {
-        new_field = format!("pub(crate) {new_field}");
-    }
-    new_field = format!("\n{indent}{new_field}{postfix}");
-
-    if needs_comma {
-        new_field = format!(",{new_field}");
-    }
+    let vis = if usage_file_id != def_file_id && !matches!(def_id, hir::Variant::EnumVariant(_)) {
+        "pub(crate) "
+    } else {
+        ""
+    };
+    let comma = if needs_comma { "," } else { "" };
+    new_field = format!("{comma}\n{indent}{vis}{new_field}{postfix}");
 
     let source_change = SourceChange::from_text_edit(
         def_file_id.file_id(sema.db),

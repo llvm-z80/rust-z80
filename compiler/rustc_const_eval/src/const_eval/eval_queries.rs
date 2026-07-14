@@ -8,7 +8,7 @@ use rustc_middle::mir::{self, ConstAlloc, ConstValue};
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{HasTypingEnv, TyAndLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable};
 use rustc_middle::{bug, throw_inval};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
@@ -21,7 +21,34 @@ use crate::interpret::{
     InterpResult, MPlaceTy, MemoryKind, OpTy, RefTracking, ReturnContinuation, create_static_alloc,
     intern_const_alloc_recursive, interp_ok, throw_exhaust,
 };
-use crate::{CTRL_C_RECEIVED, errors};
+use crate::{CTRL_C_RECEIVED, diagnostics};
+
+fn retry_codegen_mode_with_postanalysis<'tcx, K: TypeVisitable<TyCtxt<'tcx>>, V>(
+    key: ty::PseudoCanonicalInput<'tcx, K>,
+    f: impl FnOnce(ty::PseudoCanonicalInput<'tcx, K>) -> Result<V, ErrorHandled>,
+) -> Option<Result<V, ErrorHandled>> {
+    let ty::PseudoCanonicalInput { typing_env, value } = key;
+    match typing_env.typing_mode().assert_not_erased() {
+        // We are in codegen. It's very likely this constant has been evaluated in PostAnalysis
+        // before. Try to reuse this evaluation, and only re-run if we hit a `TooGeneric` error.
+        ty::TypingMode::Codegen => {
+            let with_postanalysis =
+                ty::TypingEnv::new(typing_env.param_env, ty::TypingMode::PostAnalysis);
+            let with_postanalysis = f(with_postanalysis.as_query_input(value));
+            match with_postanalysis {
+                Ok(_) | Err(ErrorHandled::Reported(..)) => return Some(with_postanalysis),
+                Err(ErrorHandled::TooGeneric(_)) => {}
+            }
+        }
+        ty::TypingMode::Coherence
+        | ty::TypingMode::Typeck { .. }
+        | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+        | ty::TypingMode::PostBorrowck { .. }
+        | ty::TypingMode::PostAnalysis => {}
+    }
+
+    None
+}
 
 fn setup_for_eval<'tcx>(
     ecx: &mut CompileTimeInterpCx<'tcx>,
@@ -37,7 +64,6 @@ fn setup_for_eval<'tcx>(
                     | DefKind::Static { .. }
                     | DefKind::ConstParam
                     | DefKind::AnonConst
-                    | DefKind::InlineConst
                     | DefKind::AssocConst { .. }
             ),
         "Unexpected DefKind: {:?}",
@@ -70,7 +96,8 @@ fn eval_body_using_ecx<'tcx, R: InterpretationResult<'tcx>>(
     body: &'tcx mir::Body<'tcx>,
 ) -> InterpResult<'tcx, R> {
     let tcx = *ecx.tcx;
-    let layout = ecx.layout_of(body.bound_return_ty().instantiate(tcx, cid.instance.args))?;
+    let layout = ecx
+        .layout_of(body.bound_return_ty(tcx).instantiate(tcx, cid.instance.args).skip_norm_wip())?;
     let (intern_kind, ret) = setup_for_eval(ecx, cid, layout)?;
 
     trace!(
@@ -134,28 +161,31 @@ fn intern_and_validate<'tcx, R: InterpretationResult<'tcx>>(
         Ok(()) => {}
         Err(InternError::DanglingPointer) => {
             throw_inval!(AlreadyReported(ReportedErrorInfo::non_const_eval_error(
-                ecx.tcx
-                    .dcx()
-                    .emit_err(errors::DanglingPtrInFinal { span: ecx.tcx.span, kind: intern_kind }),
+                ecx.tcx.dcx().emit_err(diagnostics::DanglingPtrInFinal {
+                    span: ecx.tcx.span,
+                    kind: intern_kind
+                }),
             )));
         }
         Err(InternError::BadMutablePointer) => {
             throw_inval!(AlreadyReported(ReportedErrorInfo::non_const_eval_error(
-                ecx.tcx
-                    .dcx()
-                    .emit_err(errors::MutablePtrInFinal { span: ecx.tcx.span, kind: intern_kind }),
+                ecx.tcx.dcx().emit_err(diagnostics::MutablePtrInFinal {
+                    span: ecx.tcx.span,
+                    kind: intern_kind
+                }),
             )));
         }
         Err(InternError::ConstAllocNotGlobal) => {
             throw_inval!(AlreadyReported(ReportedErrorInfo::non_const_eval_error(
-                ecx.tcx.dcx().emit_err(errors::ConstHeapPtrInFinal { span: ecx.tcx.span }),
+                ecx.tcx.dcx().emit_err(diagnostics::ConstHeapPtrInFinal { span: ecx.tcx.span }),
             )));
         }
         Err(InternError::PartialPointer) => {
             throw_inval!(AlreadyReported(ReportedErrorInfo::non_const_eval_error(
-                ecx.tcx
-                    .dcx()
-                    .emit_err(errors::PartialPtrInFinal { span: ecx.tcx.span, kind: intern_kind }),
+                ecx.tcx.dcx().emit_err(diagnostics::PartialPtrInFinal {
+                    span: ecx.tcx.span,
+                    kind: intern_kind
+                }),
             )));
         }
     }
@@ -326,9 +356,18 @@ pub fn eval_to_const_value_raw_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::PseudoCanonicalInput<'tcx, GlobalId<'tcx>>,
 ) -> ::rustc_middle::mir::interpret::EvalToConstValueResult<'tcx> {
+    crate::assert_typing_mode(key.typing_env.typing_mode());
+
     if let Some((value, _ty)) = tcx.trivial_const(key.value.instance.def_id()) {
         return Ok(value);
     }
+
+    if let Some(retry) =
+        retry_codegen_mode_with_postanalysis(key, |key| tcx.eval_to_const_value_raw(key))
+    {
+        return retry;
+    }
+
     tcx.eval_to_allocation_raw(key).map(|val| turn_into_const_value(tcx, val, key))
 }
 
@@ -368,12 +407,17 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::PseudoCanonicalInput<'tcx, GlobalId<'tcx>>,
 ) -> ::rustc_middle::mir::interpret::EvalToAllocationRawResult<'tcx> {
+    crate::assert_typing_mode(key.typing_env.typing_mode());
+    if let Some(retry) =
+        retry_codegen_mode_with_postanalysis(key, |key| tcx.eval_to_allocation_raw(key))
+    {
+        return retry;
+    }
+
     // This shouldn't be used for statics, since statics are conceptually places,
     // not values -- so what we do here could break pointer identity.
     assert!(key.value.promoted.is_some() || !tcx.is_static(key.value.instance.def_id()));
-    // Const eval always happens in PostAnalysis mode . See the comment in
-    // `InterpCx::new` for more details.
-    debug_assert_eq!(key.typing_env.typing_mode, ty::TypingMode::PostAnalysis);
+
     if cfg!(debug_assertions) {
         // Make sure we format the instance even if we do not print it.
         // This serves as a regression test against an ICE on printing.
@@ -491,7 +535,7 @@ fn report_validation_error<'tcx>(
     let bytes = ecx.print_alloc_bytes_for_diagnostics(alloc_id);
     let info = ecx.get_alloc_info(alloc_id);
     let raw_bytes =
-        errors::RawBytesNote { size: info.size.bytes(), align: info.align.bytes(), bytes };
+        diagnostics::RawBytesNote { size: info.size.bytes(), align: info.align.bytes(), bytes };
 
     crate::const_eval::report(ecx, error, move |diag, span, frames| {
         diag.span_label(span, "it is undefined behavior to use this value");

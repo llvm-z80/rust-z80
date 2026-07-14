@@ -1,14 +1,14 @@
 use rustc_abi::{BackendRepr, Float, Integer, Primitive, RegKind};
 use rustc_hir::attrs::{InstructionSetAttr, Linkage};
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_middle::mir::mono::{MonoItemData, Visibility};
 use rustc_middle::mir::{InlineAsmOperand, START_BLOCK};
+use rustc_middle::mono::{MonoItemData, Visibility};
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::{bug, ty};
 use rustc_span::sym;
 use rustc_target::callconv::{ArgAbi, FnAbi, PassMode};
-use rustc_target::spec::{Arch, BinaryFormat};
+use rustc_target::spec::{Arch, BinaryFormat, Env, Os};
 
 use crate::common;
 use crate::mir::AsmCodegenMethods;
@@ -67,7 +67,7 @@ fn inline_to_global_operand<'a, 'tcx, Cx: LayoutOf<'tcx, LayoutOfResult = TyAndL
                 .instantiate_mir_and_normalize_erasing_regions(
                     cx.tcx(),
                     cx.typing_env(),
-                    ty::EarlyBinder::bind(value.const_),
+                    ty::EarlyBinder::bind(cx.tcx(), value.const_),
                 )
                 .eval(cx.tcx(), cx.typing_env(), value.span)
                 .expect("erroneous constant missed by mono item collection");
@@ -75,7 +75,7 @@ fn inline_to_global_operand<'a, 'tcx, Cx: LayoutOf<'tcx, LayoutOfResult = TyAndL
             let mono_type = instance.instantiate_mir_and_normalize_erasing_regions(
                 cx.tcx(),
                 cx.typing_env(),
-                ty::EarlyBinder::bind(value.ty()),
+                ty::EarlyBinder::bind(cx.tcx(), value.ty()),
             );
 
             let string = common::asm_const_to_str(
@@ -91,13 +91,17 @@ fn inline_to_global_operand<'a, 'tcx, Cx: LayoutOf<'tcx, LayoutOfResult = TyAndL
             let mono_type = instance.instantiate_mir_and_normalize_erasing_regions(
                 cx.tcx(),
                 cx.typing_env(),
-                ty::EarlyBinder::bind(value.ty()),
+                ty::EarlyBinder::bind(cx.tcx(), value.ty()),
             );
 
             let instance = match mono_type.kind() {
-                &ty::FnDef(def_id, args) => {
-                    Instance::expect_resolve(cx.tcx(), cx.typing_env(), def_id, args, value.span)
-                }
+                &ty::FnDef(def_id, args) => Instance::expect_resolve(
+                    cx.tcx(),
+                    cx.typing_env(),
+                    def_id,
+                    args.no_bound_vars().unwrap(),
+                    value.span,
+                ),
                 _ => bug!("asm sym is not a function"),
             };
 
@@ -128,6 +132,8 @@ fn prefix_and_suffix<'tcx>(
 
     let is_arm = tcx.sess.target.arch == Arch::Arm;
     let is_thumb = tcx.sess.unstable_target_features.contains(&sym::thumb_mode);
+    let function_sections =
+        tcx.sess.opts.unstable_opts.function_sections.unwrap_or(tcx.sess.target.function_sections);
 
     // If we're compiling the compiler-builtins crate, e.g., the equivalent of
     // compiler-rt, then we want to implicitly compile everything with hidden
@@ -141,8 +147,14 @@ fn prefix_and_suffix<'tcx>(
     let attrs = tcx.codegen_instance_attrs(instance.def);
     let link_section = attrs.link_section.map(|symbol| symbol.as_str().to_string());
 
-    // If no alignment is specified, an alignment of 4 bytes is used.
-    let align_bytes = attrs.alignment.map(|a| a.bytes()).unwrap_or(4);
+    // Pick a default alignment when the alignment is not explicitly specified.
+    let align_bytes = match attrs.alignment {
+        Some(align) => align.bytes(),
+        None => match asm_binary_format {
+            BinaryFormat::Coff => 16,
+            _ => 4,
+        },
+    };
 
     // In particular, `.arm` can also be written `.code 32` and `.thumb` as `.code 16`.
     let (arch_prefix, arch_suffix) = if is_arm {
@@ -212,8 +224,6 @@ fn prefix_and_suffix<'tcx>(
     let mut end = String::new();
     match asm_binary_format {
         BinaryFormat::Elf => {
-            let section = link_section.unwrap_or_else(|| format!(".text.{asm_name}"));
-
             let progbits = match is_arm {
                 true => "%progbits",
                 false => "@progbits",
@@ -224,7 +234,13 @@ fn prefix_and_suffix<'tcx>(
                 false => "@function",
             };
 
-            writeln!(begin, ".pushsection {section},\"ax\", {progbits}").unwrap();
+            if let Some(section) = &link_section {
+                writeln!(begin, ".pushsection {section},\"ax\", {progbits}").unwrap();
+            } else if function_sections {
+                writeln!(begin, ".pushsection .text.{asm_name},\"ax\", {progbits}").unwrap();
+            } else {
+                writeln!(begin, ".text").unwrap();
+            }
             writeln!(begin, ".balign {align_bytes}").unwrap();
             write_linkage(&mut begin).unwrap();
             match visibility {
@@ -243,14 +259,22 @@ fn prefix_and_suffix<'tcx>(
             // pattern match on assembly generated by LLVM.
             writeln!(end, ".Lfunc_end_{asm_name}:").unwrap();
             writeln!(end, ".size {asm_name}, . - {asm_name}").unwrap();
-            writeln!(end, ".popsection").unwrap();
+            if link_section.is_some() || function_sections {
+                writeln!(end, ".popsection").unwrap();
+            }
             if !arch_suffix.is_empty() {
                 writeln!(end, "{}", arch_suffix).unwrap();
             }
         }
         BinaryFormat::MachO => {
-            let section = link_section.unwrap_or_else(|| "__TEXT,__text".to_string());
-            writeln!(begin, ".pushsection {},regular,pure_instructions", section).unwrap();
+            // NOTE: LLVM ignores `-Zfunction-sections` on macos. Instead the Mach-O symbol
+            // subsection splitting feature is used, which can be enabled with the
+            // `.subsections_via_symbols` global directive. LLVM already enables this directive.
+            if let Some(section) = &link_section {
+                writeln!(begin, ".pushsection {section},regular,pure_instructions").unwrap();
+            } else {
+                writeln!(begin, ".section __TEXT,__text,regular,pure_instructions").unwrap();
+            }
             writeln!(begin, ".balign {align_bytes}").unwrap();
             write_linkage(&mut begin).unwrap();
             match visibility {
@@ -261,25 +285,54 @@ fn prefix_and_suffix<'tcx>(
 
             writeln!(end).unwrap();
             writeln!(end, ".Lfunc_end_{asm_name}:").unwrap();
-            writeln!(end, ".popsection").unwrap();
+            if link_section.is_some() {
+                writeln!(end, ".popsection").unwrap();
+            }
             if !arch_suffix.is_empty() {
                 writeln!(end, "{}", arch_suffix).unwrap();
             }
         }
         BinaryFormat::Coff => {
-            let section = link_section.unwrap_or_else(|| format!(".text.{asm_name}"));
-            writeln!(begin, ".pushsection {},\"xr\"", section).unwrap();
-            writeln!(begin, ".balign {align_bytes}").unwrap();
-            write_linkage(&mut begin).unwrap();
             writeln!(begin, ".def {asm_name}").unwrap();
             writeln!(begin, ".scl 2").unwrap();
             writeln!(begin, ".type 32").unwrap();
             writeln!(begin, ".endef").unwrap();
+
+            if let Some(section) = &link_section {
+                writeln!(begin, ".section {section},\"xr\"").unwrap()
+            } else if !function_sections {
+                // Function sections are enabled by default on MSVC and windows-gnullvm,
+                // but disabled by default on GNU.
+                writeln!(begin, ".text").unwrap();
+            } else {
+                // LLVM uses an extension to the section directive to support defining multiple
+                // sections with the same name and comdat. It adds `unique,<id>` at the end of the
+                // `.section` directive. We have no way of generating that unique ID here, so don't
+                // emit it.
+                //
+                // See https://llvm.org/docs/Extensions.html#id2.
+                match &tcx.sess.target.options.env {
+                    Env::Gnu => {
+                        writeln!(begin, ".section .text${asm_name},\"xr\",one_only,{asm_name}")
+                            .unwrap();
+                    }
+                    Env::Msvc => {
+                        writeln!(begin, ".section .text,\"xr\",one_only,{asm_name}").unwrap();
+                    }
+                    Env::Unspecified => match &tcx.sess.target.options.os {
+                        Os::Uefi => {
+                            writeln!(begin, ".section .text,\"xr\",one_only,{asm_name}").unwrap();
+                        }
+                        _ => bug!("unexpected coff target {}", tcx.sess.target.llvm_target),
+                    },
+                    other => bug!("unexpected coff env {other:?}"),
+                }
+            }
+            write_linkage(&mut begin).unwrap();
+            writeln!(begin, ".balign {align_bytes}").unwrap();
             writeln!(begin, "{asm_name}:").unwrap();
 
             writeln!(end).unwrap();
-            writeln!(end, ".Lfunc_end_{asm_name}:").unwrap();
-            writeln!(end, ".popsection").unwrap();
             if !arch_suffix.is_empty() {
                 writeln!(end, "{}", arch_suffix).unwrap();
             }
@@ -392,7 +445,7 @@ fn wasm_type<'tcx>(signature: &mut String, arg_abi: &ArgAbi<'_, Ty<'tcx>>, ptr_t
             signature.push_str(direct_type);
         }
         PassMode::Pair(_, _) => match arg_abi.layout.backend_repr {
-            BackendRepr::ScalarPair(a, b) => {
+            BackendRepr::ScalarPair { a, b, b_offset: _ } => {
                 signature.push_str(wasm_primitive(a.primitive(), ptr_type));
                 signature.push_str(", ");
                 signature.push_str(wasm_primitive(b.primitive(), ptr_type));
@@ -402,7 +455,7 @@ fn wasm_type<'tcx>(signature: &mut String, arg_abi: &ArgAbi<'_, Ty<'tcx>>, ptr_t
         PassMode::Cast { pad_i32, ref cast } => {
             // For wasm, Cast is used for single-field primitive wrappers like `struct Wrapper(i64);`
             assert!(!pad_i32, "not currently used by wasm calling convention");
-            assert!(cast.prefix[0].is_none(), "no prefix");
+            assert!(cast.prefix.is_empty(), "no prefix");
             assert_eq!(cast.rest.total, arg_abi.layout.size, "single item");
 
             let wrapped_wasm_type = match cast.rest.unit.kind {
@@ -416,7 +469,7 @@ fn wasm_type<'tcx>(signature: &mut String, arg_abi: &ArgAbi<'_, Ty<'tcx>>, ptr_t
                     ..=8 => "f64",
                     _ => ptr_type,
                 },
-                RegKind::Vector => "v128",
+                RegKind::Vector { .. } => "v128",
             };
 
             signature.push_str(wrapped_wasm_type);

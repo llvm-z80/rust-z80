@@ -22,12 +22,14 @@ Here's the list of the notification groups:
 - [Apple](./apple.md)
 - [ARM](./arm.md)
 - [Emscripten](./emscripten.md)
+- [Fuchsia](./fuchsia.md)
 - [LoongArch](./loongarch.md)
 - [RISC-V](./risc-v.md)
 - [WASI](./wasi.md)
 - [WebAssembly](./wasm.md)
 - [Windows](./windows.md)
 - [Rust for Linux](./rust-for-linux.md)
+- [GPU target](./gpu-target.md)
 
 ## What issues are a good fit for notification groups?
 

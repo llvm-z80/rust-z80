@@ -417,36 +417,46 @@ where
         self.ptr_with_meta_to_mplace(ptr, MemPlaceMeta::None, layout, /*unaligned*/ true)
     }
 
-    /// Take a value, which represents a (thin or wide) reference, and make it a place.
-    /// Alignment is just based on the type. This is the inverse of `mplace_to_ref()`.
+    /// Take a value, which represents a (thin or wide) pointer, and make it a place.
+    /// Alignment is just based on the type. This is the inverse of `mplace_to_imm_ptr()`.
     ///
     /// Only call this if you are sure the place is "valid" (aligned and inbounds), or do not
     /// want to ever use the place for memory access!
     /// Generally prefer `deref_pointer`.
-    pub fn ref_to_mplace(
+    pub fn imm_ptr_to_mplace(
         &self,
         val: &ImmTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, MPlaceTy<'tcx, M::Provenance>> {
         let pointee_type =
-            val.layout.ty.builtin_deref(true).expect("`ref_to_mplace` called on non-ptr type");
+            val.layout.ty.builtin_deref(true).expect("`imm_ptr_to_mplace` called on non-ptr type");
         let layout = self.layout_of(pointee_type)?;
         let (ptr, meta) = val.to_scalar_and_meta();
 
-        // `ref_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
+        // `imm_ptr_to_mplace` is called on raw pointers even if they don't actually get dereferenced;
         // we hence can't call `size_and_align_of` since that asserts more validity than we want.
         let ptr = ptr.to_pointer(self)?;
         interp_ok(self.ptr_with_meta_to_mplace(ptr, meta, layout, /*unaligned*/ false))
     }
 
     /// Turn a mplace into a (thin or wide) mutable raw pointer, pointing to the same space.
+    ///
     /// `align` information is lost!
-    /// This is the inverse of `ref_to_mplace`.
-    pub fn mplace_to_ref(
+    /// This is the inverse of `imm_ptr_to_mplace`.
+    ///
+    /// If `ptr_ty` is provided, the resulting pointer will be of that type. Otherwise, it defaults to `*mut _`.
+    /// `ptr_ty` must be a type with builtin deref which derefs to the type of `mplace` (`mplace.layout.ty`).
+    pub fn mplace_to_imm_ptr(
         &self,
         mplace: &MPlaceTy<'tcx, M::Provenance>,
+        ptr_ty: Option<Ty<'tcx>>,
     ) -> InterpResult<'tcx, ImmTy<'tcx, M::Provenance>> {
         let imm = mplace.mplace.to_ref(self);
-        let layout = self.layout_of(Ty::new_mut_ptr(self.tcx.tcx, mplace.layout.ty))?;
+
+        let ptr_ty = ptr_ty
+            .inspect(|t| assert_eq!(t.builtin_deref(true), Some(mplace.layout.ty)))
+            .unwrap_or_else(|| Ty::new_mut_ptr(self.tcx.tcx, mplace.layout.ty));
+
+        let layout = self.layout_of(ptr_ty)?;
         interp_ok(ImmTy::from_immediate(imm, layout))
     }
 
@@ -467,7 +477,7 @@ where
         let val = self.read_immediate(src)?;
         trace!("deref to {} on {:?}", val.layout.ty, *val);
 
-        let mplace = self.ref_to_mplace(&val)?;
+        let mplace = self.imm_ptr_to_mplace(&val)?;
         interp_ok(mplace)
     }
 
@@ -703,7 +713,6 @@ where
         // to handle padding properly, which is only correct if we never look at this data with the
         // wrong type.
 
-        let tcx = *self.tcx;
         let will_later_validate = M::enforce_validity(self, layout);
         let Some(mut alloc) = self.get_place_alloc_mut(&MPlaceTy { mplace: dest, layout })? else {
             // zero-sized access
@@ -715,7 +724,7 @@ where
                 alloc.write_scalar(alloc_range(Size::ZERO, scalar.size()), scalar)?;
             }
             Immediate::ScalarPair(a_val, b_val) => {
-                let BackendRepr::ScalarPair(_a, b) = layout.backend_repr else {
+                let BackendRepr::ScalarPair { a: _, b: _, b_offset } = layout.backend_repr else {
                     span_bug!(
                         self.cur_span(),
                         "write_immediate_to_mplace: invalid ScalarPair layout: {:#?}",
@@ -723,7 +732,7 @@ where
                     )
                 };
                 let a_size = a_val.size();
-                let b_offset = a_size.align_to(b.align(&tcx).abi);
+                let b_size = b_val.size();
                 assert!(b_offset.bytes() > 0); // in `operand_field` we use the offset to tell apart the fields
 
                 // It is tempting to verify `b_offset` against `layout.fields.offset(1)`,
@@ -734,12 +743,12 @@ where
                 // destination now to ensure that no stray pointer fragments are being
                 // preserved (see <https://github.com/rust-lang/rust/issues/148470>).
                 // We can skip this if there is no padding (e.g. for wide pointers).
-                if !will_later_validate && a_size + b_val.size() != layout.size {
+                if !will_later_validate && a_size + b_size != layout.size {
                     alloc.write_uninit_full();
                 }
 
                 alloc.write_scalar(alloc_range(Size::ZERO, a_size), a_val)?;
-                alloc.write_scalar(alloc_range(b_offset, b_val.size()), b_val)?;
+                alloc.write_scalar(alloc_range(b_offset, b_size), b_val)?;
             }
             Immediate::Uninit => alloc.write_uninit_full(),
         }
@@ -834,17 +843,20 @@ where
     ) -> InterpResult<'tcx> {
         // These are technically *two* typed copies: `src` is a not-yet-loaded value,
         // so we're doing a typed copy at `src` type from there to some intermediate storage.
-        // And then we're doing a second typed copy from that intermediate storage to `dest`.
-        // But as an optimization, we only make a single direct copy here.
+        // And then we're doing a second typed copy at `dest` type from that intermediate storage to
+        // `dest`. But as an optimization, we only make a single direct copy here.
 
         // Do the actual copy.
         self.copy_op_no_validate(src, dest, allow_transmute)?;
 
         if M::enforce_validity(self, dest.layout()) {
             let dest = dest.to_place();
-            // Given that there were two typed copies, we have to ensure this is valid at both types,
-            // and we have to ensure this loses provenance and padding according to both types.
-            // But if the types are identical, we only do one pass.
+            // Given that there were two typed copies, we have to ensure this is valid at both
+            // types, and we have to ensure this loses provenance and padding according to both
+            // types. We also transmute both ways: when transmuting `*ptr` from `&T` to `*const T`,
+            // it seems nice to ensure that the resulting pointer value indeed is derived from a
+            // shared reference.
+            // But if the types are identical, that is strictly redundant so we only do one pass.
             if src.layout().ty != dest.layout().ty {
                 self.validate_operand(
                     &dest.transmute(src.layout(), self)?,
@@ -889,17 +901,19 @@ where
         // padding in the target independent of layout choices.
         let src_has_padding = match src.layout().backend_repr {
             BackendRepr::Scalar(_) => false,
-            BackendRepr::ScalarPair(left, right)
+            BackendRepr::ScalarPair { a: left, b: right, b_offset: _ }
                 if matches!(src.layout().ty.kind(), ty::Ref(..) | ty::RawPtr(..)) =>
             {
                 // Wide pointers never have padding, so we can avoid calling `size()`.
                 debug_assert_eq!(left.size(self) + right.size(self), src.layout().size);
                 false
             }
-            BackendRepr::ScalarPair(left, right) => {
+            BackendRepr::ScalarPair { a: left, b: right, b_offset: _ } => {
                 let left_size = left.size(self);
                 let right_size = right.size(self);
                 // We have padding if the sizes don't add up to the total.
+                // (Why don't we need to check the offset?  The scalars don't overlap so no padding
+                // implies `b_offset == left_size`, which would be superfluous to check explicitly.)
                 left_size + right_size != src.layout().size
             }
             // Everything else can only exist in memory anyway, so it doesn't matter.

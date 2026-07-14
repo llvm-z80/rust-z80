@@ -36,6 +36,7 @@ use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_serialize::opaque::FileEncoder;
+use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
 use rustc_session::config::{SymbolManglingVersion, TargetModifier};
 use rustc_session::cstore::{CrateDepKind, ForeignModule, LinkagePreference, NativeLib};
 use rustc_span::edition::Edition;
@@ -44,7 +45,6 @@ use rustc_span::{self, ExpnData, ExpnHash, ExpnId, Ident, Span, Symbol};
 use rustc_target::spec::{PanicStrategy, TargetTuple};
 use table::TableBuilder;
 
-use crate::creader::CrateMetadataRef;
 use crate::eii::EiiMapEncodedKeyValue;
 
 mod decoder;
@@ -193,7 +193,14 @@ type ExpnHashTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnHash>>>;
 pub(crate) struct ProcMacroData {
     proc_macro_decls_static: DefIndex,
     stability: Option<hir::Stability>,
-    macros: LazyArray<DefIndex>,
+    macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)>,
+}
+
+#[derive(MetadataEncodable, LazyDecodable)]
+pub enum ProcMacroKind {
+    CustomDerive { trait_name: String, attributes: Vec<String> },
+    Attr { name: String },
+    Bang { name: String },
 }
 
 /// Serialized crate metadata.
@@ -286,6 +293,7 @@ pub(crate) struct CrateRoot {
 
     source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
     target_modifiers: LazyArray<TargetModifier>,
+    denied_partial_mitigations: LazyArray<DeniedPartialMitigation>,
 
     compiler_builtins: bool,
     needs_allocator: bool,
@@ -315,13 +323,9 @@ impl From<DefId> for RawDefId {
 
 impl RawDefId {
     /// This exists so that `provide_one!` is happy
-    fn decode(self, meta: (CrateMetadataRef<'_>, TyCtxt<'_>)) -> DefId {
-        self.decode_from_cdata(meta.0)
-    }
-
-    fn decode_from_cdata(self, cdata: CrateMetadataRef<'_>) -> DefId {
+    fn decode(self, meta: (&CrateMetadata, TyCtxt<'_>)) -> DefId {
         let krate = CrateNum::from_u32(self.krate);
-        let krate = cdata.map_encoded_cnum_to_current(krate);
+        let krate = meta.0.map_encoded_cnum_to_current(krate);
         DefId { krate, index: DefIndex::from_u32(self.index) }
     }
 }
@@ -367,7 +371,7 @@ macro_rules! define_tables {
         }
 
         impl TableBuilders {
-            fn encode(&self, buf: &mut FileEncoder) -> LazyTables {
+            fn encode(&self, buf: &mut FileEncoder<'_>) -> LazyTables {
                 LazyTables {
                     $($name1: self.$name1.encode(buf),)+
                     $($name2: self.$name2.encode(buf),)+
@@ -467,9 +471,8 @@ define_tables! {
     variant_data: Table<DefIndex, LazyValue<VariantData>>,
     assoc_container: Table<DefIndex, LazyValue<ty::AssocContainer>>,
     macro_definition: Table<DefIndex, LazyValue<ast::DelimArgs>>,
-    proc_macro: Table<DefIndex, MacroKind>,
     deduced_param_attrs: Table<DefIndex, LazyArray<DeducedParamAttrs>>,
-    trait_impl_trait_tys: Table<DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<'static, Ty<'static>>>>>,
+    collect_return_position_impl_trait_in_trait_tys: Table<DefIndex, LazyValue<DefIdMap<ty::EarlyBinder<'static, Ty<'static>>>>>,
     doc_link_resolutions: Table<DefIndex, LazyValue<DocLinkResMap>>,
     doc_link_traits_in_scope: Table<DefIndex, LazyArray<DefId>>,
     assumed_wf_types_for_rpitit: Table<DefIndex, LazyArray<(Ty<'static>, Span)>>,
@@ -477,6 +480,8 @@ define_tables! {
     anon_const_kind: Table<DefIndex, LazyValue<ty::AnonConstKind>>,
     const_of_item: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     associated_types_for_impl_traits_in_trait_or_impl: Table<DefIndex, LazyValue<DefIdMap<Vec<DefId>>>>,
+    live_args_for_alias_from_outlives_bounds: Table<DefIndex, LazyValue<Option<ty::EarlyBinder<'static, Vec<ty::GenericArg<'static>>>>>>,
+    args_known_to_outlive_alias_params: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, Vec<(ty::Region<'static>, Vec<ty::GenericArg<'static>>)>>>>,
 }
 
 #[derive(TyEncodable, TyDecodable)]

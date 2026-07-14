@@ -10,7 +10,7 @@ use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use tracing::debug;
 
 use crate::{
-    ParamEnvAndCrate,
+    ParamEnvAndCrate, Span,
     db::HirDatabase,
     infer::InferenceContext,
     next_solver::{
@@ -39,8 +39,8 @@ pub fn autoderef<'db>(
 ) -> impl Iterator<Item = Ty<'db>> + use<'db> {
     let interner = DbInterner::new_with(db, env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-    let (ty, _) = infcx.instantiate_canonical(&ty);
-    let autoderef = Autoderef::new(&infcx, env.param_env, ty);
+    let (ty, _) = infcx.instantiate_canonical(Span::Dummy, &ty);
+    let autoderef = Autoderef::new(&infcx, env.param_env, ty, Span::Dummy);
     let mut v = Vec::new();
     for (ty, _steps) in autoderef {
         // `ty` may contain unresolved inference variables. Since there's no chance they would be
@@ -155,6 +155,7 @@ pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = Vec<(Ty<'db>, AutoderefKind
     // Configurations:
     include_raw_pointers: bool,
     use_receiver_trait: bool,
+    span: Span,
 }
 
 pub(crate) type Autoderef<'a, 'db, Steps = Vec<(Ty<'db>, AutoderefKind)>> =
@@ -200,17 +201,16 @@ where
                 // autoderef expect this type to have been structurally normalized.
                 if let TyKind::Alias(..) = ty.kind() {
                     let (normalized_ty, obligations) =
-                        structurally_normalize_ty(self.infcx(), self.param_env(), ty)?;
+                        structurally_normalize_ty(self.infcx(), self.param_env(), ty, self.span)?;
                     self.state.obligations.extend(obligations);
                     (AutoderefKind::Builtin, normalized_ty)
                 } else {
                     (AutoderefKind::Builtin, ty)
                 }
-            } else if let Some(ty) = self.overloaded_deref_ty(self.state.cur_ty) {
+            } else {
+                let ty = self.overloaded_deref_ty(self.state.cur_ty)?;
                 // The overloaded deref check already normalizes the pointee type.
                 (AutoderefKind::Overloaded, ty)
-            } else {
-                return None;
             };
 
         self.state.steps.push(self.state.cur_ty, kind);
@@ -232,8 +232,9 @@ impl<'a, 'db> Autoderef<'a, 'db> {
         infcx: &'a InferCtxt<'db>,
         param_env: ParamEnv<'db>,
         base_ty: Ty<'db>,
+        span: Span,
     ) -> Self {
-        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty)
+        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty, span)
     }
 }
 
@@ -242,8 +243,9 @@ impl<'a, 'b, 'db> InferenceContextAutoderef<'a, 'b, 'db> {
     pub(crate) fn new_from_inference_context(
         ctx: &'a mut InferenceContext<'b, 'db>,
         base_ty: Ty<'db>,
+        span: Span,
     ) -> Self {
-        Self::new_impl(InferenceContextAutoderefCtx(ctx), base_ty)
+        Self::new_impl(InferenceContextAutoderefCtx(ctx), base_ty, span)
     }
 
     #[inline]
@@ -258,8 +260,9 @@ impl<'a, 'db> Autoderef<'a, 'db, usize> {
         infcx: &'a InferCtxt<'db>,
         param_env: ParamEnv<'db>,
         base_ty: Ty<'db>,
+        span: Span,
     ) -> Self {
-        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty)
+        Self::new_impl(DefaultAutoderefCtx { infcx, param_env }, base_ty, span)
     }
 }
 
@@ -269,7 +272,7 @@ where
     Steps: TrackAutoderefSteps<'db>,
 {
     #[inline]
-    fn new_impl(ctx: Ctx, base_ty: Ty<'db>) -> Self {
+    fn new_impl(ctx: Ctx, base_ty: Ty<'db>, span: Span) -> Self {
         GeneralAutoderef {
             state: AutoderefSnapshot {
                 steps: Steps::default(),
@@ -282,6 +285,7 @@ where
             traits: None,
             include_raw_pointers: false,
             use_receiver_trait: false,
+            span,
         }
     }
 
@@ -338,7 +342,7 @@ where
 
         let trait_ref = TraitRef::new(interner, trait_.into(), [ty]);
         let obligation =
-            Obligation::new(interner, ObligationCause::new(), self.param_env(), trait_ref);
+            Obligation::new(interner, ObligationCause::new(self.span), self.param_env(), trait_ref);
         // We detect whether the self type implements `Deref` before trying to
         // structurally normalize. We use `predicate_may_hold_opaque_types_jank`
         // to support not-yet-defined opaque types. It will succeed for `impl Deref`
@@ -352,6 +356,7 @@ where
             self.infcx(),
             self.param_env(),
             Ty::new_projection(interner, trait_target.into(), [ty]),
+            self.span,
         )?;
         debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})", ty, normalized_ty, obligations);
         self.state.obligations.extend(obligations);
@@ -403,9 +408,11 @@ fn structurally_normalize_ty<'db>(
     infcx: &InferCtxt<'db>,
     param_env: ParamEnv<'db>,
     ty: Ty<'db>,
+    span: Span,
 ) -> Option<(Ty<'db>, PredicateObligations<'db>)> {
     let mut ocx = ObligationCtxt::new(infcx);
-    let Ok(normalized_ty) = ocx.structurally_normalize_ty(&ObligationCause::misc(), param_env, ty)
+    let Ok(normalized_ty) =
+        ocx.structurally_normalize_ty(&ObligationCause::new(span), param_env, ty)
     else {
         // We shouldn't have errors here in the old solver, except for
         // evaluate/fulfill mismatches, but that's not a reason for an ICE.

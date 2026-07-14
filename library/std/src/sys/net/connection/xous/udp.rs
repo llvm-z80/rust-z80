@@ -145,12 +145,13 @@ impl UdpSocket {
             0,
         ) {
             if receive_request.raw[0] != 0 {
-                // error case
-                if receive_request.raw[1] == NetError::TimedOut as u8 {
+                // Error case — code lives at byte 4 (where `send_message`
+                // also reads it). Byte 1 is part of the marker header.
+                if receive_request.raw[4] == NetError::TimedOut as u8 {
                     return Err(io::const_error!(io::ErrorKind::TimedOut, "recv timed out"));
-                } else if receive_request.raw[1] == NetError::WouldBlock as u8 {
+                } else if receive_request.raw[4] == NetError::WouldBlock as u8 {
                     return Err(io::const_error!(io::ErrorKind::WouldBlock, "recv would block"));
-                } else if receive_request.raw[1] == NetError::LibraryError as u8 {
+                } else if receive_request.raw[4] == NetError::LibraryError as u8 {
                     return Err(io::const_error!(io::ErrorKind::Other, "library error"));
                 } else {
                     return Err(io::const_error!(io::ErrorKind::Other, "library error"));
@@ -240,13 +241,12 @@ impl UdpSocket {
                 }
             }
         }
-        let len = buf.len() as u16;
-        let len_bytes = len.to_le_bytes();
+        let header_len = 21;
+        let len = buf.len().min(tx_req.raw.len() - header_len);
+        let len_bytes = (len as u16).to_le_bytes();
         tx_req.raw[19] = len_bytes[0];
         tx_req.raw[20] = len_bytes[1];
-        for (&s, d) in buf.iter().zip(tx_req.raw[21..].iter_mut()) {
-            *d = s;
-        }
+        tx_req.raw[header_len..header_len + len].copy_from_slice(&buf[..len]);
 
         // let buf = unsafe {
         //     xous::MemoryRange::new(
@@ -305,7 +305,7 @@ impl UdpSocket {
                         }
                     } else {
                         // no error
-                        return Ok(len as usize);
+                        return Ok(len);
                     }
                 }
                 Err(crate::os::xous::ffi::Error::ServerQueueFull) => {

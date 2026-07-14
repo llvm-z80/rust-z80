@@ -15,7 +15,7 @@ use rustc_middle::arena::ArenaAllocatable;
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::relate::Relate;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Upcast, Variance};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Unnormalized, Upcast, Variance};
 
 use super::{FromSolverError, FulfillmentContext, ScrubbedTraitError, TraitEngine};
 use crate::error_reporting::InferCtxtErrorExt;
@@ -113,7 +113,7 @@ where
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        value: T,
+        value: Unnormalized<'tcx, T>,
     ) -> T {
         let infer_ok = self.infcx.at(cause, param_env).normalize(value);
         self.register_infer_ok_obligations(infer_ok)
@@ -246,15 +246,15 @@ where
     /// will result in region constraints getting ignored.
     pub fn resolve_regions_and_report_errors(
         self,
-        body_id: LocalDefId,
+        body_def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
         assumed_wf_tys: impl IntoIterator<Item = Ty<'tcx>>,
     ) -> Result<(), ErrorGuaranteed> {
-        let errors = self.infcx.resolve_regions(body_id, param_env, assumed_wf_tys);
+        let errors = self.infcx.resolve_regions(body_def_id, param_env, assumed_wf_tys);
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(self.infcx.err_ctxt().report_region_errors(body_id, &errors))
+            Err(self.infcx.err_ctxt().report_region_errors(body_def_id, &errors))
         }
     }
 
@@ -265,11 +265,11 @@ where
     #[must_use]
     pub fn resolve_regions(
         self,
-        body_id: LocalDefId,
+        body_def_id: LocalDefId,
         param_env: ty::ParamEnv<'tcx>,
         assumed_wf_tys: impl IntoIterator<Item = Ty<'tcx>>,
     ) -> Vec<RegionResolutionError<'tcx>> {
-        self.infcx.resolve_regions(body_id, param_env, assumed_wf_tys)
+        self.infcx.resolve_regions(body_def_id, param_env, assumed_wf_tys)
     }
 }
 
@@ -331,7 +331,7 @@ where
             match self
                 .infcx
                 .at(&cause, param_env)
-                .deeply_normalize(ty, &mut **self.engine.borrow_mut())
+                .deeply_normalize(Unnormalized::new_wip(ty), &mut **self.engine.borrow_mut())
             {
                 // Insert well-formed types, ignoring duplicates.
                 Ok(normalized) => drop(implied_bounds.insert(normalized)),
@@ -346,7 +346,7 @@ where
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        value: T,
+        value: Unnormalized<'tcx, T>,
     ) -> Result<T, Vec<E>> {
         self.infcx.at(cause, param_env).deeply_normalize(value, &mut **self.engine.borrow_mut())
     }
@@ -355,7 +355,7 @@ where
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        value: Ty<'tcx>,
+        value: Unnormalized<'tcx, Ty<'tcx>>,
     ) -> Result<Ty<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
@@ -366,7 +366,7 @@ where
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        value: ty::Const<'tcx>,
+        value: Unnormalized<'tcx, ty::Const<'tcx>>,
     ) -> Result<ty::Const<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
@@ -377,7 +377,7 @@ where
         &self,
         cause: &ObligationCause<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        value: ty::Term<'tcx>,
+        value: Unnormalized<'tcx, ty::Term<'tcx>>,
     ) -> Result<ty::Term<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)

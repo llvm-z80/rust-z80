@@ -476,9 +476,8 @@ impl<'a, 'tcx> Borrows<'a, 'tcx> {
             .borrow_set
             .local_map
             .get(&place.local)
-            .into_iter()
-            .flat_map(|bs| bs.iter())
-            .copied();
+            .map(|bs| bs.iter().copied())
+            .into_flat_iter();
 
         // If the borrowed place is a local with no projections, all other borrows of this
         // local must conflict. This is purely an optimization so we don't have to call
@@ -548,8 +547,8 @@ impl<'tcx> rustc_mir_dataflow::Analysis<'tcx> for Borrows<'_, 'tcx> {
         location: Location,
     ) {
         match &stmt.kind {
-            mir::StatementKind::Assign(box (lhs, rhs)) => {
-                if let mir::Rvalue::Ref(_, _, place) = rhs {
+            mir::StatementKind::Assign((lhs, rhs)) => {
+                if let mir::Rvalue::Ref(_, _, place) | mir::Rvalue::Reborrow(_, _, place) = rhs {
                     if place.ignore_borrow(
                         self.tcx,
                         self.body,
@@ -578,7 +577,6 @@ impl<'tcx> rustc_mir_dataflow::Analysis<'tcx> for Borrows<'_, 'tcx> {
             mir::StatementKind::FakeRead(..)
             | mir::StatementKind::SetDiscriminant { .. }
             | mir::StatementKind::StorageLive(..)
-            | mir::StatementKind::Retag { .. }
             | mir::StatementKind::PlaceMention(..)
             | mir::StatementKind::AscribeUserType(..)
             | mir::StatementKind::Coverage(..)

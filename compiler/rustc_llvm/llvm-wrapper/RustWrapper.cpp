@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
+#include "llvm/IR/AutoUpgrade.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticHandler.h"
@@ -70,6 +71,10 @@ using namespace llvm::object;
 // This opcode is an LLVM detail that could hypothetically change (?), so
 // verify that the hard-coded value in `dwarf_const.rs` still agrees with LLVM.
 static_assert(dwarf::DW_OP_LLVM_fragment == 0x1000);
+static_assert(dwarf::DW_OP_constu == 0x10);
+static_assert(dwarf::DW_OP_minus == 0x1c);
+static_assert(dwarf::DW_OP_mul == 0x1e);
+static_assert(dwarf::DW_OP_bregx == 0x92);
 static_assert(dwarf::DW_OP_stack_value == 0x9f);
 
 static LLVM_THREAD_LOCAL char *LastError;
@@ -150,6 +155,15 @@ extern "C" void LLVMRustPrintStatistics(RustStringRef OutBuf) {
   llvm::PrintStatistics(OS);
 }
 
+extern "C" void LLVMRustPrintStatisticsJSON(RustStringRef OutBuf) {
+  auto OS = RawRustStringOstream(OutBuf);
+  llvm::PrintStatisticsJSON(OS);
+}
+
+extern "C" bool LLVMRustIsCall(LLVMValueRef V) {
+  return llvm::isa<llvm::CallBase>(llvm::unwrap(V));
+}
+
 // Some of the functions here rely on LLVM modules that may not always be
 // available. As such, we only try to build it in the first place, if
 // llvm.offload is enabled.
@@ -168,7 +182,7 @@ static Error writeFile(StringRef Filename, StringRef Data) {
 
 // This is the first of many steps in creating a binary using llvm offload,
 // to run code on the gpu. Concrete, it replaces the following binary use:
-// clang-offload-packager -o host.out
+// clang-offload-packager -o device.bin
 //  --image=file=device.bc,triple=amdgcn-amd-amdhsa,arch=gfx90a,kind=openmp
 // The input module is the rust code compiled for a gpu target like amdgpu.
 // Based on clang/tools/clang-offload-packager/ClangOffloadPackager.cpp
@@ -294,10 +308,12 @@ extern "C" LLVMValueRef LLVMRustGetOrInsertFunction(LLVMModuleRef M,
                   .getCallee());
 }
 
-extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
-                                                  const char *Name,
-                                                  size_t NameLen,
-                                                  LLVMTypeRef Ty) {
+// Get the global variable with the given name if it exists or create a new
+// external global.
+extern "C" LLVMValueRef
+LLVMRustGetOrInsertGlobalInAddrspace(LLVMModuleRef M, const char *Name,
+                                     size_t NameLen, LLVMTypeRef Ty,
+                                     unsigned int AddressSpace) {
   Module *Mod = unwrap(M);
   auto NameRef = StringRef(Name, NameLen);
 
@@ -308,8 +324,22 @@ extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
   GlobalVariable *GV = Mod->getGlobalVariable(NameRef, true);
   if (!GV)
     GV = new GlobalVariable(*Mod, unwrap(Ty), false,
-                            GlobalValue::ExternalLinkage, nullptr, NameRef);
+                            GlobalValue::ExternalLinkage, nullptr, NameRef,
+                            nullptr, GlobalValue::NotThreadLocal, AddressSpace);
   return wrap(GV);
+}
+
+// Get the global variable with the given name if it exists or create a new
+// external global.
+extern "C" LLVMValueRef LLVMRustGetOrInsertGlobal(LLVMModuleRef M,
+                                                  const char *Name,
+                                                  size_t NameLen,
+                                                  LLVMTypeRef Ty) {
+  Module *Mod = unwrap(M);
+  unsigned int AddressSpace =
+      Mod->getDataLayout().getDefaultGlobalsAddressSpace();
+  return LLVMRustGetOrInsertGlobalInAddrspace(M, Name, NameLen, Ty,
+                                              AddressSpace);
 }
 
 // Must match the layout of `rustc_codegen_llvm::llvm::ffi::AttributeKind`.
@@ -361,6 +391,8 @@ enum class LLVMRustAttributeKind {
   CapturesNone = 46,
   SanitizeRealtimeNonblocking = 47,
   SanitizeRealtimeBlocking = 48,
+  Convergent = 49,
+  NoFree = 50,
 };
 
 static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
@@ -457,6 +489,10 @@ static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
     return Attribute::SanitizeRealtime;
   case LLVMRustAttributeKind::SanitizeRealtimeBlocking:
     return Attribute::SanitizeRealtimeBlocking;
+  case LLVMRustAttributeKind::Convergent:
+    return Attribute::Convergent;
+  case LLVMRustAttributeKind::NoFree:
+    return Attribute::NoFree;
   }
   report_fatal_error("bad LLVMRustAttributeKind");
 }
@@ -731,7 +767,7 @@ extern "C" bool LLVMRustInlineAsmVerify(LLVMTypeRef Ty, char *Constraints,
 }
 
 template <typename DIT> DIT *unwrapDIPtr(LLVMMetadataRef Ref) {
-  return (DIT *)(Ref ? unwrap<MDNode>(Ref) : nullptr);
+  return (DIT *)(Ref ? unwrap<Metadata>(Ref) : nullptr);
 }
 
 #define DIDescriptor DIScope
@@ -1169,15 +1205,6 @@ extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateVariantMemberType(
       fromRust(Flags), unwrapDI<DIType>(Ty)));
 }
 
-extern "C" LLVMMetadataRef
-LLVMRustDIBuilderCreateEnumerator(LLVMDIBuilderRef Builder, const char *Name,
-                                  size_t NameLen, const uint64_t Value[2],
-                                  unsigned SizeInBits, bool IsUnsigned) {
-  return wrap(unwrap(Builder)->createEnumerator(
-      StringRef(Name, NameLen),
-      APSInt(APInt(SizeInBits, ArrayRef<uint64_t>(Value, 2)), IsUnsigned)));
-}
-
 extern "C" LLVMMetadataRef LLVMRustDIBuilderCreateEnumerationType(
     LLVMDIBuilderRef Builder, LLVMMetadataRef Scope, const char *Name,
     size_t NameLen, LLVMMetadataRef File, unsigned LineNumber,
@@ -1205,6 +1232,36 @@ extern "C" void LLVMRustDICompositeTypeReplaceArrays(
   DICompositeType *Tmp = unwrapDI<DICompositeType>(CompositeTy);
   unwrap(Builder)->replaceArrays(Tmp, DINodeArray(unwrap<MDTuple>(Elements)),
                                  DINodeArray(unwrap<MDTuple>(Params)));
+}
+
+// LLVM's C FFI bindings don't expose the overload of `GetOrCreateSubrange`
+// which takes a metadata node as the upper bound.
+extern "C" LLVMMetadataRef
+LLVMRustDIGetOrCreateSubrange(LLVMDIBuilderRef Builder,
+                              LLVMMetadataRef CountNode, LLVMMetadataRef LB,
+                              LLVMMetadataRef UB, LLVMMetadataRef Stride) {
+  return wrap(unwrap(Builder)->getOrCreateSubrange(
+      unwrapDI<Metadata>(CountNode), unwrapDI<Metadata>(LB),
+      unwrapDI<Metadata>(UB), unwrapDI<Metadata>(Stride)));
+}
+
+// LLVM's CI FFI bindings don't expose the `BitStride` parameter of
+// `createVectorType`.
+extern "C" LLVMMetadataRef
+LLVMRustDICreateVectorType(LLVMDIBuilderRef Builder, uint64_t Size,
+                           uint32_t AlignInBits, LLVMMetadataRef Type,
+                           LLVMMetadataRef Subscripts,
+                           LLVMMetadataRef BitStride) {
+#if LLVM_VERSION_GE(22, 0)
+  return wrap(unwrap(Builder)->createVectorType(
+      Size, AlignInBits, unwrapDI<DIType>(Type),
+      DINodeArray(unwrapDI<MDTuple>(Subscripts)),
+      unwrapDI<Metadata>(BitStride)));
+#else
+  return wrap(unwrap(Builder)->createVectorType(
+      Size, AlignInBits, unwrapDI<DIType>(Type),
+      DINodeArray(unwrapDI<MDTuple>(Subscripts))));
+#endif
 }
 
 extern "C" LLVMMetadataRef
@@ -1442,6 +1499,10 @@ LLVMRustBuildMemMove(LLVMBuilderRef B, LLVMValueRef Dst, unsigned DstAlign,
   return wrap(unwrap(B)->CreateMemMove(unwrap(Dst), MaybeAlign(DstAlign),
                                        unwrap(Src), MaybeAlign(SrcAlign),
                                        unwrap(Size), IsVolatile));
+}
+
+extern "C" LLVMValueRef LLVMRustBuildVScale(LLVMBuilderRef B, LLVMTypeRef Ty) {
+  return wrap(unwrap(B)->CreateVScale(unwrap(Ty)));
 }
 
 extern "C" LLVMValueRef LLVMRustBuildMemSet(LLVMBuilderRef B, LLVMValueRef Dst,
@@ -1776,6 +1837,48 @@ extern "C" void LLVMRustSetNoSanitizeHWAddress(LLVMValueRef Global) {
     MD = GV.getSanitizerMetadata();
   MD.NoHWAddress = true;
   GV.setSanitizerMetadata(MD);
+}
+
+extern "C" bool LLVMRustUpgradeIntrinsicFunction(LLVMValueRef Fn,
+                                                 LLVMValueRef *NewFn) {
+  Function *F = unwrap<Function>(Fn);
+  Function *NewF = nullptr;
+  bool CanUpgrade = UpgradeIntrinsicFunction(F, NewF, false);
+  *NewFn = wrap(NewF);
+  return CanUpgrade;
+}
+
+extern "C" bool LLVMRustIsTargetIntrinsic(unsigned ID) {
+  return Intrinsic::isTargetIntrinsic(ID);
+}
+
+extern "C" LLVMValueRef LLVMRustConstPtrAuth(LLVMValueRef Ptr, uint32_t Key,
+                                             uint64_t Disc,
+                                             LLVMValueRef AddrDiversity,
+                                             LLVMValueRef DeactivationSymbol) {
+  auto *C = cast<Constant>(unwrap<Value>(Ptr));
+  assert(C->getType()->isPointerTy() && "Expected pointer type");
+  assert(!isa<UndefValue>(C) && "Unexpected undef in const_ptr_auth");
+  assert(!isa<ConstantPointerNull>(C) && "Unexpected null in const_ptr_auth");
+
+  LLVMContext &Ctx = C->getContext();
+  auto *KeyC = ConstantInt::get(Type::getInt32Ty(Ctx), Key);
+  auto *DiscC = ConstantInt::get(Type::getInt64Ty(Ctx), Disc);
+  auto *PTy = cast<PointerType>(C->getType());
+  Constant *AddrDiv =
+      AddrDiversity ? dyn_cast<Constant>(unwrap<Value>(AddrDiversity))
+                    : ConstantPointerNull::get(cast<PointerType>(C->getType()));
+  assert(AddrDiv && "Failed to get Address Diversity");
+#if LLVM_VERSION_GE(22, 0)
+  Constant *DeactivationSym =
+      DeactivationSymbol ? dyn_cast<Constant>(unwrap<Value>(DeactivationSymbol))
+                         : ConstantPointerNull::get(PTy);
+  assert(DeactivationSym && "Failed to get Deactivation Symbol");
+
+  return wrap(ConstantPtrAuth::get(C, KeyC, DiscC, AddrDiv, DeactivationSym));
+#else
+  return wrap(ConstantPtrAuth::get(C, KeyC, DiscC, AddrDiv));
+#endif
 }
 
 // Statically assert that the fixed metadata kind IDs declared in

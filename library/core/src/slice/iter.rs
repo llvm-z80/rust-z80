@@ -5,9 +5,7 @@ mod macros;
 
 use super::{from_raw_parts, from_raw_parts_mut};
 use crate::hint::assert_unchecked;
-use crate::iter::{
-    FusedIterator, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce, UncheckedIterator,
-};
+use crate::iter::{FusedIterator, TrustedLen, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
 use crate::marker::PhantomData;
 use crate::mem::{self, SizedTypeProperties};
 use crate::num::NonZero;
@@ -3050,6 +3048,20 @@ where
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         if self.slice.is_empty() { (0, Some(0)) } else { (1, Some(self.slice.len())) }
+    }
+
+    #[inline]
+    fn count(mut self) -> usize {
+        let Some((mut previous, rest)) = self.slice.split_first() else {
+            return 0;
+        };
+
+        let mut count = 1;
+        for current in rest {
+            count += usize::from(!(self.predicate)(previous, current));
+            previous = current;
+        }
+        count
     }
 
     #[inline]

@@ -620,6 +620,57 @@ fn test_next_chunk() {
 }
 
 #[test]
+fn test_next_chunk_back() {
+    let mut it = 0..12;
+    assert_eq!(it.next_chunk_back().unwrap(), [8, 9, 10, 11]);
+    assert_eq!(it.next_chunk_back().unwrap(), []);
+    assert_eq!(it.next_chunk_back().unwrap(), [2, 3, 4, 5, 6, 7]);
+    assert_eq!(it.next_chunk_back::<4>().unwrap_err().as_slice(), &[0, 1]);
+
+    let mut it = std::iter::once_with(|| panic!());
+    assert_eq!(it.next_chunk_back::<0>().unwrap(), []);
+}
+
+#[test]
+fn test_next_chunk_untrusted() {
+    struct Untrusted<I: Iterator>(I);
+    impl<I: Iterator> Iterator for Untrusted<I> {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+    }
+    let mut it = Untrusted(0..12);
+    assert_eq!(it.next_chunk().unwrap(), [0, 1, 2, 3]);
+    assert_eq!(it.next_chunk().unwrap(), []);
+    assert_eq!(it.next_chunk().unwrap(), [4, 5, 6, 7, 8, 9]);
+    assert_eq!(it.next_chunk::<4>().unwrap_err().as_slice(), &[10, 11]);
+}
+
+#[test]
+fn test_next_chunk_back_untrusted() {
+    struct Untrusted<I: Iterator>(I);
+    impl<I: Iterator> Iterator for Untrusted<I> {
+        type Item = I::Item;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+    }
+    impl<I: DoubleEndedIterator> DoubleEndedIterator for Untrusted<I> {
+        fn next_back(&mut self) -> Option<Self::Item> {
+            self.0.next_back()
+        }
+    }
+    let mut it = Untrusted(0..12);
+    assert_eq!(it.next_chunk_back().unwrap(), [8, 9, 10, 11]);
+    assert_eq!(it.next_chunk_back().unwrap(), []);
+    assert_eq!(it.next_chunk_back().unwrap(), [2, 3, 4, 5, 6, 7]);
+    assert_eq!(it.next_chunk::<4>().unwrap_err().as_slice(), &[0, 1]);
+}
+
+#[test]
 fn test_collect_into_tuples() {
     let a = vec![(1, 2, 3), (4, 5, 6), (7, 8, 9)];
     let b = vec![1, 4, 7];

@@ -117,7 +117,7 @@ pub(crate) fn codegen_inline_asm_terminator<'tcx>(
                         fx.tcx,
                         ty::TypingEnv::fully_monomorphized(),
                         def_id,
-                        args,
+                        args.no_bound_vars().unwrap(),
                     )
                     .unwrap();
                     let symbol = fx.tcx.symbol_name(instance);
@@ -424,13 +424,10 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
 
         // Allocate stack slots for inout
         for (i, operand) in self.operands.iter().enumerate() {
-            match *operand {
-                CInlineAsmOperand::InOut { reg, out_place: Some(_), .. } => {
-                    let slot = new_slot(reg.reg_class());
-                    slots_input[i] = Some(slot);
-                    slots_output[i] = Some(slot);
-                }
-                _ => (),
+            if let CInlineAsmOperand::InOut { reg, out_place: Some(_), .. } = *operand {
+                let slot = new_slot(reg.reg_class());
+                slots_input[i] = Some(slot);
+                slots_output[i] = Some(slot);
             }
         }
 
@@ -456,11 +453,8 @@ impl<'tcx> InlineAssemblyGenerator<'_, 'tcx> {
 
         // Allocate stack slots for output
         for (i, operand) in self.operands.iter().enumerate() {
-            match *operand {
-                CInlineAsmOperand::Out { reg, place: Some(_), .. } => {
-                    slots_output[i] = Some(new_slot(reg.reg_class()));
-                }
-                _ => (),
+            if let CInlineAsmOperand::Out { reg, place: Some(_), .. } = *operand {
+                slots_output[i] = Some(new_slot(reg.reg_class()));
             }
         }
 

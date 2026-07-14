@@ -1,6 +1,6 @@
 use syntax::{
     Direction, SyntaxKind, T,
-    ast::{self, AstNode, edit::IndentLevel, syntax_factory::SyntaxFactory},
+    ast::{self, AstNode, edit::IndentLevel},
     syntax_editor::{Element, Position},
 };
 
@@ -30,7 +30,7 @@ use crate::{AssistContext, AssistId, Assists};
 //     }
 // }
 // ```
-pub(crate) fn unmerge_match_arm(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn unmerge_match_arm(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let pipe_token = ctx.find_token_syntax_at_offset(T![|])?;
     let or_pat = ast::OrPat::cast(pipe_token.parent()?)?;
     if or_pat.leading_pipe().is_some_and(|it| it == pipe_token) {
@@ -56,8 +56,8 @@ pub(crate) fn unmerge_match_arm(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
         "Unmerge match arm",
         pipe_token.text_range(),
         |edit| {
-            let make = SyntaxFactory::with_mappings();
-            let mut editor = edit.make_editor(&new_parent);
+            let editor = edit.make_editor(&new_parent);
+            let make = editor.make();
             // It is guaranteed that `pats_after` has at least one element
             let new_pat = if pats_after.len() == 1 {
                 pats_after[0].clone()
@@ -86,7 +86,7 @@ pub(crate) fn unmerge_match_arm(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
             //  - After the arm. In this case we always want to insert a comma after the newly
             //    inserted arm.
             //  - Missing after the arm, with no arms after. In this case we want to insert a
-            //    comma before the newly inserted arm. It can not be necessary if there arm
+            //    comma before the newly inserted arm. It can not be necessary if the arm
             //    body is a block, but we don't bother to check that.
             //  - Missing after the arm with arms after, if the arm body is a block. In this case
             //    we don't want to insert a comma at all.
@@ -101,7 +101,6 @@ pub(crate) fn unmerge_match_arm(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
             insert_after_old_arm.push(new_match_arm.syntax().clone().into());
 
             editor.insert_all(Position::after(match_arm.syntax()), insert_after_old_arm);
-            editor.add_mappings(make.finish_with_mappings());
             edit.add_file_edits(ctx.vfs_file_id(), editor);
         },
     )

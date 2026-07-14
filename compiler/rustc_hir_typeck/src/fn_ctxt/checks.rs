@@ -13,14 +13,15 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{Expr, ExprKind, FnRetTy, HirId, LangItem, Node, QPath, is_range_literal};
 use rustc_hir_analysis::check::potentially_plural_count;
-use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, PermitVariants};
+use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, ResolvedStructPath};
 use rustc_index::IndexVec;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_session::Session;
+use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::{DUMMY_SP, Ident, Span, kw, sym};
 use rustc_trait_selection::error_reporting::infer::{FailureCode, ObligationCauseExt};
 use rustc_trait_selection::infer::InferCtxtExt;
@@ -31,7 +32,7 @@ use tracing::debug;
 use crate::Expectation::*;
 use crate::TupleArgumentsFlag::*;
 use crate::coercion::CoerceMany;
-use crate::errors::SuggestPtrNullMut;
+use crate::diagnostics::SuggestPtrNullMut;
 use crate::fn_ctxt::arg_matrix::{ArgMatrix, Compatibility, Error, ExpectedIdx, ProvidedIdx};
 use crate::gather_locals::Declaration;
 use crate::inline_asm::InlineAsmCtxt;
@@ -40,7 +41,7 @@ use crate::method::probe::Mode::MethodCall;
 use crate::method::probe::ProbeScope::TraitsInScope;
 use crate::{
     BreakableCtxt, Diverges, Expectation, FnCtxt, GatherLocalsVisitor, LoweredTy, Needs,
-    TupleArgumentsFlag, errors, struct_span_code_err,
+    TupleArgumentsFlag, diagnostics, struct_span_code_err,
 };
 
 rustc_index::newtype_index! {
@@ -49,14 +50,27 @@ rustc_index::newtype_index! {
     pub(crate) struct GenericIdx {}
 }
 
+/// Outcome of checking arguments that are tupled by "rust-call" or `#[splat]`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TupledArgCheckOutcome<'tcx> {
+    /// The error code to emit if the arguments are not compatible.
+    new_err_code: Option<ErrCode>,
+
+    /// The formal input types after checking.
+    untupled_formal_input_tys: Vec<Ty<'tcx>>,
+
+    /// The expected input types after checking.
+    untupled_expected_input_tys: Option<Vec<Ty<'tcx>>>,
+}
+
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_casts(&mut self) {
         let mut deferred_cast_checks = self.root_ctxt.deferred_cast_checks.borrow_mut();
         debug!("FnCtxt::check_casts: {} deferred checks", deferred_cast_checks.len());
         for cast in deferred_cast_checks.drain(..) {
-            let body_id = std::mem::replace(&mut self.body_id, cast.body_id);
+            let body_def_id = std::mem::replace(&mut self.body_def_id, cast.body_def_id);
             cast.check(self);
-            self.body_id = body_id;
+            self.body_def_id = body_def_id;
         }
     }
 
@@ -95,8 +109,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // as otherwise we can wind up conservatively proving `Copy` which may
                 // infer the repeat expr count to something that never required `Copy` in
                 // the first place.
-                let count = self
-                    .structurally_resolve_const(element.span, self.normalize(element.span, count));
+                let count = self.structurally_resolve_const(
+                    element.span,
+                    self.normalize(element.span, Unnormalized::new_wip(count)),
+                );
 
                 // Avoid run on "`NotCopy: Copy` is not implemented" errors when the
                 // repeat expr count is erroneous/unknown. The user might wind up
@@ -158,7 +174,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 ty::ConstKind::Param(_)
                 | ty::ConstKind::Expr(_)
                 | ty::ConstKind::Placeholder(_)
-                | ty::ConstKind::Unevaluated(_) => enforce_copy_bound(element, element_ty),
+                | ty::ConstKind::Alias(_, _) => enforce_copy_bound(element, element_ty),
 
                 ty::ConstKind::Bound(_, _) | ty::ConstKind::Infer(_) | ty::ConstKind::Error(_) => {
                     unreachable!()
@@ -182,12 +198,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expectation: Expectation<'tcx>,
         // The expressions for each provided argument
         provided_args: &'tcx [hir::Expr<'tcx>],
-        // Whether the function is variadic, for example when imported from C
+        // Whether the function is variadic (e.g. from C)
         c_variadic: bool,
-        // Whether the arguments have been bundled in a tuple (ex: closures)
+        // Whether all the arguments have been bundled in a tuple (ex: closures), or one has been splatted
         tuple_arguments: TupleArgumentsFlag,
         // The DefId for the function being called, for better error messages
         fn_def_id: Option<DefId>,
+        // The generics of the function being called. Only used for splatting
+        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
     ) {
         let tcx = self.tcx;
 
@@ -216,11 +234,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         // First, let's unify the formal method signature with the expectation eagerly.
-        // We use this to guide coercion inference; it's output is "fudged" which means
+        // We use this to guide coercion inference; its output is "fudged" which means
         // any remaining type variables are assigned to new, unrelated variables. This
         // is because the inference guidance here is only speculative.
+        // FIXME(splat): do we need to splat arguments before this type inference?
         let formal_output = self.resolve_vars_with_obligations(formal_output);
-        let expected_input_tys: Option<Vec<_>> = expectation
+        let mut expected_input_tys: Option<Vec<_>> = expectation
             .only_has_type(self)
             .and_then(|expected_output| {
                 // FIXME(#149379): This operation results in expected input
@@ -238,37 +257,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let origin = self.misc(call_span);
                     ocx.sup(&origin, self.param_env, expected_output, formal_output)?;
 
-                    let formal_input_tys_ns;
-                    let formal_input_tys = if self.next_trait_solver() {
-                        // In the new solver, the normalizations are done lazily.
-                        // Because of this, if we encounter unnormalized alias types inside this
-                        // fudge scope, we might lose the relationships between them and other vars
-                        // when fudging inference variables created here.
-                        // So, we utilize generalization to normalize aliases by adding a new
-                        // inference var and equating it with the type we want to pull out of the
-                        // fudge scope.
-                        formal_input_tys_ns = formal_input_tys
-                            .iter()
-                            .map(|&ty| {
-                                // If we replace a (unresolved) inference var with a new inference
-                                // var, it will be eventually resolved to itself and this will
-                                // weaken type inferences as the new inference var will be fudged
-                                // out and lose all relationships with other vars while the former
-                                // will not be fudged.
-                                if ty.is_ty_var() {
-                                    return ty;
-                                }
-
-                                let generalized_ty = self.next_ty_var(call_span);
-                                ocx.eq(&origin, self.param_env, ty, generalized_ty).unwrap();
-                                generalized_ty
-                            })
-                            .collect_vec();
-
-                        formal_input_tys_ns.as_slice()
-                    } else {
-                        formal_input_tys
-                    };
+                    // Check the well-formedness of expected input tys, as using ill-formed
+                    // expectation may cause type inference errors, see #150316.
+                    for &ty in formal_input_tys {
+                        ocx.register_obligation(traits::Obligation::new(
+                            self.tcx,
+                            self.misc(call_span),
+                            self.param_env,
+                            ty::ClauseKind::WellFormed(ty.into()),
+                        ));
+                    }
 
                     if !ocx.try_evaluate_obligations().is_empty() {
                         return Err(TypeError::Mismatch);
@@ -276,7 +274,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                     // Record all the argument types, with the args
                     // produced from the above subtyping unification.
-                    Ok(Some(formal_input_tys.to_vec()))
+                    Ok(Some(
+                        formal_input_tys
+                            .iter()
+                            .map(|&ty| self.resolve_vars_if_possible(ty))
+                            .collect(),
+                    ))
                 })
                 .ok()
             })
@@ -284,45 +287,33 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let mut err_code = E0061;
 
-        // If the arguments should be wrapped in a tuple (ex: closures), unwrap them here
-        let (formal_input_tys, expected_input_tys) = if tuple_arguments == TupleArguments {
-            let tuple_type = self.structurally_resolve_type(call_span, formal_input_tys[0]);
-            match tuple_type.kind() {
-                // We expected a tuple and got a tuple
-                ty::Tuple(arg_types) => {
-                    // Argument length differs
-                    if arg_types.len() != provided_args.len() {
-                        err_code = E0057;
-                    }
-                    let expected_input_tys = match expected_input_tys {
-                        Some(expected_input_tys) => match expected_input_tys.get(0) {
-                            Some(ty) => match ty.kind() {
-                                ty::Tuple(tys) => Some(tys.iter().collect()),
-                                _ => None,
-                            },
-                            None => None,
-                        },
-                        None => None,
-                    };
-                    (arg_types.iter().collect(), expected_input_tys)
-                }
-                _ => {
-                    // Otherwise, there's a mismatch, so clear out what we're expecting, and set
-                    // our input types to err_args so we don't blow up the error messages
-                    let guar = struct_span_code_err!(
-                        self.dcx(),
-                        call_span,
-                        E0059,
-                        "cannot use call notation; the first type parameter \
-                         for the function trait is neither a tuple nor unit"
-                    )
-                    .emit();
-                    (self.err_args(provided_args.len(), guar), None)
-                }
+        let mut formal_input_tys = formal_input_tys.to_vec();
+
+        // If the arguments should be wrapped in a tuple (ex: closures, splats), unwrap them here
+        if tuple_arguments.is_tupled() {
+            // Caller arguments are tupled before typechecking, starting at the given index.
+            // Tupling makes the callee and caller argument counts match.
+            let outcome = self.check_tupled_arguments(
+                call_span,
+                call_expr,
+                formal_input_tys,
+                provided_args,
+                expected_input_tys,
+                tuple_arguments,
+                fn_def_id,
+                callee_generic_args,
+            );
+            let TupledArgCheckOutcome {
+                new_err_code,
+                untupled_formal_input_tys,
+                untupled_expected_input_tys,
+            } = outcome;
+            if let Some(new_err_code) = new_err_code {
+                err_code = new_err_code;
             }
-        } else {
-            (formal_input_tys.to_vec(), expected_input_tys)
-        };
+            formal_input_tys = untupled_formal_input_tys;
+            expected_input_tys = untupled_expected_input_tys;
+        }
 
         // If there are no external expectations at the call site, just use the types from the function defn
         let expected_input_tys = if let Some(expected_input_tys) = expected_input_tys {
@@ -341,7 +332,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let demand_compatible = |idx| {
             let formal_input_ty: Ty<'tcx> = formal_input_tys[idx];
             let expected_input_ty: Ty<'tcx> = expected_input_tys[idx];
-            let provided_arg = &provided_args[idx];
+            let provided_arg: &hir::Expr<'tcx> = &provided_args[idx];
 
             debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
@@ -350,7 +341,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // 1. Unify the provided argument with the expected type
             let expectation = Expectation::rvalue_hint(self, expected_input_ty);
 
-            let checked_ty = self.check_expr_with_expectation(provided_arg, expectation);
+            // If we are processing first arg of delegation then we could have adjusted it
+            // in `execute_delegation_aware_arguments_check`.
+            let checked_ty = self
+                .tcx
+                .hir_opt_delegation_info(self.body_def_id)
+                .and_then(|_| self.typeck_results.borrow().node_type_opt(provided_arg.hir_id))
+                .unwrap_or_else(|| self.check_expr_with_expectation(provided_arg, expectation));
 
             // 2. Coerce to the most detailed type that could be coerced
             //    to, which is `expected_ty` if `rvalue_hint` returns an
@@ -476,7 +473,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty: Ty<'tcx>,
                     cast_ty: &str,
                 ) {
-                    sess.dcx().emit_err(errors::PassToVariadicFunction {
+                    sess.dcx().emit_err(diagnostics::PassToVariadicFunction {
                         span,
                         ty,
                         cast_ty,
@@ -486,25 +483,30 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
 
                 // There are a few types which get autopromoted when passed via varargs
-                // in C but we just error out instead and require explicit casts. An
-                // integer narrower than `int` (whose width is target-dependent) is
-                // promoted and must be cast; one already `int`-wide or wider is not.
+                // in C but we just error out instead and require explicit casts.
+                //
+                // We use implementations of VaArgSafe as the source of truth. On some embedded
+                // targets, c_double is f32 and c_int/c_uing are i16/u16, and these types implement
+                // VaArgSafe there. On all other targets, these types do not implement VaArgSafe.
+                //
+                // cfg(bootstrap): change the if let to an unwrap.
                 let arg_ty = self.structurally_resolve_type(arg.span, arg_ty);
-                let c_int_width = tcx.sess.target.c_int_width;
+                if let Some(trait_def_id) = tcx.lang_items().va_arg_safe()
+                    && self
+                        .type_implements_trait(trait_def_id, [arg_ty], self.param_env)
+                        .must_apply_modulo_regions()
+                {
+                    continue;
+                }
+
                 match arg_ty.kind() {
                     ty::Float(ty::FloatTy::F32) => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_double");
                     }
-                    ty::Int(ty::IntTy::I8) | ty::Bool => {
+                    ty::Int(ty::IntTy::I8 | ty::IntTy::I16) | ty::Bool => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_int");
                     }
-                    ty::Int(ty::IntTy::I16) if c_int_width > 16 => {
-                        variadic_error(tcx.sess, arg.span, arg_ty, "c_int");
-                    }
-                    ty::Uint(ty::UintTy::U8) => {
-                        variadic_error(tcx.sess, arg.span, arg_ty, "c_uint");
-                    }
-                    ty::Uint(ty::UintTy::U16) if c_int_width > 16 => {
+                    ty::Uint(ty::UintTy::U8 | ty::UintTy::U16) => {
                         variadic_error(tcx.sess, arg.span, arg_ty, "c_uint");
                     }
                     ty::FnDef(..) => {
@@ -512,7 +514,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let fn_ptr = self.resolve_vars_if_possible(fn_ptr).to_string();
 
                         let fn_item_spa = arg.span;
-                        tcx.sess.dcx().emit_err(errors::PassFnItemToVariadicFunction {
+                        tcx.sess.dcx().emit_err(diagnostics::PassFnItemToVariadicFunction {
                             span: fn_item_spa,
                             sugg_span: fn_item_spa.shrink_to_hi(),
                             replace: fn_ptr,
@@ -557,6 +559,258 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    /// Check arguments that are tupled by "rust-call" or `#[splat]`.
+    fn check_tupled_arguments(
+        &self,
+        // Span enclosing the call site
+        call_span: Span,
+        // Expression of the call site
+        call_expr: &'tcx hir::Expr<'tcx>,
+        // Types (as defined in the *signature* of the target function)
+        mut formal_input_tys: Vec<Ty<'tcx>>,
+        // The expressions for each provided argument
+        provided_args: &'tcx [hir::Expr<'tcx>],
+        // The expected input types from the context of the call site
+        mut expected_input_tys: Option<Vec<Ty<'tcx>>>,
+        // Whether all the arguments have been bundled in a tuple (ex: closures), or one has been splatted
+        tuple_arguments: TupleArgumentsFlag,
+        // The DefId for the function being called, for better error messages
+        fn_def_id: Option<DefId>,
+        // The generics of the function being called. Only used for splatting
+        callee_generic_args: Option<ty::GenericArgsRef<'tcx>>,
+    ) -> TupledArgCheckOutcome<'tcx> {
+        let (first_tupled_arg_index, is_self_splatted) = tuple_arguments.tupled_arg_index();
+        let Some(first_tupled_arg_index) = first_tupled_arg_index else {
+            // If we're not tupling any of the current arguments, we're done.
+            return TupledArgCheckOutcome {
+                new_err_code: None,
+                untupled_formal_input_tys: formal_input_tys,
+                untupled_expected_input_tys: expected_input_tys,
+            };
+        };
+        let first_tupled_arg_index_usz = usize::from(first_tupled_arg_index);
+
+        // The argument difference can range from -1 to u16::MAX - 1, so we count the number
+        // of tupled arguments instead.
+        // (An empty argument list becomes a unit tuple in the callee.)
+        // 0: f() -> f(#[splat] _: ())
+        // 1: f(a) -> f(#[splat] _: (A,))
+        // 2: f(a, b) -> f(#[splat] _: (A, B))
+        // The Fn* traits ensure this by construction, and `#[splat]` can only be applied to
+        // an actual argument.
+        let tupled_args_count = (1 + provided_args.len()).checked_sub(formal_input_tys.len());
+        debug!(
+            ?first_tupled_arg_index, ?is_self_splatted,
+            ?tupled_args_count, ?tuple_arguments,
+            provided_args_len = ?provided_args.len(), formal_input_tys_len = ?formal_input_tys.len()
+        );
+
+        // If earlier code has modified the FnSig argument list without adjusting the splatted
+        // argument, indexing into the formal input types will panic.
+        if first_tupled_arg_index_usz >= formal_input_tys.len() {
+            span_bug!(
+                call_span,
+                "splatted argument index is out of bounds: {first_tupled_arg_index:?} >= {}, \
+                is_self_splatted = {is_self_splatted:?}, \
+                tupled_args_count = {tupled_args_count:?}, {tuple_arguments:?}, \
+                provided_args: {}",
+                formal_input_tys.len(),
+                provided_args.len(),
+            );
+        }
+
+        let formal_input_tupled_ty = formal_input_tys[first_tupled_arg_index_usz];
+        // Keep the type variable if the argument is splatted, so we can force it to be a tuple later.
+        let tuple_type = if tuple_arguments.is_splatted() {
+            let callee_tuple_type = self.resolve_vars_with_obligations(formal_input_tupled_ty);
+            if callee_tuple_type.is_ty_var()
+                && let Some(tupled_args_count) = tupled_args_count
+            {
+                // Make the original type variable resolve to a tuple containing new type variables
+                let ocx = ObligationCtxt::new(self);
+                let origin = self.misc(call_span);
+
+                let new_tupled_type = Ty::new_tup_from_iter(
+                    self.tcx,
+                    iter::repeat_with(|| self.next_ty_var(call_span)).take(tupled_args_count),
+                );
+
+                // FIXME(splat): should this be a sub/super type relationship?
+                let ocx_error = ocx.eq(&origin, self.param_env, callee_tuple_type, new_tupled_type);
+                if let Err(ocx_error) = ocx_error {
+                    // FIXME(splat): add a test for this error and the one below, if they are reachable
+                    struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        // FIXME(splat): add a new error code before stabilization (and below as well)
+                        E0277,
+                        "cannot resolve splatted arguments; splatted type parameters \
+                        must be a tuple or unit type: {:?}",
+                        ocx_error,
+                    )
+                    .emit();
+                }
+
+                let type_errors = ocx.try_evaluate_obligations();
+                if type_errors.is_empty() {
+                    new_tupled_type
+                } else {
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        E0277,
+                        "cannot resolve splatted arguments; splatted type parameters \
+                        must be a tuple or unit type: {:?}",
+                        type_errors,
+                    )
+                    .emit();
+                    Ty::new_error(self.tcx, guar)
+                }
+            } else {
+                // Otherwise, just let the argument type checker make a suggestion
+                callee_tuple_type
+            }
+        } else {
+            self.structurally_resolve_type(call_span, formal_input_tupled_ty)
+        };
+
+        // We expected a tuple and got a tuple (or made one ourselves).
+        // If it's not a tuple, we error out in the next block.
+        let mut err_code = None;
+        if let ty::Tuple(detup_formal_arg_tys) = tuple_type.kind() {
+            // Argument length differs
+            // FIXME(splat): update the error code E0057 docs when splat is stabilized
+            if Some(detup_formal_arg_tys.len()) != tupled_args_count {
+                err_code = Some(E0057);
+            }
+            if let Some(ref mut expected_input_tys) = expected_input_tys
+                && let Some(ty) = expected_input_tys.get(first_tupled_arg_index_usz)
+                && let ty::Tuple(detup_expected_arg_tys) = ty.kind()
+            {
+                let substitute_tys = if Some(detup_expected_arg_tys.len()) == tupled_args_count {
+                    detup_expected_arg_tys.iter()
+                } else {
+                    // Just fall back to the formal argument types
+                    detup_formal_arg_tys.iter()
+                };
+
+                expected_input_tys.splice(
+                    first_tupled_arg_index_usz..=first_tupled_arg_index_usz,
+                    substitute_tys,
+                );
+            } else {
+                expected_input_tys = None;
+            }
+            formal_input_tys.splice(
+                first_tupled_arg_index_usz..=first_tupled_arg_index_usz,
+                detup_formal_arg_tys.iter(),
+            );
+            if let Some(ref expected_input_tys) = expected_input_tys {
+                assert_eq!(
+                    formal_input_tys.len(),
+                    expected_input_tys.len(),
+                    "incorrectly constructed input type tuples, argument counts must match: \
+                    tuple_arguments: {tuple_arguments:?}, \
+                    first_tupled_arg_index: {first_tupled_arg_index}",
+                )
+            }
+        }
+
+        // Otherwise, there's a mismatch during splatting or a rust-call.
+        // So clear out what we're expecting, and set our input types to err_args so we don't
+        // blow up the error messages.
+        let guar =
+            if tuple_arguments == TupleAllCallArgs && !matches!(tuple_type.kind(), ty::Tuple(_)) {
+                let guar = struct_span_code_err!(
+                    self.dcx(),
+                    call_span,
+                    E0059,
+                    "cannot use call notation; the first type parameter \
+                    for the function trait is neither a tuple nor unit"
+                )
+                .emit();
+
+                Some(guar)
+            } else if tuple_arguments.is_splatted() {
+                // If we don't check argument counts here, and there's a subtle bug in the code above,
+                // later compilation stages can fail in unrelated places with confusing errors.
+                if !matches!(tuple_type.kind(), ty::Tuple(_)) {
+                    let spans = if let Some(def_id) = fn_def_id
+                        && let Some(hir_node) = self.tcx.hir_get_if_local(def_id)
+                        && let Some(fn_decl) = hir_node.fn_decl()
+                        && let Some(arg_ty) = fn_decl.inputs.get(first_tupled_arg_index_usz)
+                    {
+                        let arg_def_span = arg_ty.span;
+                        vec![call_span, arg_def_span]
+                    } else {
+                        vec![call_span]
+                    };
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        spans,
+                        // FIXME(splat): add a new error code before stabilization
+                        E0277,
+                        "cannot use splat attribute; the splatted argument type \
+                        must be a tuple or unit, not a {:?} ({:?})",
+                        tuple_type.kind(),
+                        self.structurally_resolve_type(
+                            call_span,
+                            formal_input_tys[first_tupled_arg_index_usz]
+                        )
+                        .kind(),
+                    )
+                    .emit();
+
+                    Some(guar)
+                } else if formal_input_tys.len() != provided_args.len() {
+                    // FIXME(splat): suggest alternative argument counts, if there are any
+                    let guar = struct_span_code_err!(
+                        self.dcx(),
+                        call_span,
+                        E0057,
+                        "this splatted function takes {} arguments, but {} {} provided",
+                        formal_input_tys.len(),
+                        provided_args.len(),
+                        if provided_args.len() == 1 { "was" } else { "were" },
+                    )
+                    .emit();
+
+                    Some(guar)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(guar) = guar {
+            TupledArgCheckOutcome {
+                new_err_code: err_code,
+                untupled_formal_input_tys: self.err_args(provided_args.len(), guar),
+                untupled_expected_input_tys: None,
+            }
+        } else {
+            // If splatting, record this call in a side-table, so MIR lowering can tuple the caller's arguments
+            if tuple_arguments.is_splatted() {
+                // FIXME(const_trait_impl): does not enforce constness yet
+                self.write_splatted_call(
+                    call_expr.hir_id,
+                    call_span,
+                    fn_def_id,
+                    callee_generic_args,
+                    first_tupled_arg_index,
+                    tupled_args_count.unwrap().try_into().unwrap(),
+                );
+            }
+
+            TupledArgCheckOutcome {
+                new_err_code: err_code,
+                untupled_formal_input_tys: formal_input_tys,
+                untupled_expected_input_tys: expected_input_tys,
+            }
+        }
+    }
+
     /// If `unsized_fn_params` is active, check that unsized values are place expressions. Since
     /// the removal of `unsized_locals` in <https://github.com/rust-lang/rust/pull/142911> we can't
     /// store them in MIR locals as temporaries.
@@ -582,6 +836,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         fn_def_id: Option<DefId>,
         call_span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
+        // FIXME(splat): when the feature design is settled, improve the errors here
         tuple_arguments: TupleArgumentsFlag,
     ) -> ErrorGuaranteed {
         // Next, let's construct the error
@@ -720,6 +975,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_expr_lit(
         &self,
         lit: &hir::Lit,
+        lint_id: HirId,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
         let tcx = self.tcx;
@@ -767,7 +1023,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     ty::Float(_) => Some(ty),
                     _ => None,
                 });
-                opt_ty.unwrap_or_else(|| self.next_float_var())
+                opt_ty.unwrap_or_else(|| self.next_float_var(lit.span, Some(lint_id)))
             }
             ast::LitKind::Bool(_) => tcx.types.bool,
             ast::LitKind::CStr(_, _) => Ty::new_imm_ref(
@@ -961,14 +1217,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // wrapping in parentheses. We find the statement or expression
                         // following the `match` (`&& true`) and see if it is something that
                         // can reasonably be interpreted as a binop following an expression.
-                        err.multipart_suggestion(
-                            "parentheses are required to parse this as an expression",
-                            vec![
-                                (expr.span.shrink_to_lo(), "(".to_string()),
-                                (expr.span.shrink_to_hi(), ")".to_string()),
-                            ],
-                            Applicability::MachineApplicable,
-                        );
+                        err.subdiagnostic(ExprParenthesesNeeded::surrounding(expr.span));
                     } else if expr.can_have_side_effects() {
                         self.suggest_semicolon_at_end(expr.span, err);
                     }
@@ -1269,38 +1518,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         path_span: Span,
         hir_id: HirId,
     ) -> (Res, LoweredTy<'tcx>) {
+        let ResolvedStructPath { res: result, ty } =
+            self.lowerer().lower_path_for_struct_expr(*qpath, path_span, hir_id);
         match *qpath {
-            QPath::Resolved(ref maybe_qself, path) => {
-                let self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself).raw);
-                let ty = self.lowerer().lower_resolved_ty_path(
-                    self_ty,
-                    path,
-                    hir_id,
-                    PermitVariants::Yes,
-                );
-                (path.res, LoweredTy::from_raw(self, path_span, ty))
-            }
-            QPath::TypeRelative(hir_self_ty, segment) => {
-                let self_ty = self.lower_ty(hir_self_ty);
-
-                let result = self.lowerer().lower_type_relative_ty_path(
-                    self_ty.raw,
-                    hir_self_ty,
-                    segment,
-                    hir_id,
-                    path_span,
-                    PermitVariants::Yes,
-                );
-                let ty = result
-                    .map(|(ty, _, _)| ty)
-                    .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar));
+            QPath::Resolved(_, path) => (path.res, LoweredTy::from_raw(self, path_span, ty)),
+            QPath::TypeRelative(_, _) => {
                 let ty = LoweredTy::from_raw(self, path_span, ty);
-                let result = result.map(|(_, kind, def_id)| (kind, def_id));
+                let resolution =
+                    result.map(|res: Res| (self.tcx().def_kind(res.def_id()), res.def_id()));
 
                 // Write back the new resolution.
-                self.write_resolution(hir_id, result);
+                self.write_resolution(hir_id, resolution);
 
-                (result.map_or(Res::Err, |(kind, def_id)| Res::Def(kind, def_id)), ty)
+                (result.unwrap_or(Res::Err), ty)
             }
         }
     }
@@ -1380,8 +1610,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // If we're calling a method of a Fn/FnMut/FnOnce trait object implicitly
         // (eg invoking a closure) we want to point at the underlying callable,
         // not the method implicitly invoked (eg call_once).
-        // TupleArguments is set only when this is an implicit call (my_closure(...)) rather than explicit (my_closure.call(...))
-        if tuple_arguments == TupleArguments
+        // TupleAllCallArgs is set only when this is an implicit call `my_closure(...)` rather
+        // than explicit `my_closure.call(...)`.
+        if tuple_arguments == TupleAllCallArgs
             && let Some(assoc_item) = self.tcx.opt_associated_item(def_id)
             // Since this is an associated item, it might point at either an impl or a trait item.
             // We want it to always point to the trait item.
@@ -1396,7 +1627,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let callee_ty = callee_ty.peel_refs();
             match *callee_ty.kind() {
                 ty::Param(param) => {
-                    let param = self.tcx.generics_of(self.body_id).type_param(param, self.tcx);
+                    let param = self.tcx.generics_of(self.body_def_id).type_param(param, self.tcx);
                     if param.kind.is_synthetic() {
                         // if it's `impl Fn() -> ..` then just fall down to the def-id based logic
                         def_id = param.def_id;
@@ -1405,13 +1636,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // and point at that.
                         let instantiated = self
                             .tcx
-                            .explicit_predicates_of(self.body_id)
+                            .explicit_predicates_of(self.body_def_id)
                             .instantiate_identity(self.tcx);
                         // FIXME(compiler-errors): This could be problematic if something has two
                         // fn-like predicates with different args, but callable types really never
                         // do that, so it's OK.
                         for (predicate, span) in instantiated {
-                            if let ty::ClauseKind::Trait(pred) = predicate.kind().skip_binder()
+                            if let ty::ClauseKind::Trait(pred) =
+                                predicate.skip_norm_wip().kind().skip_binder()
                                 && pred.self_ty().peel_refs() == callee_ty
                                 && self.tcx.is_fn_trait(pred.def_id())
                             {
@@ -1421,7 +1653,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     }
                 }
-                ty::Alias(ty::Opaque, ty::AliasTy { def_id: new_def_id, .. })
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: new_def_id }, .. })
                 | ty::Closure(new_def_id, _)
                 | ty::FnDef(new_def_id, _) => {
                     def_id = new_def_id;
@@ -1467,25 +1699,44 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     deps: SmallVec<[ExpectedIdx; 4]>,
                 }
 
-                debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+                // FIXME(splat): fix the generic mismatch earlier, so it doesn't reach here
+                if !tuple_arguments.is_splatted() {
+                    debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+                }
                 // Gather all mismatched parameters with generics.
                 let mut mismatched_params = Vec::<MismatchedParam<'_>>::new();
+                let mut use_splat_fallback = false;
                 if let Some(expected_idx) = expected_idx {
                     let expected_idx = ExpectedIdx::from_usize(expected_idx);
-                    let &(expected_generic, ref expected_param) =
-                        &params_with_generics[expected_idx];
-                    if let Some(expected_generic) = expected_generic {
-                        mismatched_params.push(MismatchedParam {
-                            idx: expected_idx,
-                            generic: expected_generic,
-                            param: expected_param,
-                            deps: SmallVec::new(),
-                        });
-                    } else {
-                        // Still mark the mismatched parameter
-                        spans.push_span_label(expected_param.span(), "");
-                    }
-                } else {
+                    match params_with_generics.get(expected_idx) {
+                        Some(&(Some(expected_generic), ref expected_param)) => mismatched_params
+                            .push(MismatchedParam {
+                                idx: expected_idx,
+                                generic: expected_generic,
+                                param: expected_param,
+                                deps: SmallVec::new(),
+                            }),
+                        Some((None, expected_param)) => {
+                            // Still mark the mismatched parameter
+                            spans.push_span_label(expected_param.span(), "");
+                        }
+                        None => {
+                            if tuple_arguments.is_splatted() {
+                                // FIXME(splat): when the arg is splatted, adjust its index, to handle the type mismatch properly
+                                use_splat_fallback = true;
+                            } else {
+                                span_bug!(
+                                    self.tcx.def_span(def_id),
+                                    "arg index {} out of bounds for method with {} inputs",
+                                    expected_idx.as_usize(),
+                                    params_with_generics.len(),
+                                );
+                            }
+                        }
+                    };
+                }
+
+                if expected_idx.is_none() || use_splat_fallback {
                     mismatched_params.extend(
                         params_with_generics.iter_enumerated().zip(matched_inputs).filter_map(
                             |((idx, &(generic, ref param)), matched_idx)| {
@@ -1696,15 +1947,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         provided_arg_tys: &IndexVec<ProvidedIdx, (Ty<'tcx>, Span)>,
         formal_and_expected_inputs: &IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         is_method: bool,
+        is_splat: bool,
     ) {
         let Some(def_id) = callable_def_id else {
             return;
         };
 
         if let Some((params_with_generics, _)) = self.get_hir_param_info(def_id, is_method) {
-            debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+            // FIXME(splat): fix the generic mismatch earlier, so it doesn't reach here
+            if !is_splat {
+                debug_assert_eq!(params_with_generics.len(), matched_inputs.len());
+            }
             for (idx, (generic_param, _)) in params_with_generics.iter_enumerated() {
-                if matched_inputs[idx].is_none() {
+                if matched_inputs.get(idx).flatten_ref().is_none() {
                     continue;
                 }
 
@@ -1726,7 +1981,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let Some(other_generic_param) = other_generic_param else {
                             return false;
                         };
-                        if matched_inputs[other_idx].is_some() {
+                        if matched_inputs.get(other_idx).flatten_ref().is_some() {
                             return false;
                         }
                         other_generic_param == generic_param
@@ -1814,14 +2069,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             (Some(_), Some(_)) | (None, None) => unreachable!(),
             (Some(body), None) => {
                 let params = self.tcx.hir_body(body).params;
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((fn_inputs.zip(params.iter().map(FnParam::Param)).collect(), generics))
             }
             (None, Some(params)) => {
-                let params =
-                    params.get(is_method as usize..params.len() - sig.decl.c_variadic as usize)?;
+                let params = params
+                    .get(is_method as usize..params.len() - sig.decl.c_variadic() as usize)?;
                 debug_assert_eq!(params.len(), fn_inputs.len());
                 Some((
                     fn_inputs.zip(params.iter().map(|&ident| FnParam::Ident(ident))).collect(),
@@ -1903,14 +2158,14 @@ impl FnParam<'_> {
     }
 }
 
-struct FnCallDiagCtxt<'a, 'b, 'tcx> {
-    arg_matching_ctxt: ArgMatchingCtxt<'a, 'b, 'tcx>,
+struct FnCallDiagCtxt<'a, 'tcx> {
+    arg_matching_ctxt: ArgMatchingCtxt<'a, 'tcx>,
     errors: Vec<Error<'tcx>>,
     matched_inputs: IndexVec<ExpectedIdx, Option<ProvidedIdx>>,
 }
 
-impl<'a, 'b, 'tcx> Deref for FnCallDiagCtxt<'a, 'b, 'tcx> {
-    type Target = ArgMatchingCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for FnCallDiagCtxt<'a, 'tcx> {
+    type Target = ArgMatchingCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.arg_matching_ctxt
@@ -1923,9 +2178,9 @@ enum ArgumentsFormatting {
     Multiline { fallback_indent: String, brace_indent: String },
 }
 
-impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> FnCallDiagCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2029,7 +2284,11 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                             self.arg_matching_ctxt.args_ctxt.call_metadata.full_call_span,
                             format!(
                                 "{call_name} takes {}{} but {} {} supplied",
-                                if self.c_variadic { "at least " } else { "" },
+                                if self.arg_matching_ctxt.args_ctxt.c_variadic {
+                                    "at least "
+                                } else {
+                                    ""
+                                },
                                 potentially_plural_count(
                                     self.formal_and_expected_inputs.len(),
                                     "argument"
@@ -2078,7 +2337,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
             if cfg!(debug_assertions) {
                 span_bug!(self.call_metadata.error_span, "expected errors from argument matrix");
             } else {
-                let mut err = self.dcx().create_err(errors::ArgMismatchIndeterminate {
+                let mut err = self.dcx().create_err(diagnostics::ArgMismatchIndeterminate {
                     span: self.call_metadata.error_span,
                 });
                 self.arg_matching_ctxt.suggest_confusable(&mut err);
@@ -2172,14 +2431,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                 format!("arguments to this {call_name} are incorrect"),
             );
 
-            self.fn_ctxt.label_generic_mismatches(
-                &mut err,
-                self.fn_def_id,
-                &self.matched_inputs,
-                &self.provided_arg_tys,
-                &self.formal_and_expected_inputs,
-                self.call_metadata.is_method,
-            );
+            self.label_generic_mismatches(&mut err);
 
             if let hir::ExprKind::MethodCall(_, rcvr, _, _) =
                 self.arg_matching_ctxt.args_ctxt.call_ctxt.call_expr.kind
@@ -2262,7 +2514,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                     format!(
                         "this {} takes {}{} but {} {} supplied",
                         self.call_metadata.call_name,
-                        if self.c_variadic { "at least " } else { "" },
+                        if self.arg_matching_ctxt.args_ctxt.c_variadic { "at least " } else { "" },
                         potentially_plural_count(self.formal_and_expected_inputs.len(), "argument"),
                         potentially_plural_count(self.provided_args.len(), "argument"),
                         pluralize!("was", self.provided_args.len())
@@ -2348,6 +2600,17 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                         provided_span,
                         format!("unexpected argument{idx}{provided_ty_name}"),
                     ));
+                    if self.provided_arg_tys.len() == 1
+                        && let Some(span) = self.maybe_suggest_expect_for_unwrap(provided_ty)
+                    {
+                        err.span_suggestion_verbose(
+                            span,
+                            "did you mean to use `expect`?",
+                            "expect",
+                            Applicability::MaybeIncorrect,
+                        );
+                        continue;
+                    }
                     let mut span = provided_span;
                     if span.can_be_used_for_suggestions()
                         && self.call_metadata.error_span.can_be_used_for_suggestions()
@@ -2620,7 +2883,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
         (suggestions, labels, suggestion_text)
     }
 
-    fn label_generic_mismatches(&self, err: &mut Diag<'b>) {
+    fn label_generic_mismatches(&self, err: &mut Diag<'a>) {
         self.fn_ctxt.label_generic_mismatches(
             err,
             self.fn_def_id,
@@ -2628,6 +2891,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
             &self.provided_arg_tys,
             &self.formal_and_expected_inputs,
             self.call_metadata.is_method,
+            self.arg_matching_ctxt.tuple_arguments.is_splatted(),
         );
     }
 
@@ -2778,24 +3042,40 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
 
         (suggestion_span, suggestion)
     }
+
+    fn maybe_suggest_expect_for_unwrap(&self, provided_ty: Ty<'tcx>) -> Option<Span> {
+        let tcx = self.tcx();
+        if let Some(call_ident) = self.call_metadata.call_ident
+            && call_ident.name == sym::unwrap
+            && let Some(callee_ty) = self.callee_ty
+            && let ty::Adt(adt, _) = callee_ty.peel_refs().kind()
+            && (tcx.is_diagnostic_item(sym::Option, adt.did())
+                || tcx.is_diagnostic_item(sym::Result, adt.did()))
+            && self.may_coerce(provided_ty, Ty::new_static_str(tcx))
+        {
+            Some(call_ident.span)
+        } else {
+            None
+        }
+    }
 }
 
-struct ArgMatchingCtxt<'a, 'b, 'tcx> {
-    args_ctxt: ArgsCtxt<'a, 'b, 'tcx>,
+struct ArgMatchingCtxt<'a, 'tcx> {
+    args_ctxt: ArgsCtxt<'a, 'tcx>,
     provided_arg_tys: IndexVec<ProvidedIdx, (Ty<'tcx>, Span)>,
 }
 
-impl<'a, 'b, 'tcx> Deref for ArgMatchingCtxt<'a, 'b, 'tcx> {
-    type Target = ArgsCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for ArgMatchingCtxt<'a, 'tcx> {
+    type Target = ArgsCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.args_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> ArgMatchingCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> ArgMatchingCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2926,23 +3206,23 @@ impl<'a, 'b, 'tcx> ArgMatchingCtxt<'a, 'b, 'tcx> {
     }
 }
 
-struct ArgsCtxt<'a, 'b, 'tcx> {
-    call_ctxt: CallCtxt<'a, 'b, 'tcx>,
+struct ArgsCtxt<'a, 'tcx> {
+    call_ctxt: CallCtxt<'a, 'tcx>,
     call_metadata: CallMetadata,
     args_span: Span,
 }
 
-impl<'a, 'b, 'tcx> Deref for ArgsCtxt<'a, 'b, 'tcx> {
-    type Target = CallCtxt<'a, 'b, 'tcx>;
+impl<'a, 'tcx> Deref for ArgsCtxt<'a, 'tcx> {
+    type Target = CallCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.call_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> ArgsCtxt<'a, 'tcx> {
     fn new(
-        arg: &'a FnCtxt<'b, 'tcx>,
+        arg: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx Expr<'tcx>>,
@@ -2953,7 +3233,7 @@ impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
         call_expr: &'tcx Expr<'tcx>,
         tuple_arguments: TupleArgumentsFlag,
     ) -> Self {
-        let call_ctxt: CallCtxt<'_, '_, '_> = CallCtxt::new(
+        let call_ctxt: CallCtxt<'_, '_> = CallCtxt::new(
             arg,
             compatibility_diagonal,
             formal_and_expected_inputs,
@@ -3035,7 +3315,8 @@ impl<'a, 'b, 'tcx> ArgsCtxt<'a, 'b, 'tcx> {
                 .fn_ctxt
                 .tcx
                 .fn_sig(assoc.def_id)
-                .instantiate(self.call_ctxt.fn_ctxt.tcx, args);
+                .instantiate(self.call_ctxt.fn_ctxt.tcx, args)
+                .skip_norm_wip();
 
             self.call_ctxt.fn_ctxt.instantiate_binder_with_fresh_vars(
                 call_name.span,
@@ -3059,8 +3340,8 @@ struct CallMetadata {
     is_method: bool,
 }
 
-struct CallCtxt<'a, 'b, 'tcx> {
-    fn_ctxt: &'a FnCtxt<'b, 'tcx>,
+struct CallCtxt<'a, 'tcx> {
+    fn_ctxt: &'a FnCtxt<'a, 'tcx>,
     compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
     formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
     provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
@@ -3074,17 +3355,17 @@ struct CallCtxt<'a, 'b, 'tcx> {
     callee_ty: Option<Ty<'tcx>>,
 }
 
-impl<'a, 'b, 'tcx> Deref for CallCtxt<'a, 'b, 'tcx> {
-    type Target = &'a FnCtxt<'b, 'tcx>;
+impl<'a, 'tcx> Deref for CallCtxt<'a, 'tcx> {
+    type Target = &'a FnCtxt<'a, 'tcx>;
 
     fn deref(&self) -> &Self::Target {
         &self.fn_ctxt
     }
 }
 
-impl<'a, 'b, 'tcx> CallCtxt<'a, 'b, 'tcx> {
+impl<'a, 'tcx> CallCtxt<'a, 'tcx> {
     fn new(
-        fn_ctxt: &'a FnCtxt<'b, 'tcx>,
+        fn_ctxt: &'a FnCtxt<'a, 'tcx>,
         compatibility_diagonal: IndexVec<ProvidedIdx, Compatibility<'tcx>>,
         formal_and_expected_inputs: IndexVec<ExpectedIdx, (Ty<'tcx>, Ty<'tcx>)>,
         provided_args: IndexVec<ProvidedIdx, &'tcx hir::Expr<'tcx>>,
@@ -3094,7 +3375,7 @@ impl<'a, 'b, 'tcx> CallCtxt<'a, 'b, 'tcx> {
         call_span: Span,
         call_expr: &'tcx hir::Expr<'tcx>,
         tuple_arguments: TupleArgumentsFlag,
-    ) -> CallCtxt<'a, 'b, 'tcx> {
+    ) -> CallCtxt<'a, 'tcx> {
         let callee_expr = match &call_expr.peel_blocks().kind {
             hir::ExprKind::Call(callee, _) => Some(*callee),
             hir::ExprKind::MethodCall(_, receiver, ..) => {

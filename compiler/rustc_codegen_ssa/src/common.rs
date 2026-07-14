@@ -90,20 +90,20 @@ pub enum TypeKind {
 }
 
 // FIXME(mw): Anything that is produced via DepGraph::with_task() must implement
-//            the HashStable trait. Normally DepGraph::with_task() calls are
+//            the StableHash trait. Normally DepGraph::with_task() calls are
 //            hidden behind queries, but CGU creation is a special case in two
 //            ways: (1) it's not a query and (2) CGU are output nodes, so their
 //            Fingerprints are not actually needed. It remains to be clarified
 //            how exactly this case will be handled in the red/green system but
-//            for now we content ourselves with providing a no-op HashStable
+//            for now we content ourselves with providing a no-op StableHash
 //            implementation for CGUs.
 mod temp_stable_hash_impls {
-    use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+    use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 
     use crate::ModuleCodegen;
 
-    impl<HCX, M> HashStable<HCX> for ModuleCodegen<M> {
-        fn hash_stable(&self, _: &mut HCX, _: &mut StableHasher) {
+    impl<M> StableHash for ModuleCodegen<M> {
+        fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, _: &mut StableHasher) {
             // do nothing
         }
     }
@@ -117,7 +117,11 @@ pub(crate) fn build_langcall<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let tcx = bx.tcx();
     let def_id = tcx.require_lang_item(li, span);
     let instance = ty::Instance::mono(tcx, def_id);
-    (bx.fn_abi_of_instance(instance, ty::List::empty()), bx.get_fn_addr(instance), instance)
+    (
+        bx.fn_abi_of_instance(instance, ty::List::empty()),
+        bx.get_fn_addr(instance, Some(PacMetadata::default())),
+        instance,
+    )
 }
 
 pub(crate) fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(

@@ -7,6 +7,7 @@ extern crate rustc_driver as _;
 
 pub use salsa;
 pub use salsa_macros;
+use span::TextSize;
 
 // FIXME: Rename this crate, base db is non descriptive
 mod change;
@@ -36,9 +37,8 @@ pub use query_group;
 use rustc_hash::{FxHashSet, FxHasher};
 use salsa::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
-use syntax::{Parse, SyntaxError, ast};
 use triomphe::Arc;
-pub use vfs::{AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
+pub use vfs::{AbsPathBuf, AnchoredPath, AnchoredPathBuf, FileId, VfsPath, file_set::FileSet};
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
 pub type FxIndexMap<K, V> =
@@ -50,6 +50,7 @@ macro_rules! impl_intern_key {
         #[salsa_macros::interned(no_lifetime, revisions = usize::MAX)]
         #[derive(PartialOrd, Ord)]
         pub struct $id {
+            #[returns(ref)]
             pub loc: $loc,
         }
 
@@ -169,14 +170,30 @@ impl Files {
         };
     }
 
-    pub fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput {
+    pub fn file_source_root(
+        &self,
+        db: &dyn SourceDatabase,
+        id: vfs::FileId,
+    ) -> FileSourceRootInput {
         let file_source_root = match self.file_source_roots.get(&id) {
             Some(file_source_root) => file_source_root,
             None => panic!(
-                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}); this is a bug",
+                "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
+                self.path_for_file(db, id)
+                    .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
             ),
         };
         *file_source_root
+    }
+
+    fn path_for_file(&self, db: &dyn SourceDatabase, id: vfs::FileId) -> Option<vfs::VfsPath> {
+        for source_root in &*self.source_roots {
+            let source_root = *source_root.value();
+            if let Some(path) = source_root.source_root(db).path_for_file(&id) {
+                return Some(path.clone());
+            }
+        }
+        None
     }
 
     pub fn set_file_source_root_with_durability(
@@ -236,36 +253,6 @@ pub struct SourceRootInput {
     pub source_root: Arc<SourceRoot>,
 }
 
-/// Database which stores all significant input facts: source code and project
-/// model. Everything else in rust-analyzer is derived from these queries.
-#[query_group::query_group]
-pub trait RootQueryDb: SourceDatabase + salsa::Database {
-    /// Parses the file into the syntax tree.
-    #[salsa::invoke(parse)]
-    #[salsa::lru(128)]
-    fn parse(&self, file_id: EditionedFileId) -> Parse<ast::SourceFile>;
-
-    /// Returns the set of errors obtained from parsing the file including validation errors.
-    #[salsa::transparent]
-    fn parse_errors(&self, file_id: EditionedFileId) -> Option<&[SyntaxError]>;
-
-    #[salsa::transparent]
-    fn toolchain_channel(&self, krate: Crate) -> Option<ReleaseChannel>;
-
-    /// Crates whose root file is in `id`.
-    #[salsa::invoke_interned(source_root_crates)]
-    fn source_root_crates(&self, id: SourceRootId) -> Arc<[Crate]>;
-
-    #[salsa::transparent]
-    fn relevant_crates(&self, file_id: FileId) -> Arc<[Crate]>;
-
-    /// Returns the crates in topological order.
-    ///
-    /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    #[salsa::input]
-    fn all_crates(&self) -> Arc<Box<[Crate]>>;
-}
-
 #[salsa_macros::db]
 pub trait SourceDatabase: salsa::Database {
     /// Text of the file.
@@ -311,6 +298,8 @@ pub trait SourceDatabase: salsa::Database {
     fn crates_map(&self) -> Arc<CratesMap>;
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
+
+    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;
 }
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
@@ -353,46 +342,67 @@ impl CrateWorkspaceData {
     }
 }
 
-fn toolchain_channel(db: &dyn RootQueryDb, krate: Crate) -> Option<ReleaseChannel> {
+pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre))
 }
 
-fn parse(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Parse<ast::SourceFile> {
-    let _p = tracing::info_span!("parse", ?file_id).entered();
-    let (file_id, edition) = file_id.unpack(db.as_dyn_database());
-    let text = db.file_text(file_id).text(db);
-    ast::SourceFile::parse(text, edition)
+#[salsa::input(singleton, debug)]
+struct AllCrates {
+    crates: std::sync::Arc<[Crate]>,
 }
 
-fn parse_errors(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Option<&[SyntaxError]> {
-    #[salsa_macros::tracked(returns(ref))]
-    fn parse_errors(db: &dyn RootQueryDb, file_id: EditionedFileId) -> Option<Box<[SyntaxError]>> {
-        let errors = db.parse(file_id).errors();
-        match &*errors {
-            [] => None,
-            [..] => Some(errors.into()),
-        }
+pub fn set_all_crates_with_durability(
+    db: &mut dyn salsa::Database,
+    crates: impl IntoIterator<Item = Crate>,
+    durability: Durability,
+) {
+    AllCrates::try_get(db)
+        .unwrap_or_else(|| AllCrates::new(db, std::sync::Arc::default()))
+        .set_crates(db)
+        .with_durability(durability)
+        .to(crates.into_iter().collect());
+}
+
+/// Returns the crates in topological order.
+///
+/// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
+pub fn all_crates(db: &dyn salsa::Database) -> std::sync::Arc<[Crate]> {
+    AllCrates::try_get(db).map_or(std::sync::Arc::default(), |all_crates| all_crates.crates(db))
+}
+
+// FIXME: VFS rewrite should allow us to get rid of this wrapper
+#[doc(hidden)]
+#[salsa::interned]
+pub struct InternedSourceRootId {
+    pub id: SourceRootId,
+}
+
+/// Crates whose root file is in `id`.
+pub fn source_root_crates(db: &dyn SourceDatabase, id: SourceRootId) -> &[Crate] {
+    #[salsa::tracked(returns(deref))]
+    pub fn source_root_crates<'db>(
+        db: &'db dyn SourceDatabase,
+        id: InternedSourceRootId<'db>,
+    ) -> Box<[Crate]> {
+        let crates = AllCrates::get(db).crates(db);
+        let id = id.id(db);
+        crates
+            .iter()
+            .copied()
+            .filter(|&krate| {
+                let root_file = krate.data(db).root_file_id;
+                db.file_source_root(root_file).source_root_id(db) == id
+            })
+            .collect()
     }
-    parse_errors(db, file_id).as_ref().map(|it| &**it)
+    source_root_crates(db, InternedSourceRootId::new(db, id))
 }
 
-fn source_root_crates(db: &dyn RootQueryDb, id: SourceRootId) -> Arc<[Crate]> {
-    let crates = db.all_crates();
-    crates
-        .iter()
-        .copied()
-        .filter(|&krate| {
-            let root_file = krate.data(db).root_file_id;
-            db.file_source_root(root_file).source_root_id(db) == id
-        })
-        .collect()
-}
-
-fn relevant_crates(db: &dyn RootQueryDb, file_id: FileId) -> Arc<[Crate]> {
+pub fn relevant_crates(db: &dyn SourceDatabase, file_id: FileId) -> &[Crate] {
     let _p = tracing::info_span!("relevant_crates").entered();
 
     let source_root = db.file_source_root(file_id);
-    db.source_root_crates(source_root.source_root_id(db))
+    source_root_crates(db, source_root.source_root_id(db))
 }
 
 #[must_use]

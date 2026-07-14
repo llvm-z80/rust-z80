@@ -8,6 +8,7 @@ mod suggestions;
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 
+pub(crate) use inspect_obligations::UseSubtyping;
 use rustc_errors::DiagCtxtHandle;
 use rustc_hir::attrs::{DivergingBlockBehavior, DivergingFallbackBehavior};
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -17,7 +18,9 @@ use rustc_hir_analysis::hir_ty_lowering::{
 };
 use rustc_infer::infer::{self, RegionVariableOrigin};
 use rustc_infer::traits::{DynCompatibilityViolation, Obligation};
-use rustc_middle::ty::{self, Const, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{
+    self, CantBeErased, Const, Flags, Ty, TyCtxt, TypeVisitableExt, TypingMode, Unnormalized,
+};
 use rustc_session::Session;
 use rustc_span::{self, DUMMY_SP, ErrorGuaranteed, Ident, Span};
 use rustc_trait_selection::error_reporting::TypeErrCtxt;
@@ -40,7 +43,7 @@ use crate::{CoroutineTypes, Diverges, EnclosingBreakables, TypeckRootCtxt};
 ///
 /// [`InferCtxt`]: infer::InferCtxt
 pub(crate) struct FnCtxt<'a, 'tcx> {
-    pub(super) body_id: LocalDefId,
+    pub(super) body_def_id: LocalDefId,
 
     /// The parameter environment used for proving trait obligations
     /// in this function. This can change when we descend into
@@ -135,12 +138,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn new(
         root_ctxt: &'a TypeckRootCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        body_id: LocalDefId,
+        body_def_id: LocalDefId,
     ) -> FnCtxt<'a, 'tcx> {
         let (diverging_fallback_behavior, diverging_block_behavior) =
             never_type_behavior(root_ctxt.tcx);
         FnCtxt {
-            body_id,
+            body_def_id,
             param_env,
             ret_coercion: None,
             ret_coercion_span: Cell::new(None),
@@ -161,6 +164,12 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    pub(crate) fn typing_mode(&self) -> TypingMode<'tcx, CantBeErased> {
+        // `FnCtxt` is never constructed in the trait solver, so we can safely use
+        // `assert_not_erased`.
+        self.infcx.typing_mode_raw().assert_not_erased()
+    }
+
     pub(crate) fn dcx(&self) -> DiagCtxtHandle<'a> {
         self.root_ctxt.infcx.dcx()
     }
@@ -170,7 +179,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
         code: ObligationCauseCode<'tcx>,
     ) -> ObligationCause<'tcx> {
-        ObligationCause::new(span, self.body_id, code)
+        ObligationCause::new(span, self.body_def_id, code)
     }
 
     pub(crate) fn misc(&self, span: Span) -> ObligationCause<'tcx> {
@@ -189,25 +198,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn err_ctxt(&'a self) -> TypeErrCtxt<'a, 'tcx> {
         TypeErrCtxt {
             infcx: &self.infcx,
+            param_env: Some(self.param_env),
             typeck_results: Some(self.typeck_results.borrow()),
             diverging_fallback_has_occurred: self.diverging_fallback_has_occurred.get(),
-            normalize_fn_sig: Box::new(|fn_sig| {
-                if fn_sig.has_escaping_bound_vars() {
-                    return fn_sig;
-                }
-                self.probe(|_| {
-                    let ocx = ObligationCtxt::new(self);
-                    let normalized_fn_sig =
-                        ocx.normalize(&ObligationCause::dummy(), self.param_env, fn_sig);
-                    if ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
-                        let normalized_fn_sig = self.resolve_vars_if_possible(normalized_fn_sig);
-                        if !normalized_fn_sig.has_infer() {
-                            return normalized_fn_sig;
-                        }
-                    }
-                    fn_sig
-                })
-            }),
             autoderef_steps: Box::new(|ty| {
                 let mut autoderef = self.autoderef(DUMMY_SP, ty).silence_errors();
                 let mut steps = vec![];
@@ -237,7 +230,7 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
     }
 
     fn item_def_id(&self) -> LocalDefId {
-        self.body_id
+        self.body_def_id
     }
 
     fn re_infer(&self, span: Span, reason: RegionInferReason<'_>) -> ty::Region<'tcx> {
@@ -279,7 +272,7 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
 
             self.trait_ascriptions.borrow_mut().entry(hir_id.local_id).or_default().push(clause);
 
-            let clause = self.normalize(span, clause);
+            let clause = self.normalize(span, Unnormalized::new_wip(clause));
             self.register_predicate(Obligation::new(
                 self.tcx,
                 self.misc(span),
@@ -302,11 +295,11 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
         // HACK(eddyb) should get the original `Span`.
         let span = tcx.def_span(def_id);
 
-        ty::EarlyBinder::bind(tcx.arena.alloc_from_iter(
-            self.param_env.caller_bounds().iter().filter_map(|predicate| {
-                match predicate.kind().skip_binder() {
+        ty::EarlyBinder::bind_iter(tcx.arena.alloc_from_iter(
+            self.param_env.caller_bounds().iter().filter_map(|clause| {
+                match clause.kind().skip_binder() {
                     ty::ClauseKind::Trait(data) if data.self_ty().is_param(index) => {
-                        Some((predicate, span))
+                        Some((ty::set_aliases_to_non_rigid(tcx, clause).skip_norm_wip(), span))
                     }
                     _ => None,
                 }
@@ -326,7 +319,11 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
 
         let mut filter_iat_candidate = |self_ty, impl_| {
             let ocx = ObligationCtxt::new_with_diagnostics(self);
-            let self_ty = ocx.normalize(&ObligationCause::dummy(), self.param_env, self_ty);
+            let self_ty = ocx.normalize(
+                &ObligationCause::dummy(),
+                self.param_env,
+                Unnormalized::new_wip(self_ty),
+            );
 
             let impl_args = infcx.fresh_args_for_item(span, impl_);
             let impl_ty = tcx.type_of(impl_).instantiate(tcx, impl_args);
@@ -339,9 +336,9 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
 
             // Check whether the impl imposes obligations we have to worry about.
             let impl_bounds = tcx.predicates_of(impl_).instantiate(tcx, impl_args);
-            let impl_bounds = ocx.normalize(&ObligationCause::dummy(), self.param_env, impl_bounds);
             let impl_obligations = traits::predicates_for_generics(
                 |_, _| ObligationCause::dummy(),
+                |pred| ocx.normalize(&ObligationCause::dummy(), self.param_env, pred),
                 self.param_env,
                 impl_bounds,
             );
@@ -403,14 +400,14 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
         match ty.kind() {
             ty::Adt(adt_def, _) => Some(*adt_def),
             // FIXME(#104767): Should we handle bound regions here?
-            ty::Alias(ty::Projection | ty::Inherent | ty::Free, _)
-                if !ty.has_escaping_bound_vars() =>
-            {
-                if self.next_trait_solver() {
-                    self.try_structurally_resolve_type(span, ty).ty_adt_def()
-                } else {
-                    self.normalize(span, ty).ty_adt_def()
-                }
+            ty::Alias(
+                _,
+                ty::AliasTy {
+                    kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. },
+                    ..
+                },
+            ) if !ty.has_escaping_bound_vars() => {
+                self.normalize(span, Unnormalized::new_wip(ty)).ty_adt_def()
             }
             _ => None,
         }
@@ -423,13 +420,15 @@ impl<'tcx> HirTyLowerer<'tcx> for FnCtxt<'_, 'tcx> {
             // WF obligations that are registered elsewhere, but they have a
             // better cause code assigned to them in `add_required_obligations_for_hir`.
             // This means that they should shadow obligations with worse spans.
-            if let ty::Alias(ty::Projection | ty::Free, ty::AliasTy { args, def_id, .. }) =
-                ty.kind()
+            if let ty::Alias(
+                _,
+                ty::AliasTy { kind: ty::Projection { def_id } | ty::Free { def_id }, args, .. },
+            ) = ty.kind()
             {
                 self.add_required_obligations_for_hir(span, *def_id, args, hir_id);
             }
 
-            self.normalize(span, ty)
+            self.normalize(span, Unnormalized::new_wip(ty))
         } else {
             ty
         };
@@ -477,15 +476,7 @@ pub(crate) struct LoweredTy<'tcx> {
 
 impl<'tcx> LoweredTy<'tcx> {
     fn from_raw(fcx: &FnCtxt<'_, 'tcx>, span: Span, raw: Ty<'tcx>) -> LoweredTy<'tcx> {
-        // FIXME(-Znext-solver=no): This is easier than requiring all uses of `LoweredTy`
-        // to call `try_structurally_resolve_type` instead. This seems like a lot of
-        // effort, especially as we're still supporting the old solver. We may revisit
-        // this in the future.
-        let normalized = if fcx.next_trait_solver() {
-            fcx.try_structurally_resolve_type(span, raw)
-        } else {
-            fcx.normalize(span, raw)
-        };
+        let normalized = fcx.normalize(span, Unnormalized::new_wip(raw));
         LoweredTy { raw, normalized }
     }
 }

@@ -1,7 +1,6 @@
 //! Abstract Syntax Tree, layered on top of untyped `SyntaxNode`s
 
 pub mod edit;
-pub mod edit_in_place;
 mod expr_ext;
 mod generated;
 pub mod make;
@@ -25,9 +24,9 @@ pub use self::{
     expr_ext::{ArrayExprKind, BlockModifier, CallableExpr, ElseBranch, LiteralKind},
     generated::{nodes::*, tokens::*},
     node_ext::{
-        AttrKind, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind, SelfParamKind,
-        SlicePatComponents, StructKind, TokenTreeChildren, TypeBoundKind, TypeOrConstParam,
-        VisibilityKind,
+        AttrKind, CfgAtomKey, FieldKind, Macro, NameLike, NameOrNameRef, PathSegmentKind,
+        SelfParamKind, SlicePatComponents, StructKind, TokenTreeChildren, TypeBoundKind,
+        TypeOrConstParam, VisibilityKind,
     },
     operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
     token_ext::{

@@ -1,4 +1,3 @@
-use hir::db::ExpandDatabase;
 use ide_db::source_change::SourceChange;
 use ide_db::text_edit::TextEdit;
 use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T, ast};
@@ -8,8 +7,8 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 // Diagnostic: need-mut
 //
 // This diagnostic is triggered on mutating an immutable variable.
-pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option<Diagnostic> {
-    let root = ctx.sema.db.parse_or_expand(d.span.file_id);
+pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NeedMut) -> Option<Diagnostic> {
+    let root = d.span.file_id.parse_or_expand(ctx.sema.db);
     let node = d.span.value.to_node(&root);
     let mut span = d.span;
     if let Some(parent) = node.parent()
@@ -63,7 +62,10 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
 // Diagnostic: unused-mut
 //
 // This diagnostic is triggered when a mutable variable isn't actually mutated.
-pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Option<Diagnostic> {
+pub(crate) fn unused_mut(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::UnusedMut,
+) -> Option<Diagnostic> {
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
     let fixes = (|| {
         let file_id = ast.file_id.file_id()?;
@@ -87,7 +89,6 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Op
             use_range,
         )])
     })();
-    let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
     Some(
         Diagnostic::new_with_syntax_node_ptr(
             ctx,
@@ -1311,7 +1312,7 @@ fn main() {
     fn regression_20662() {
         check_diagnostics(
             r#"
-//- minicore: index
+//- minicore: index, slice
 pub trait A: core::ops::IndexMut<usize> {
     type T: A;
 }

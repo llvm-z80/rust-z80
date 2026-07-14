@@ -257,8 +257,6 @@ use crate::{fmt, intrinsics};
 )]
 #[expect(missing_debug_implementations)]
 mod private {
-    pub(super) trait Sealed {}
-
     #[cfg(target_has_atomic_load_store = "8")]
     #[repr(C, align(1))]
     pub struct Align1<T>(T);
@@ -271,7 +269,7 @@ mod private {
     #[cfg(target_has_atomic_load_store = "64")]
     #[repr(C, align(8))]
     pub struct Align8<T>(T);
-    #[cfg(target_has_atomic_load_store = "128")]
+    #[cfg(any(target_has_atomic_load_store = "128", doc))]
     #[repr(C, align(16))]
     pub struct Align16<T>(T);
 }
@@ -291,26 +289,47 @@ mod private {
     reason = "implementation detail which may disappear or be replaced at any time",
     issue = "none"
 )]
-#[expect(private_bounds)]
-pub unsafe trait AtomicPrimitive: Sized + Copy + private::Sealed {
+pub impl(self) unsafe trait AtomicPrimitive: Sized + Copy {
     /// Temporary implementation detail.
     type Storage: Sized;
 }
 
-macro impl_atomic_primitive(
-    [$($T:ident)?] $Primitive:ty as $Storage:ident<$Operand:ty>, size($size:literal)
-) {
-    impl $(<$T>)? private::Sealed for $Primitive {}
+macro impl_atomic_primitive {
+    (
+        @impl [$($T:ident)?] $Primitive:ty as $Storage:ident<$Operand:ty>,
+        $cfg:meta
+    ) => {
+        #[unstable(
+            feature = "atomic_internals",
+            reason = "implementation detail which may disappear or be replaced at any time",
+            issue = "none"
+        )]
+        #[cfg($cfg)]
+        unsafe impl $(<$T>)? AtomicPrimitive for $Primitive {
+            type Storage = private::$Storage<$Operand>;
+        }
+    },
 
-    #[unstable(
-        feature = "atomic_internals",
-        reason = "implementation detail which may disappear or be replaced at any time",
-        issue = "none"
-    )]
-    #[cfg(target_has_atomic_load_store = $size)]
-    unsafe impl $(<$T>)? AtomicPrimitive for $Primitive {
-        type Storage = private::$Storage<$Operand>;
-    }
+    (
+        [$($T:ident)?] $Primitive:ty as $Storage:ident<$Operand:ty>,
+        size($size:literal)
+    ) => {
+        impl_atomic_primitive!(
+            @impl [$($T)?] $Primitive as $Storage<$Operand>,
+            target_has_atomic_load_store = $size
+        );
+    },
+
+    (
+        [$($T:ident)?] $Primitive:ty as $Storage:ident<$Operand:ty>,
+        size($size:literal),
+        doc
+    ) => {
+        impl_atomic_primitive!(
+            @impl [$($T)?] $Primitive as $Storage<$Operand>,
+            any(target_has_atomic_load_store = $size, doc)
+        );
+    },
 }
 
 impl_atomic_primitive!([] bool as Align1<u8>, size("8"));
@@ -322,8 +341,8 @@ impl_atomic_primitive!([] i32 as Align4<i32>, size("32"));
 impl_atomic_primitive!([] u32 as Align4<u32>, size("32"));
 impl_atomic_primitive!([] i64 as Align8<i64>, size("64"));
 impl_atomic_primitive!([] u64 as Align8<u64>, size("64"));
-impl_atomic_primitive!([] i128 as Align16<i128>, size("128"));
-impl_atomic_primitive!([] u128 as Align16<u128>, size("128"));
+impl_atomic_primitive!([] i128 as Align16<i128>, size("128"), doc);
+impl_atomic_primitive!([] u128 as Align16<u128>, size("128"), doc);
 
 #[cfg(target_pointer_width = "16")]
 impl_atomic_primitive!([] isize as Align2<isize>, size("ptr"));
@@ -613,7 +632,6 @@ impl AtomicBool {
     /// # Examples
     ///
     /// ```
-    /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicBool, Ordering};
     ///
     /// let mut some_bool = true;
@@ -622,8 +640,8 @@ impl AtomicBool {
     /// assert_eq!(some_bool, false);
     /// ```
     #[inline]
-    #[cfg(target_has_atomic_equal_alignment = "8")]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[cfg(target_has_atomic_primitive_alignment = "8")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn from_mut(v: &mut bool) -> &mut Self {
         // SAFETY: the mutable reference guarantees unique ownership, and
         // alignment of both `bool` and `Self` is 1.
@@ -638,7 +656,6 @@ impl AtomicBool {
     /// # Examples
     ///
     /// ```ignore-wasm
-    /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicBool, Ordering};
     ///
     /// let mut some_bools = [const { AtomicBool::new(false) }; 10];
@@ -658,7 +675,7 @@ impl AtomicBool {
     /// });
     /// ```
     #[inline]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn get_mut_slice(this: &mut [Self]) -> &mut [bool] {
         // SAFETY: the mutable reference guarantees unique ownership.
         unsafe { &mut *(this as *mut [Self] as *mut [bool]) }
@@ -669,7 +686,6 @@ impl AtomicBool {
     /// # Examples
     ///
     /// ```rust,ignore-wasm
-    /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicBool, Ordering};
     ///
     /// let mut some_bools = [false; 10];
@@ -682,8 +698,8 @@ impl AtomicBool {
     /// assert_eq!(some_bools, [true; 10]);
     /// ```
     #[inline]
-    #[cfg(target_has_atomic_equal_alignment = "8")]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[cfg(target_has_atomic_primitive_alignment = "8")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn from_mut_slice(v: &mut [bool]) -> &mut [Self] {
         // SAFETY: the mutable reference guarantees unique ownership, and
         // alignment of both `bool` and `Self` is 1.
@@ -1582,7 +1598,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(atomic_from_mut)]
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
     /// let mut data = 123;
@@ -1593,8 +1608,8 @@ impl<T> AtomicPtr<T> {
     /// assert_eq!(unsafe { *some_ptr }, 456);
     /// ```
     #[inline]
-    #[cfg(target_has_atomic_equal_alignment = "ptr")]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[cfg(target_has_atomic_primitive_alignment = "ptr")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn from_mut(v: &mut *mut T) -> &mut Self {
         let [] = [(); align_of::<AtomicPtr<()>>() - align_of::<*mut ()>()];
         // SAFETY:
@@ -1612,7 +1627,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```ignore-wasm
-    /// #![feature(atomic_from_mut)]
     /// use std::ptr::null_mut;
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
@@ -1638,7 +1652,7 @@ impl<T> AtomicPtr<T> {
     /// });
     /// ```
     #[inline]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn get_mut_slice(this: &mut [Self]) -> &mut [*mut T] {
         // SAFETY: the mutable reference guarantees unique ownership.
         unsafe { &mut *(this as *mut [Self] as *mut [*mut T]) }
@@ -1651,7 +1665,6 @@ impl<T> AtomicPtr<T> {
     /// # Examples
     ///
     /// ```ignore-wasm
-    /// #![feature(atomic_from_mut)]
     /// use std::ptr::null_mut;
     /// use std::sync::atomic::{AtomicPtr, Ordering};
     ///
@@ -1672,8 +1685,8 @@ impl<T> AtomicPtr<T> {
     /// }
     /// ```
     #[inline]
-    #[cfg(target_has_atomic_equal_alignment = "ptr")]
-    #[unstable(feature = "atomic_from_mut", issue = "76314")]
+    #[cfg(target_has_atomic_primitive_alignment = "ptr")]
+    #[stable(feature = "atomic_from_mut", since = "1.98.0")]
     pub fn from_mut_slice(v: &mut [*mut T]) -> &mut [Self] {
         // SAFETY:
         //  - the mutable reference guarantees unique ownership.
@@ -2136,7 +2149,7 @@ impl<T> AtomicPtr<T> {
     /// ```
     #[inline]
     #[stable(feature = "atomic_try_update", since = "1.95.0")]
-    #[cfg(target_has_atomic = "8")]
+    #[cfg(target_has_atomic = "ptr")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     #[rustc_should_not_be_called_on_const_items]
     pub fn update(
@@ -2504,7 +2517,7 @@ impl<T> AtomicPtr<T> {
 #[cfg(target_has_atomic_load_store = "8")]
 #[stable(feature = "atomic_bool_from", since = "1.24.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const From<bool> for AtomicBool {
+const impl From<bool> for AtomicBool {
     /// Converts a `bool` into an `AtomicBool`.
     ///
     /// # Examples
@@ -2523,7 +2536,7 @@ impl const From<bool> for AtomicBool {
 #[cfg(target_has_atomic_load_store = "ptr")]
 #[stable(feature = "atomic_from", since = "1.23.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl<T> const From<*mut T> for AtomicPtr<T> {
+const impl<T> From<*mut T> for AtomicPtr<T> {
     /// Converts a `*mut T` into an `AtomicPtr<T>`.
     #[inline]
     fn from(p: *mut T) -> Self {
@@ -2540,7 +2553,8 @@ macro_rules! if_8_bit {
 
 #[cfg(target_has_atomic_load_store)]
 macro_rules! atomic_int {
-    ($cfg_cas:meta,
+    ($cfg_base:meta,
+     $cfg_cas:meta,
      $cfg_align:meta,
      $stable:meta,
      $stable_cxchg:meta,
@@ -2598,7 +2612,7 @@ macro_rules! atomic_int {
 
         #[$stable_from]
         #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-        impl const From<$int_type> for $atomic_type {
+        const impl From<$int_type> for $atomic_type {
             #[doc = concat!("Converts an `", stringify!($int_type), "` into an `", stringify!($atomic_type), "`.")]
             #[inline]
             fn from(v: $int_type) -> Self { Self::new(v) }
@@ -2616,7 +2630,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```")]
+            #[cfg_attr(not($cfg_base), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::", stringify!($atomic_type), ";")]
             ///
             #[doc = concat!("let atomic_forty_two = ", stringify!($atomic_type), "::new(42);")]
@@ -2635,7 +2650,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```rust")]
+            #[cfg_attr(not($cfg_base), doc = "```rust,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{self, ", stringify!($atomic_type), "};")]
             ///
             /// // Get a pointer to an allocated value
@@ -2697,7 +2713,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```")]
+            #[cfg_attr(not($cfg_base), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let mut some_var = ", stringify!($atomic_type), "::new(10);")]
@@ -2725,8 +2742,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
-            /// #![feature(atomic_from_mut)]
+            #[cfg_attr($cfg_align, doc = "```rust")]
+            #[cfg_attr(not($cfg_align), doc = "```rust,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             /// let mut some_int = 123;
@@ -2736,8 +2753,8 @@ macro_rules! atomic_int {
             /// ```
             ///
             #[inline]
-            #[$cfg_align]
-            #[unstable(feature = "atomic_from_mut", issue = "76314")]
+            #[cfg(any($cfg_align, doc))]
+            #[stable(feature = "atomic_from_mut", since = "1.98.0")]
             pub fn from_mut(v: &mut $int_type) -> &mut Self {
                 let [] = [(); align_of::<Self>() - align_of::<$int_type>()];
                 // SAFETY:
@@ -2754,8 +2771,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```ignore-wasm
-            /// #![feature(atomic_from_mut)]
+            #[cfg_attr($cfg_base, doc = "```ignore-wasm")]
+            #[cfg_attr(not($cfg_base), doc = "```ignore-wasm,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let mut some_ints = [const { ", stringify!($atomic_type), "::new(0) }; 10];")]
@@ -2777,7 +2794,7 @@ macro_rules! atomic_int {
             /// });
             /// ```
             #[inline]
-            #[unstable(feature = "atomic_from_mut", issue = "76314")]
+            #[stable(feature = "atomic_from_mut", since = "1.98.0")]
             pub fn get_mut_slice(this: &mut [Self]) -> &mut [$int_type] {
                 // SAFETY: the mutable reference guarantees unique ownership.
                 unsafe { &mut *(this as *mut [Self] as *mut [$int_type]) }
@@ -2795,8 +2812,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```ignore-wasm
-            /// #![feature(atomic_from_mut)]
+            #[cfg_attr($cfg_align, doc = "```ignore-wasm")]
+            #[cfg_attr(not($cfg_align), doc = "```ignore-wasm,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             /// let mut some_ints = [0; 10];
@@ -2811,8 +2828,8 @@ macro_rules! atomic_int {
             /// }
             /// ```
             #[inline]
-            #[$cfg_align]
-            #[unstable(feature = "atomic_from_mut", issue = "76314")]
+            #[cfg(any($cfg_align, doc))]
+            #[stable(feature = "atomic_from_mut", since = "1.98.0")]
             pub fn from_mut_slice(v: &mut [$int_type]) -> &mut [Self] {
                 let [] = [(); align_of::<Self>() - align_of::<$int_type>()];
                 // SAFETY:
@@ -2829,7 +2846,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```")]
+            #[cfg_attr(not($cfg_base), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::", stringify!($atomic_type), ";")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -2855,7 +2873,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```")]
+            #[cfg_attr(not($cfg_base), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -2881,7 +2900,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_base, doc = "```")]
+            #[cfg_attr(not($cfg_base), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -2910,7 +2930,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -2919,7 +2940,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn swap(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -2967,7 +2988,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -2984,7 +3006,7 @@ macro_rules! atomic_int {
                 since = "1.50.0",
                 note = "Use `compare_exchange` or `compare_exchange_weak` instead")
             ]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn compare_and_swap(&self,
@@ -3020,7 +3042,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let some_var = ", stringify!($atomic_type), "::new(5);")]
@@ -3053,7 +3076,7 @@ macro_rules! atomic_int {
             /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
             #[inline]
             #[$stable_cxchg]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn compare_exchange(&self,
@@ -3087,7 +3110,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let val = ", stringify!($atomic_type), "::new(4);")]
@@ -3117,7 +3141,7 @@ macro_rules! atomic_int {
             /// [compare-and-swap operation]: https://en.wikipedia.org/wiki/Compare-and-swap
             #[inline]
             #[$stable_cxchg]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn compare_exchange_weak(&self,
@@ -3145,7 +3169,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(0);")]
@@ -3154,7 +3179,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_add(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3176,7 +3201,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(20);")]
@@ -3185,7 +3211,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_sub(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3210,7 +3236,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(0b101101);")]
@@ -3219,7 +3246,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_and(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3244,7 +3271,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(0x13);")]
@@ -3253,7 +3281,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable_nand]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_nand(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3278,7 +3306,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(0b101101);")]
@@ -3287,7 +3316,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_or(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3312,7 +3341,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(0b101101);")]
@@ -3321,7 +3351,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[$stable]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_xor(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3334,7 +3364,7 @@ macro_rules! atomic_int {
             /// .
             #[inline]
             #[stable(feature = "no_more_cas", since = "1.45.0")]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             #[deprecated(
@@ -3388,7 +3418,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```rust
+            #[cfg_attr($cfg_cas, doc = "```rust")]
+            #[cfg_attr(not($cfg_cas), doc = "```rust,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let x = ", stringify!($atomic_type), "::new(7);")]
@@ -3399,7 +3430,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[stable(feature = "atomic_try_update", since = "1.95.0")]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn try_update(
@@ -3455,7 +3486,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```rust
+            #[cfg_attr($cfg_cas, doc = "```rust")]
+            #[cfg_attr(not($cfg_cas), doc = "```rust,compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let x = ", stringify!($atomic_type), "::new(7);")]
@@ -3465,7 +3497,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[stable(feature = "atomic_try_update", since = "1.95.0")]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn update(
@@ -3500,7 +3532,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(23);")]
@@ -3510,7 +3543,8 @@ macro_rules! atomic_int {
             ///
             /// If you want to obtain the maximum value in one step, you can use the following:
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(23);")]
@@ -3520,7 +3554,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[stable(feature = "atomic_min_max", since = "1.45.0")]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_max(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3545,7 +3579,8 @@ macro_rules! atomic_int {
             ///
             /// # Examples
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(23);")]
@@ -3557,7 +3592,8 @@ macro_rules! atomic_int {
             ///
             /// If you want to obtain the minimum value in one step, you can use the following:
             ///
-            /// ```
+            #[cfg_attr($cfg_cas, doc = "```")]
+            #[cfg_attr(not($cfg_cas), doc = "```compile_fail")]
             #[doc = concat!($extra_feature, "use std::sync::atomic::{", stringify!($atomic_type), ", Ordering};")]
             ///
             #[doc = concat!("let foo = ", stringify!($atomic_type), "::new(23);")]
@@ -3567,7 +3603,7 @@ macro_rules! atomic_int {
             /// ```
             #[inline]
             #[stable(feature = "atomic_min_max", since = "1.45.0")]
-            #[$cfg_cas]
+            #[cfg(any($cfg_cas, doc))]
             #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
             #[rustc_should_not_be_called_on_const_items]
             pub fn fetch_min(&self, val: $int_type, order: Ordering) -> $int_type {
@@ -3620,8 +3656,9 @@ macro_rules! atomic_int {
 
 #[cfg(target_has_atomic_load_store = "8")]
 atomic_int! {
-    cfg(target_has_atomic = "8"),
-    cfg(target_has_atomic_equal_alignment = "8"),
+    target_has_atomic_load_store = "8",
+    target_has_atomic = "8",
+    target_has_atomic_primitive_alignment = "8",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3638,8 +3675,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "8")]
 atomic_int! {
-    cfg(target_has_atomic = "8"),
-    cfg(target_has_atomic_equal_alignment = "8"),
+    target_has_atomic_load_store = "8",
+    target_has_atomic = "8",
+    target_has_atomic_primitive_alignment = "8",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3656,8 +3694,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "16")]
 atomic_int! {
-    cfg(target_has_atomic = "16"),
-    cfg(target_has_atomic_equal_alignment = "16"),
+    target_has_atomic_load_store = "16",
+    target_has_atomic = "16",
+    target_has_atomic_primitive_alignment = "16",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3674,8 +3713,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "16")]
 atomic_int! {
-    cfg(target_has_atomic = "16"),
-    cfg(target_has_atomic_equal_alignment = "16"),
+    target_has_atomic_load_store = "16",
+    target_has_atomic = "16",
+    target_has_atomic_primitive_alignment = "16",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3692,8 +3732,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "32")]
 atomic_int! {
-    cfg(target_has_atomic = "32"),
-    cfg(target_has_atomic_equal_alignment = "32"),
+    target_has_atomic_load_store = "32",
+    target_has_atomic = "32",
+    target_has_atomic_primitive_alignment = "32",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3710,8 +3751,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "32")]
 atomic_int! {
-    cfg(target_has_atomic = "32"),
-    cfg(target_has_atomic_equal_alignment = "32"),
+    target_has_atomic_load_store = "32",
+    target_has_atomic = "32",
+    target_has_atomic_primitive_alignment = "32",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3728,8 +3770,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "64")]
 atomic_int! {
-    cfg(target_has_atomic = "64"),
-    cfg(target_has_atomic_equal_alignment = "64"),
+    target_has_atomic_load_store = "64",
+    target_has_atomic = "64",
+    target_has_atomic_primitive_alignment = "64",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3746,8 +3789,9 @@ atomic_int! {
 }
 #[cfg(target_has_atomic_load_store = "64")]
 atomic_int! {
-    cfg(target_has_atomic = "64"),
-    cfg(target_has_atomic_equal_alignment = "64"),
+    target_has_atomic_load_store = "64",
+    target_has_atomic = "64",
+    target_has_atomic_primitive_alignment = "64",
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
     stable(feature = "integer_atomics_stable", since = "1.34.0"),
@@ -3762,10 +3806,11 @@ atomic_int! {
     8,
     u64 AtomicU64
 }
-#[cfg(target_has_atomic_load_store = "128")]
+#[cfg(any(target_has_atomic_load_store = "128", doc))]
 atomic_int! {
-    cfg(target_has_atomic = "128"),
-    cfg(target_has_atomic_equal_alignment = "128"),
+    target_has_atomic_load_store = "128",
+    target_has_atomic = "128",
+    target_has_atomic_primitive_alignment = "128",
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
@@ -3780,10 +3825,11 @@ atomic_int! {
     16,
     i128 AtomicI128
 }
-#[cfg(target_has_atomic_load_store = "128")]
+#[cfg(any(target_has_atomic_load_store = "128", doc))]
 atomic_int! {
-    cfg(target_has_atomic = "128"),
-    cfg(target_has_atomic_equal_alignment = "128"),
+    target_has_atomic_load_store = "128",
+    target_has_atomic = "128",
+    target_has_atomic_primitive_alignment = "128",
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
     unstable(feature = "integer_atomics", issue = "99069"),
@@ -3804,8 +3850,9 @@ macro_rules! atomic_int_ptr_sized {
     ( $($target_pointer_width:literal $align:literal)* ) => { $(
         #[cfg(target_pointer_width = $target_pointer_width)]
         atomic_int! {
-            cfg(target_has_atomic = "ptr"),
-            cfg(target_has_atomic_equal_alignment = "ptr"),
+            target_has_atomic_load_store = "ptr",
+            target_has_atomic = "ptr",
+            target_has_atomic_primitive_alignment = "ptr",
             stable(feature = "rust1", since = "1.0.0"),
             stable(feature = "extended_compare_and_swap", since = "1.10.0"),
             stable(feature = "atomic_debug", since = "1.3.0"),
@@ -3822,8 +3869,9 @@ macro_rules! atomic_int_ptr_sized {
         }
         #[cfg(target_pointer_width = $target_pointer_width)]
         atomic_int! {
-            cfg(target_has_atomic = "ptr"),
-            cfg(target_has_atomic_equal_alignment = "ptr"),
+            target_has_atomic_load_store = "ptr",
+            target_has_atomic = "ptr",
+            target_has_atomic_primitive_alignment = "ptr",
             stable(feature = "rust1", since = "1.0.0"),
             stable(feature = "extended_compare_and_swap", since = "1.10.0"),
             stable(feature = "atomic_debug", since = "1.3.0"),
@@ -4228,8 +4276,9 @@ unsafe fn atomic_umin<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 /// An atomic fence.
 ///
 /// Fences create synchronization between themselves and atomic operations or fences in other
-/// threads. To achieve this, a fence prevents the compiler and CPU from reordering certain types of
-/// memory operations around it.
+/// threads. It can be helpful to think of a fence as preventing the compiler and CPU from
+/// reordering certain types of memory operations around it, but that is a simplified model which
+/// fails to capture some of the nuances.
 ///
 /// There are 3 different ways to use an atomic fence:
 ///
@@ -4379,6 +4428,7 @@ unsafe fn atomic_umin<T: Copy>(dst: *mut T, val: T, order: Ordering) -> T {
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "fence"]
+#[doc(alias = "atomic_thread_fence")]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub fn fence(order: Ordering) {
     // SAFETY: using an atomic fence is safe.
@@ -4393,15 +4443,15 @@ pub fn fence(order: Ordering) {
     }
 }
 
-/// A "compiler-only" atomic fence.
+/// An atomic fence for synchronization within a single thread.
 ///
 /// Like [`fence`], this function establishes synchronization with other atomic operations and
 /// fences. However, unlike [`fence`], `compiler_fence` only establishes synchronization with
 /// operations *in the same thread*. This may at first sound rather useless, since code within a
 /// thread is typically already totally ordered and does not need any further synchronization.
-/// However, there are cases where code can run on the same thread without being ordered:
+/// However, there are cases where code can run on the same thread without being synchronized:
 /// - The most common case is that of a *signal handler*: a signal handler runs in the same thread
-///   as the code it interrupted, but it is not ordered with respect to that code. `compiler_fence`
+///   as the code it interrupted, but it is not synchronized with that code. `compiler_fence`
 ///   can be used to establish synchronization between a thread and its signal handler, the same way
 ///   that `fence` can be used to establish synchronization across threads.
 /// - Similar situations can arise in embedded programming with interrupt handlers, or in custom
@@ -4412,9 +4462,14 @@ pub fn fence(order: Ordering) {
 /// [`fence`], synchronization still requires atomic operations to be used in both threads -- it is
 /// not possible to perform synchronization entirely with fences and non-atomic operations.
 ///
-/// `compiler_fence` does not emit any machine code, but restricts the kinds of memory re-ordering
-/// the compiler is allowed to do. `compiler_fence` corresponds to [`atomic_signal_fence`] in C and
-/// C++.
+/// `compiler_fence` does not emit any machine code. However, note that `compiler_fence` is also
+/// *not* a "compiler barrier". It can be helpful to think of a `compiler_fence` as preventing the
+/// compiler from reordering certain types of memory operations around it, but that is a simplified
+/// model which fails to capture some of the nuances. The only actual guarantee made by
+/// `compiler_fence` is establishing synchronization with signal handlers and similar kinds of code,
+/// under the rules described in the [`fence`] documentation.
+///
+/// `compiler_fence` corresponds to [`atomic_signal_fence`] in C and C++.
 ///
 /// [`atomic_signal_fence`]: https://en.cppreference.com/w/cpp/atomic/atomic_signal_fence
 ///
@@ -4457,6 +4512,7 @@ pub fn fence(order: Ordering) {
 #[inline]
 #[stable(feature = "compiler_fences", since = "1.21.0")]
 #[rustc_diagnostic_item = "compiler_fence"]
+#[doc(alias = "atomic_signal_fence")]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub fn compiler_fence(order: Ordering) {
     // SAFETY: using an atomic fence is safe.

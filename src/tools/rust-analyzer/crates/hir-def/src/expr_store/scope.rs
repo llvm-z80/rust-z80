@@ -1,13 +1,13 @@
 //! Name resolution for expressions.
+use base_db::SourceDatabase;
 use hir_expand::{MacroDefId, name::Name};
 use la_arena::{Arena, ArenaMap, Idx, IdxRange, RawIdx};
 
 use crate::{
     BlockId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, VariantId,
-    db::DefDatabase,
-    expr_store::{Body, ExpressionStore, HygieneId},
+    expr_store::{Body, ExpressionStore, HygieneId, body::Param},
     hir::{
-        Binding, BindingId, Expr, ExprId, Item, LabelId, Pat, PatId, Statement,
+        Array, Binding, BindingId, Expr, ExprId, Item, LabelId, Pat, PatId, Statement,
         generics::GenericParams,
     },
     signatures::VariantFields,
@@ -56,7 +56,7 @@ pub struct ScopeData {
 #[salsa::tracked]
 impl ExprScopes {
     #[salsa::tracked(returns(ref))]
-    pub fn body_expr_scopes(db: &dyn DefDatabase, def: DefWithBodyId) -> ExprScopes {
+    pub fn body_expr_scopes(db: &dyn SourceDatabase, def: DefWithBodyId) -> ExprScopes {
         let body = Body::of(db, def);
         let mut scopes = ExprScopes::new_body(body);
         scopes.shrink_to_fit();
@@ -64,7 +64,7 @@ impl ExprScopes {
     }
 
     #[salsa::tracked(returns(ref))]
-    pub fn sig_expr_scopes(db: &dyn DefDatabase, def: GenericDefId) -> ExprScopes {
+    pub fn sig_expr_scopes(db: &dyn SourceDatabase, def: GenericDefId) -> ExprScopes {
         let (_, store) = GenericParams::with_store(db, def);
         let roots = store.expr_roots();
         let mut scopes = ExprScopes::new_store(store, roots);
@@ -73,7 +73,7 @@ impl ExprScopes {
     }
 
     #[salsa::tracked(returns(ref))]
-    pub fn variant_scopes(db: &dyn DefDatabase, def: VariantId) -> ExprScopes {
+    pub fn variant_scopes(db: &dyn SourceDatabase, def: VariantId) -> ExprScopes {
         let fields = VariantFields::of(db, def);
         let roots = fields.store.expr_roots();
         let mut scopes = ExprScopes::new_store(&fields.store, roots);
@@ -84,7 +84,7 @@ impl ExprScopes {
 
 impl ExprScopes {
     #[inline]
-    pub fn of(db: &dyn DefDatabase, def: impl Into<ExpressionStoreOwnerId>) -> &ExprScopes {
+    pub fn of(db: &dyn SourceDatabase, def: impl Into<ExpressionStoreOwnerId>) -> &ExprScopes {
         match def.into() {
             ExpressionStoreOwnerId::Body(def) => Self::body_expr_scopes(db, def),
             ExpressionStoreOwnerId::Signature(def) => Self::sig_expr_scopes(db, def),
@@ -147,11 +147,11 @@ impl ExprScopes {
             ),
         };
         let mut root = scopes.root_scope();
-        if let Some(self_param) = body.self_param {
+        if let Some(Param { formal: self_param, user_written: _ }) = body.self_param {
             scopes.add_bindings(body, root, self_param, body.binding_hygiene(self_param));
         }
-        scopes.add_params_bindings(body, root, &body.params);
-        compute_expr_scopes(body.root_expr(), body, &mut scopes, &mut root);
+        body.params.iter().for_each(|param| scopes.add_pat_bindings(body, root, param.formal));
+        compute_expr_scopes(body.root_expr(), body, &mut scopes, &mut { root }, &mut root);
         scopes
     }
 
@@ -166,7 +166,7 @@ impl ExprScopes {
         let root = scopes.root_scope();
         for root_expr in roots {
             let mut scope = scopes.new_scope(root);
-            compute_expr_scopes(root_expr, store, &mut scopes, &mut scope);
+            compute_expr_scopes(root_expr, store, &mut scopes, &mut { scope }, &mut scope);
         }
         scopes
     }
@@ -248,10 +248,6 @@ impl ExprScopes {
         pattern.walk_child_pats(|pat| self.add_pat_bindings(store, scope, pat));
     }
 
-    fn add_params_bindings(&mut self, store: &ExpressionStore, scope: ScopeId, params: &[PatId]) {
-        params.iter().for_each(|pat| self.add_pat_bindings(store, scope, *pat));
-    }
-
     fn set_scope(&mut self, node: ExprId, scope: ScopeId) {
         self.scope_by_expr.insert(node, scope);
     }
@@ -270,31 +266,33 @@ fn compute_block_scopes(
     store: &ExpressionStore,
     scopes: &mut ExprScopes,
     scope: &mut ScopeId,
+    const_scope: &mut ScopeId,
 ) {
     for stmt in statements {
         match stmt {
             Statement::Let { pat, initializer, else_branch, .. } => {
                 if let Some(expr) = initializer {
-                    compute_expr_scopes(*expr, store, scopes, scope);
+                    compute_expr_scopes(*expr, store, scopes, scope, const_scope);
                 }
                 if let Some(expr) = else_branch {
-                    compute_expr_scopes(*expr, store, scopes, scope);
+                    compute_expr_scopes(*expr, store, scopes, scope, const_scope);
                 }
 
                 *scope = scopes.new_scope(*scope);
                 scopes.add_pat_bindings(store, *scope, *pat);
             }
             Statement::Expr { expr, .. } => {
-                compute_expr_scopes(*expr, store, scopes, scope);
+                compute_expr_scopes(*expr, store, scopes, scope, const_scope);
             }
             Statement::Item(Item::MacroDef(macro_id)) => {
                 *scope = scopes.new_macro_def_scope(*scope, macro_id.clone());
+                *const_scope = scopes.new_macro_def_scope(*const_scope, macro_id.clone());
             }
             Statement::Item(Item::Other) => (),
         }
     }
     if let Some(expr) = tail {
-        compute_expr_scopes(expr, store, scopes, scope);
+        compute_expr_scopes(expr, store, scopes, scope, const_scope);
     }
 }
 
@@ -303,75 +301,91 @@ fn compute_expr_scopes(
     store: &ExpressionStore,
     scopes: &mut ExprScopes,
     scope: &mut ScopeId,
+    const_scope: &mut ScopeId,
 ) {
-    let make_label =
-        |label: &Option<LabelId>| label.map(|label| (label, store[label].name.clone()));
+    let make_label = |label: Option<LabelId>| label.map(|label| (label, store[label].name.clone()));
 
-    let compute_expr_scopes = |scopes: &mut ExprScopes, expr: ExprId, scope: &mut ScopeId| {
-        compute_expr_scopes(expr, store, scopes, scope)
+    let compute_expr_scopes =
+        |scopes: &mut ExprScopes, expr: ExprId, scope: &mut ScopeId, const_scope: &mut ScopeId| {
+            compute_expr_scopes(expr, store, scopes, scope, const_scope)
+        };
+    let handle_block = |id,
+                        statements,
+                        tail,
+                        label,
+                        scopes: &mut ExprScopes,
+                        scope: &mut ScopeId,
+                        const_scope: &mut ScopeId| {
+        let mut scope = scopes.new_block_scope(*scope, id, make_label(label));
+        let mut const_scope = if id.is_some() {
+            scopes.new_block_scope(*const_scope, id, None)
+        } else {
+            // We don't need to allocate a new scope, since only items matter to us.
+            *const_scope
+        };
+        // Overwrite the old scope for the block expr, so that every block scope can be found
+        // via the block itself (important for blocks that only contain items, no expressions).
+        scopes.set_scope(expr, scope);
+        compute_block_scopes(statements, tail, store, scopes, &mut scope, &mut const_scope);
     };
 
     scopes.set_scope(expr, *scope);
     match &store[expr] {
         Expr::Block { statements, tail, id, label } => {
-            let mut scope = scopes.new_block_scope(*scope, *id, make_label(label));
-            // Overwrite the old scope for the block expr, so that every block scope can be found
-            // via the block itself (important for blocks that only contain items, no expressions).
-            scopes.set_scope(expr, scope);
-            compute_block_scopes(statements, *tail, store, scopes, &mut scope);
+            handle_block(*id, statements, *tail, *label, scopes, scope, const_scope);
         }
         Expr::Const(id) => {
-            let mut scope = scopes.root_scope();
-            compute_expr_scopes(scopes, *id, &mut scope);
+            let mut scope = *const_scope;
+            compute_expr_scopes(scopes, *id, &mut scope, const_scope);
         }
-        Expr::Unsafe { id, statements, tail } | Expr::Async { id, statements, tail } => {
-            let mut scope = scopes.new_block_scope(*scope, *id, None);
-            // Overwrite the old scope for the block expr, so that every block scope can be found
-            // via the block itself (important for blocks that only contain items, no expressions).
-            scopes.set_scope(expr, scope);
-            compute_block_scopes(statements, *tail, store, scopes, &mut scope);
+        Expr::Array(Array::Repeat { initializer, repeat }) => {
+            compute_expr_scopes(scopes, *initializer, scope, const_scope);
+            let mut repeat_scope = *const_scope;
+            compute_expr_scopes(scopes, *repeat, &mut repeat_scope, const_scope);
         }
-        Expr::Loop { body: body_expr, label } => {
-            let mut scope = scopes.new_labeled_scope(*scope, make_label(label));
-            compute_expr_scopes(scopes, *body_expr, &mut scope);
+        Expr::Unsafe { id, statements, tail } => {
+            handle_block(*id, statements, *tail, None, scopes, scope, const_scope);
+        }
+        Expr::Loop { body: body_expr, label, source: _ } => {
+            let mut scope = scopes.new_labeled_scope(*scope, make_label(*label));
+            compute_expr_scopes(scopes, *body_expr, &mut scope, const_scope);
         }
         Expr::Closure { args, body: body_expr, .. } => {
             let mut scope = scopes.new_scope(*scope);
-            scopes.add_params_bindings(store, scope, args);
-            compute_expr_scopes(scopes, *body_expr, &mut scope);
+            args.iter().for_each(|arg| scopes.add_pat_bindings(store, scope, *arg));
+            compute_expr_scopes(scopes, *body_expr, &mut scope, const_scope);
         }
         Expr::Match { expr, arms } => {
-            compute_expr_scopes(scopes, *expr, scope);
+            compute_expr_scopes(scopes, *expr, scope, const_scope);
             for arm in arms.iter() {
                 let mut scope = scopes.new_scope(*scope);
                 scopes.add_pat_bindings(store, scope, arm.pat);
                 if let Some(guard) = arm.guard {
                     scope = scopes.new_scope(scope);
-                    compute_expr_scopes(scopes, guard, &mut scope);
+                    compute_expr_scopes(scopes, guard, &mut scope, const_scope);
                 }
-                compute_expr_scopes(scopes, arm.expr, &mut scope);
+                compute_expr_scopes(scopes, arm.expr, &mut scope, const_scope);
             }
         }
         &Expr::If { condition, then_branch, else_branch } => {
             let mut then_branch_scope = scopes.new_scope(*scope);
-            compute_expr_scopes(scopes, condition, &mut then_branch_scope);
-            compute_expr_scopes(scopes, then_branch, &mut then_branch_scope);
+            compute_expr_scopes(scopes, condition, &mut then_branch_scope, const_scope);
+            compute_expr_scopes(scopes, then_branch, &mut then_branch_scope, const_scope);
             if let Some(else_branch) = else_branch {
-                compute_expr_scopes(scopes, else_branch, scope);
+                compute_expr_scopes(scopes, else_branch, scope, const_scope);
             }
         }
         &Expr::Let { pat, expr } => {
-            compute_expr_scopes(scopes, expr, scope);
+            compute_expr_scopes(scopes, expr, scope, const_scope);
             *scope = scopes.new_scope(*scope);
             scopes.add_pat_bindings(store, *scope, pat);
         }
-        _ => store.walk_child_exprs(expr, |e| compute_expr_scopes(scopes, e, scope)),
+        _ => store.walk_child_exprs(expr, |e| compute_expr_scopes(scopes, e, scope, const_scope)),
     };
 }
 
 #[cfg(test)]
 mod tests {
-    use base_db::RootQueryDb;
     use hir_expand::{InFile, name::AsName};
     use span::FileId;
     use syntax::{AstNode, algo::find_node_at_offset, ast};
@@ -414,7 +428,7 @@ mod tests {
 
         let (file_id, _) = editioned_file_id.unpack(&db);
 
-        let file_syntax = db.parse(editioned_file_id).syntax_node();
+        let file_syntax = editioned_file_id.parse(&db).syntax_node();
         let marker: ast::PathExpr = find_node_at_offset(&file_syntax, offset).unwrap();
         let function = find_function(&db, file_id);
 
@@ -570,7 +584,7 @@ fn foo() {
 
         let (file_id, _) = editioned_file_id.unpack(&db);
 
-        let file = db.parse(editioned_file_id).ok().unwrap();
+        let file = editioned_file_id.parse(&db).ok().unwrap();
         let expected_name = find_node_at_offset::<ast::Name>(file.syntax(), expected_offset.into())
             .expect("failed to find a name at the target offset");
         let name_ref: ast::NameRef = find_node_at_offset(file.syntax(), offset).unwrap();

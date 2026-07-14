@@ -15,7 +15,7 @@ use rustc_hir::{self as hir, CoroutineDesugaring, CoroutineKind};
 use rustc_infer::traits::{Obligation, PolyTraitObligation, PredicateObligation, SelectionError};
 use rustc_middle::ty::fast_reject::DeepRejectCtxt;
 use rustc_middle::ty::{
-    self, FieldInfo, SizedTraitKind, TraitRef, Ty, TypeVisitableExt, TypingMode, elaborate,
+    self, FieldInfo, SizedTraitKind, TraitRef, Ty, TypeVisitableExt, elaborate,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_span::DUMMY_SP;
@@ -194,7 +194,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // quickly check if the self-type is a projection at all.
         match obligation.predicate.skip_binder().trait_ref.self_ty().kind() {
             // Excluding IATs and type aliases here as they don't have meaningful item bounds.
-            ty::Alias(ty::Projection | ty::Opaque, _) => {}
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { .. } | ty::Opaque { .. }, .. }) => {}
             ty::Infer(ty::TyVar(_)) => {
                 span_bug!(
                     obligation.cause.span,
@@ -277,7 +277,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             .param_env
             .caller_bounds()
             .iter()
-            .filter_map(|p| p.as_trait_clause())
+            .filter_map(|c| c.as_trait_clause())
             // Micro-optimization: filter out predicates with different polarities.
             .filter(|p| p.polarity() == stack.obligation.predicate.polarity());
 
@@ -784,7 +784,13 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     }
                 }
                 ty::Param(..)
-                | ty::Alias(ty::Projection | ty::Inherent | ty::Free, ..)
+                | ty::Alias(
+                    _,
+                    ty::AliasTy {
+                        kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. },
+                        ..
+                    },
+                )
                 | ty::Placeholder(..)
                 | ty::Bound(..) => {
                     // In these cases, we don't know what the actual
@@ -835,7 +841,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     );
                 }
 
-                ty::Alias(ty::Opaque, alias) => {
+                ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }) => {
                     if candidates.vec.iter().any(|c| matches!(c, ProjectionCandidate { .. })) {
                         // We do not generate an auto impl candidate for `impl Trait`s which already
                         // reference our auto trait.
@@ -846,11 +852,11 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         //
                         // Note that this is only sound as projection candidates of opaque types
                         // are always applicable for auto traits.
-                    } else if let TypingMode::Coherence = self.infcx.typing_mode() {
+                    } else if self.typing_mode().is_coherence() {
                         // We do not emit auto trait candidates for opaque types in coherence.
                         // Doing so can result in weird dependency cycles.
                         candidates.ambiguous = true;
-                    } else if self.infcx.can_define_opaque_ty(alias.def_id) {
+                    } else if self.infcx.can_define_opaque_ty(def_id) {
                         // We do not emit auto trait candidates for opaque types in their defining scope, as
                         // we need to know the hidden type first, which we can't reliably know within the defining
                         // scope.
@@ -1024,10 +1030,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     // supertraits.
                     let a_auto_traits: FxIndexSet<DefId> = a_data
                         .auto_traits()
-                        .chain(principal_def_id_a.into_iter().flat_map(|principal_def_id| {
-                            elaborate::supertrait_def_ids(self.tcx(), principal_def_id)
-                                .filter(|def_id| self.tcx().trait_is_auto(*def_id))
-                        }))
+                        .chain(
+                            principal_def_id_a
+                                .map(|principal_def_id| {
+                                    elaborate::supertrait_def_ids(self.tcx(), principal_def_id)
+                                        .filter(|def_id| self.tcx().trait_is_auto(*def_id))
+                                })
+                                .into_flat_iter(),
+                        )
                         .collect();
                     let auto_traits_compatible = b_data
                         .auto_traits()

@@ -1,7 +1,7 @@
 use rustc_hir::attrs::InlineAttr;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::find_attr;
+use rustc_hir::{self as hir, find_attr};
 use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
@@ -43,6 +43,12 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return true;
     }
 
+    if let hir::Constness::Const { always: true } = tcx.constness(def_id) {
+        // Comptime functions only exist during const eval and can never be passed
+        // to codegen. The const eval MIR pipeline also doesn't inline anything at all.
+        return false;
+    }
+
     // Obey source annotations first; this is important because it means we can use
     // #[inline(never)] to force code generation.
     match codegen_fn_attrs.inline {
@@ -58,7 +64,7 @@ fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         return true;
     }
 
-    let sig = tcx.fn_sig(def_id).instantiate_identity();
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip();
     for ty in sig.inputs().skip_binder().iter().chain(std::iter::once(&sig.output().skip_binder()))
     {
         // FIXME(f16_f128): in order to avoid crashes building `core`, always inline to skip
@@ -146,8 +152,9 @@ impl<'tcx> Visitor<'tcx> for CostChecker<'_, 'tcx> {
             TerminatorKind::Call { func, unwind, .. } => {
                 // We track calls because they make our function not a leaf (and in theory, the
                 // number of calls indicates how likely this function is to perturb other CGUs).
-                // But intrinsics don't have a body that gets assigned to a CGU, so they are
-                // ignored.
+                // But there are a handful of intrinsics such as raw_eq that should not block
+                // cross-crate-inlining. Adding a broad exception for all intrinsics benchmarks well
+                // and seems more sustainable than an ever-growing list of intrinsics to ignore.
                 if let Some((fn_def_id, _)) = func.const_fn_def()
                     && find_attr!(tcx, fn_def_id, RustcIntrinsic)
                 {

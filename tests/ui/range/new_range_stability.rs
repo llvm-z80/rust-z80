@@ -6,6 +6,8 @@ use std::range::{
     RangeToInclusive,
     RangeFrom,
     RangeFromIter,
+    Range,
+    legacy,
 };
 
 fn range_inclusive(mut r: RangeInclusive<usize>) {
@@ -43,13 +45,20 @@ fn range_from(mut r: RangeFrom<usize>) {
     i.remainder(); //~ ERROR unstable
 }
 
-// Unstable module
+fn range(mut r: Range<usize>) {
+    &[1, 2, 3][r];
 
-use std::range::legacy; //~ ERROR unstable
+    r.start;
+    r.end;
+    r.contains(&5);
+    r.is_empty();
+    r.iter();
 
-// Unstable types
+    let mut i = r.into_iter();
+    i.next();
 
-use std::range::Range; //~ ERROR unstable
-use std::range::RangeIter; //~ ERROR unstable
+    // Left unstable
+    i.remainder(); //~ ERROR unstable
+}
 
 fn main() {}

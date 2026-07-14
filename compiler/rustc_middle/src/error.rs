@@ -36,23 +36,8 @@ pub(crate) struct OpaqueHiddenTypeMismatch<'tcx> {
     pub sub: TypeMismatchReason,
 }
 
-#[derive(Diagnostic)]
-#[diag("we don't support unions yet: '{$ty_name}'")]
-pub struct UnsupportedUnion {
-    pub ty_name: String,
-}
-
-// FIXME(autodiff): I should get used somewhere
-#[derive(Diagnostic)]
-#[diag("reading from a `Duplicated` const {$ty} is unsafe")]
-pub struct AutodiffUnsafeInnerConstRef<'tcx> {
-    #[primary_span]
-    pub span: Span,
-    pub ty: Ty<'tcx>,
-}
-
 #[derive(Subdiagnostic)]
-pub enum TypeMismatchReason {
+pub(crate) enum TypeMismatchReason {
     #[label("this expression supplies two conflicting concrete types for the same opaque type")]
     ConflictType {
         #[primary_span]
@@ -71,6 +56,18 @@ pub enum TypeMismatchReason {
     "consider increasing the recursion limit by adding a `#![recursion_limit = \"{$suggested_limit}\"]`"
 )]
 pub(crate) struct RecursionLimitReached<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'tcx>,
+    pub suggested_limit: rustc_hir::limit::Limit,
+}
+
+#[derive(Diagnostic)]
+#[diag("reached the recursion limit while computing the size of `{$ty}`")]
+#[help(
+    "consider increasing the recursion limit by adding a `#![recursion_limit = \"{$suggested_limit}\"]`"
+)]
+pub(crate) struct RecursionLimitReachedSizeSkeleton<'tcx> {
     #[primary_span]
     pub span: Span,
     pub ty: Ty<'tcx>,
@@ -148,6 +145,15 @@ pub(crate) struct InvalidConstInValtree {
 }
 
 #[derive(Diagnostic)]
+#[diag("constant {$global_const_id} cannot be used as pattern")]
+#[note("constants whose type references itself cannot be used as patterns")]
+pub(crate) struct CyclicConstInValtree {
+    #[primary_span]
+    pub span: Span,
+    pub global_const_id: String,
+}
+
+#[derive(Diagnostic)]
 #[diag("internal compiler error: reentrant incremental verify failure, suppressing message")]
 pub(crate) struct Reentrant;
 
@@ -158,8 +164,37 @@ pub(crate) struct Reentrant;
 #[note(
     "an ideal reproduction consists of the code before and some patch that then triggers the bug when applied and compiled again"
 )]
-#[note("as a workaround, you can run {$run_cmd} to allow your project to compile")]
+#[note("as a workaround, you can {$run_cmd} to allow your project to compile")]
 pub(crate) struct IncrementCompilation {
     pub run_cmd: String,
     pub dep_node: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("multiple implementations of `#[{$name}]`")]
+pub struct DuplicateEiiImpls {
+    pub name: Symbol,
+
+    #[primary_span]
+    #[label("first implemented here in crate `{$first_crate}`")]
+    pub first_span: Span,
+    pub first_crate: Symbol,
+
+    #[label("also implemented here in crate `{$second_crate}`")]
+    pub second_span: Span,
+    pub second_crate: Symbol,
+
+    #[note("in addition to these two, { $num_additional_crates ->
+        [one] another implementation was found in crate {$additional_crate_names}
+        *[other] more implementations were also found in the following crates: {$additional_crate_names}
+    }")]
+    pub additional_crates: Option<()>,
+
+    pub num_additional_crates: usize,
+    pub additional_crate_names: String,
+
+    #[help(
+        "an \"externally implementable item\" can only have a single implementation in the final artifact. When multiple implementations are found, also in different crates, they conflict"
+    )]
+    pub help: (),
 }

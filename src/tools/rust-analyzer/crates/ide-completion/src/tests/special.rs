@@ -65,7 +65,7 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-            md std
+            md std::
             st Option Option
             bt u32       u32
         "#]],
@@ -95,7 +95,7 @@ mod macros {
         expect![[r#"
             fn f()                       fn()
             ma concat!(…) macro_rules! concat
-            md std
+            md std::
             bt u32                        u32
         "#]],
     );
@@ -123,8 +123,8 @@ pub mod prelude {
 }
 "#,
         expect![[r#"
-            md core
-            md std
+            md core::
+            md std::
             st String String
             bt u32       u32
         "#]],
@@ -153,7 +153,7 @@ pub mod prelude {
             "#,
         expect![[r#"
             fn f() fn()
-            md std
+            md std::
             bt u32  u32
         "#]],
     );
@@ -181,8 +181,8 @@ pub mod prelude {
 }
             "#,
         expect![[r#"
-                md std
-            "#]],
+            md std::
+        "#]],
     );
 }
 
@@ -714,7 +714,7 @@ mod m {
 "#,
         expect![[r#"
             fn z() fn()
-            md z
+            md z::
         "#]],
     );
 }
@@ -896,9 +896,6 @@ fn bar() -> Bar {
 "#,
         expect![[r#"
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex Bar::foo()
-            ex bar()
         "#]],
     );
 }
@@ -926,9 +923,6 @@ fn bar() -> Bar {
         expect![[r#"
             fn bar()                  fn()
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex Bar::foo()
-            ex bar()
         "#]],
     );
 }
@@ -955,9 +949,6 @@ fn bar() -> Bar {
 "#,
         expect![[r#"
             fn foo() (as Foo) fn() -> Self
-            ex Bar
-            ex Bar::foo()
-            ex bar()
         "#]],
     );
 }
@@ -1135,7 +1126,7 @@ fn foo { ::$0 }
 "#,
         Some(':'),
         expect![[r#"
-            md core
+            md core::
         "#]],
     );
     check_with_trigger_character(
@@ -1145,7 +1136,7 @@ fn foo { /* test */::$0 }
 "#,
         Some(':'),
         expect![[r#"
-            md core
+            md core::
         "#]],
     );
 
@@ -1497,7 +1488,7 @@ fn here_we_go() {
 "#,
         expect![[r#"
             fn here_we_go()                  fn()
-            md foo
+            md foo::
             st Bar (alias Qux) (use foo::Bar) Bar
             bt u32                            u32
             kw const

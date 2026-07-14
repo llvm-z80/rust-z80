@@ -106,6 +106,8 @@ declare_features! (
     (removed, deprecated_safe, "1.95.0", Some(94978), Some("never properly implemented, in the way of attribute refactor"), 152554),
     /// Allows deriving traits as per `SmartPointer` specification
     (removed, derive_smart_pointer, "1.84.0", Some(123430), Some("replaced by `CoercePointee`"), 131284),
+    /// Allows macros to customize macro argument matcher diagnostics.
+    (removed, diagnostic_on_unmatch_args, "1.98.0", Some(155642), Some("renamed to `diagnostic_on_unmatched_args`"), 157887),
     /// Tells rustdoc to automatically generate `#[doc(cfg(...))]`.
     (removed, doc_auto_cfg, "1.92.0", Some(43781), Some("merged into `doc_cfg`"), 138907),
     /// Allows `#[doc(cfg_hide(...))]`.
@@ -282,6 +284,9 @@ declare_features! (
     /// Allows string patterns to dereference values to match them.
     (removed, string_deref_patterns, "1.94.0", Some(87121), Some("superseded by `deref_patterns`"), 150530),
     (removed, struct_inherit, "1.0.0", None, None),
+    /// Allows the use of target_feature when a function is marked inline(always).
+    (removed, target_feature_inline_always, "1.97.0", Some(145574),
+     Some("removed because of unfixable soundness issues")),
     (removed, test_removed_feature, "1.0.0", None, None),
     /// Allows using items which are missing stability attributes
     (removed, unmarked_api, "1.0.0", None, None),
@@ -309,19 +314,5 @@ declare_features! (
 
     // -------------------------------------------------------------------------
     // feature-group-end: removed features
-    // -------------------------------------------------------------------------
-
-
-    // -------------------------------------------------------------------------
-    // feature-group-start: removed library features
-    // -------------------------------------------------------------------------
-    //
-    // FIXME(#141617): we should have a better way to track removed library features, but we reuse
-    // the infrastructure here so users still get hints. The symbols used here can be remove from
-    // `symbol.rs` when that happens.
-    (removed, concat_idents, "1.90.0", Some(29599),
-     Some("use the `${concat(..)}` metavariable expression instead"), 142704),
-    // -------------------------------------------------------------------------
-    // feature-group-end: removed library features
     // -------------------------------------------------------------------------
 );

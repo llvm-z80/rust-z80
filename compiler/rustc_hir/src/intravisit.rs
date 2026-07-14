@@ -71,11 +71,6 @@ use rustc_span::{Ident, Span, Symbol};
 
 use crate::hir::*;
 
-pub trait IntoVisitor<'hir> {
-    type Visitor: Visitor<'hir>;
-    fn into_visitor(&self) -> Self::Visitor;
-}
-
 #[derive(Copy, Clone, Debug)]
 pub enum FnKind<'a> {
     /// `#[xxx] pub async/const/extern "Abi" fn foo()`
@@ -535,7 +530,7 @@ pub fn walk_param<'v, V: Visitor<'v>>(visitor: &mut V, param: &'v Param<'v>) -> 
 }
 
 pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::Result {
-    let Item { owner_id: _, kind, span: _, vis_span: _, has_delayed_lints: _, eii: _ } = item;
+    let Item { owner_id: _, kind, span: _, vis_span: _, eii: _ } = item;
     try_visit!(visitor.visit_id(item.hir_id()));
     match *kind {
         ItemKind::ExternCrate(orig_name, ident) => {
@@ -618,15 +613,19 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item<'v>) -> V::
             try_visit!(visitor.visit_generics(generics));
             try_visit!(visitor.visit_variant_data(struct_definition));
         }
-        ItemKind::Trait(
-            _constness,
-            _is_auto,
-            _safety,
+        ItemKind::Trait {
+            impl_restriction,
+            constness: _,
+            is_auto: _,
+            safety: _,
             ident,
-            ref generics,
+            generics,
             bounds,
-            trait_item_refs,
-        ) => {
+            items: trait_item_refs,
+        } => {
+            if let RestrictionKind::Restricted(path) = &impl_restriction.kind {
+                walk_list!(visitor, visit_path_segment, path.segments);
+            }
             try_visit!(visitor.visit_ident(ident));
             try_visit!(visitor.visit_generics(generics));
             walk_list!(visitor, visit_param_bound, bounds);
@@ -661,8 +660,7 @@ pub fn walk_foreign_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     foreign_item: &'v ForeignItem<'v>,
 ) -> V::Result {
-    let ForeignItem { ident, kind, owner_id: _, span: _, vis_span: _, has_delayed_lints: _ } =
-        foreign_item;
+    let ForeignItem { ident, kind, owner_id: _, span: _, vis_span: _ } = foreign_item;
     try_visit!(visitor.visit_id(foreign_item.hir_id()));
     try_visit!(visitor.visit_ident(*ident));
 
@@ -894,6 +892,7 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) 
             fn_arg_span: _,
             kind: _,
             constness: _,
+            explicit_captures: _,
         }) => {
             walk_list!(visitor, visit_generic_param, bound_generic_params);
             try_visit!(visitor.visit_fn(FnKind::Closure, fn_decl, body, *span, def_id));
@@ -1054,6 +1053,12 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v, AmbigArg>) -
             visit_opt!(visitor, visit_ident, *variant);
             try_visit!(visitor.visit_ident(*field));
         }
+        TyKind::View(ty, fields) => {
+            try_visit!(visitor.visit_ty_unambig(ty));
+            for field in fields {
+                try_visit!(visitor.visit_ident(*field));
+            }
+        }
     }
     V::Result::output()
 }
@@ -1089,7 +1094,7 @@ pub fn walk_const_arg<'v, V: Visitor<'v>>(
     try_visit!(visitor.visit_id(*hir_id));
     match kind {
         ConstArgKind::Tup(exprs) => {
-            walk_list!(visitor, visit_const_arg, *exprs);
+            walk_list!(visitor, visit_const_arg_unambig, *exprs);
             V::Result::output()
         }
         ConstArgKind::Struct(qpath, field_exprs) => {
@@ -1200,10 +1205,6 @@ pub fn walk_where_predicate<'v, V: Visitor<'v>>(
             try_visit!(visitor.visit_lifetime(lifetime));
             walk_list!(visitor, visit_param_bound, bounds);
         }
-        WherePredicateKind::EqPredicate(WhereEqPredicate { ref lhs_ty, ref rhs_ty }) => {
-            try_visit!(visitor.visit_ty_unambig(lhs_ty));
-            try_visit!(visitor.visit_ty_unambig(rhs_ty));
-        }
     }
     V::Result::output()
 }
@@ -1212,8 +1213,7 @@ pub fn walk_fn_decl<'v, V: Visitor<'v>>(
     visitor: &mut V,
     function_declaration: &'v FnDecl<'v>,
 ) -> V::Result {
-    let FnDecl { inputs, output, c_variadic: _, implicit_self: _, lifetime_elision_allowed: _ } =
-        function_declaration;
+    let FnDecl { inputs, output, fn_decl_kind: _ } = function_declaration;
     walk_list!(visitor, visit_ty_unambig, *inputs);
     visitor.visit_fn_ret_ty(output)
 }
@@ -1263,22 +1263,14 @@ pub fn walk_trait_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     trait_item: &'v TraitItem<'v>,
 ) -> V::Result {
-    let TraitItem {
-        ident,
-        generics,
-        ref defaultness,
-        ref kind,
-        span,
-        owner_id: _,
-        has_delayed_lints: _,
-    } = *trait_item;
+    let TraitItem { ident, generics, ref defaultness, ref kind, span, owner_id: _ } = *trait_item;
     let hir_id = trait_item.hir_id();
     try_visit!(visitor.visit_ident(ident));
     try_visit!(visitor.visit_generics(&generics));
     try_visit!(visitor.visit_defaultness(&defaultness));
     try_visit!(visitor.visit_id(hir_id));
     match *kind {
-        TraitItemKind::Const(ref ty, default, _) => {
+        TraitItemKind::Const(ref ty, default) => {
             try_visit!(visitor.visit_ty_unambig(ty));
             visit_opt!(visitor, visit_const_item_rhs, default);
         }
@@ -1313,15 +1305,8 @@ pub fn walk_impl_item<'v, V: Visitor<'v>>(
     visitor: &mut V,
     impl_item: &'v ImplItem<'v>,
 ) -> V::Result {
-    let ImplItem {
-        owner_id: _,
-        ident,
-        ref generics,
-        ref impl_kind,
-        ref kind,
-        span: _,
-        has_delayed_lints: _,
-    } = *impl_item;
+    let ImplItem { owner_id: _, ident, ref generics, ref impl_kind, ref kind, span: _ } =
+        *impl_item;
 
     try_visit!(visitor.visit_ident(ident));
     try_visit!(visitor.visit_generics(generics));
@@ -1420,8 +1405,21 @@ pub fn walk_struct_def<'v, V: Visitor<'v>>(
 
 pub fn walk_field_def<'v, V: Visitor<'v>>(
     visitor: &mut V,
-    FieldDef { hir_id, ident, ty, default, span: _, vis_span: _, def_id: _, safety: _ }: &'v FieldDef<'v>,
+    FieldDef {
+        hir_id,
+        ident,
+        ty,
+        default,
+        span: _,
+        vis_span: _,
+        mut_restriction,
+        def_id: _,
+        safety: _,
+    }: &'v FieldDef<'v>,
 ) -> V::Result {
+    if let RestrictionKind::Restricted(path) = mut_restriction.kind {
+        walk_list!(visitor, visit_path_segment, path.segments);
+    }
     try_visit!(visitor.visit_id(*hir_id));
     try_visit!(visitor.visit_ident(*ident));
     visit_opt!(visitor, visit_anon_const, default);
@@ -1489,7 +1487,8 @@ pub fn walk_path_segment<'v, V: Visitor<'v>>(
     visitor: &mut V,
     segment: &'v PathSegment<'v>,
 ) -> V::Result {
-    let PathSegment { ident, hir_id, res: _, args, infer_args: _ } = segment;
+    let PathSegment { ident, hir_id, res: _, args, infer_args: _, delegation_child_segment: _ } =
+        segment;
     try_visit!(visitor.visit_ident(*ident));
     try_visit!(visitor.visit_id(*hir_id));
     visit_opt!(visitor, visit_generic_args, *args);

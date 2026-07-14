@@ -10,9 +10,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::{cmp, fmt, iter, mem};
 
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::sync;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic, Walkable};
+use rustc_macros::{Decodable, Encodable, StableHash, Walkable};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
 use thin_vec::ThinVec;
@@ -22,8 +22,11 @@ use crate::ast_traits::{HasAttrs, HasTokens};
 use crate::token::{self, Delimiter, Token, TokenKind};
 use crate::{AttrVec, Attribute};
 
+#[cfg(test)]
+mod tests;
+
 /// Part of a `TokenStream`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub enum TokenTree {
     /// A single token. Should never be `OpenDelim` or `CloseDelim`, because
     /// delimiters are implicitly represented by `Delimited`.
@@ -89,6 +92,22 @@ impl TokenTree {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct WithTokens<T> {
+    pub node: T,
+    pub tokens: Option<LazyAttrTokenStream>,
+}
+
+impl<T> WithTokens<T> {
+    pub fn new(node: T) -> WithTokens<T> {
+        WithTokens { node, tokens: None }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> WithTokens<U> {
+        WithTokens { node: f(self.node), tokens: self.tokens }
+    }
+}
+
 /// A lazy version of [`AttrTokenStream`], which defers creation of an actual
 /// `AttrTokenStream` until it is needed.
 #[derive(Clone)]
@@ -138,8 +157,8 @@ impl<D: SpanDecoder> Decodable<D> for LazyAttrTokenStream {
     }
 }
 
-impl<CTX> HashStable<CTX> for LazyAttrTokenStream {
-    fn hash_stable(&self, _hcx: &mut CTX, _hasher: &mut StableHasher) {
+impl StableHash for LazyAttrTokenStream {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _hcx: &mut Hcx, _hasher: &mut StableHasher) {
         panic!("Attempted to compute stable hash for LazyAttrTokenStream");
     }
 }
@@ -545,7 +564,7 @@ pub struct AttrsTarget {
 /// compound token. Used for conversions to `proc_macro::Spacing`. Also used to
 /// guide pretty-printing, which is where the `JointHidden` value (which isn't
 /// part of `proc_macro::Spacing`) comes in useful.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub enum Spacing {
     /// The token cannot join with the following token to form a compound
     /// token.
@@ -824,33 +843,27 @@ impl FromIterator<TokenTree> for TokenStream {
     }
 }
 
-impl<CTX> HashStable<CTX> for TokenStream
-where
-    CTX: crate::HashStableContext,
-{
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+impl StableHash for TokenStream {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         for sub_tt in self.iter() {
-            sub_tt.hash_stable(hcx, hasher);
+            sub_tt.stable_hash(hcx, hasher);
         }
     }
 }
 
 #[derive(Clone)]
-pub struct TokenStreamIter<'t> {
-    stream: &'t TokenStream,
-    index: usize,
-}
+pub struct TokenStreamIter<'t>(std::slice::Iter<'t, TokenTree>);
 
 impl<'t> TokenStreamIter<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        TokenStreamIter { stream, index: 0 }
+        TokenStreamIter(stream.0.as_slice().iter())
     }
 
     // Peeking could be done via `Peekable`, but most iterators need peeking,
     // and this is simple and avoids the need to use `peekable` and `Peekable`
     // at all the use sites.
     pub fn peek(&self) -> Option<&'t TokenTree> {
-        self.stream.0.get(self.index)
+        self.0.as_slice().first()
     }
 }
 
@@ -858,10 +871,11 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
-        self.stream.0.get(self.index).map(|tree| {
-            self.index += 1;
-            tree
-        })
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
@@ -970,7 +984,7 @@ impl TokenCursor {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-#[derive(Encodable, Decodable, HashStable_Generic, Walkable)]
+#[derive(Encodable, Decodable, StableHash, Walkable)]
 pub struct DelimSpan {
     pub open: Span,
     pub close: Span,
@@ -994,7 +1008,7 @@ impl DelimSpan {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
 pub struct DelimSpacing {
     pub open: Spacing,
     pub close: Spacing,

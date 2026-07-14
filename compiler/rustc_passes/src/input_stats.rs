@@ -411,6 +411,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
                 Infer,
                 Pat,
                 FieldOf,
+                View,
                 Err
             ]
         );
@@ -430,7 +431,7 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_where_predicate(&mut self, p: &'v hir::WherePredicate<'v>) {
         record_variants!(
             (self, p, p.kind, Some(p.hir_id), hir, WherePredicate, WherePredicateKind),
-            [BoundPredicate, RegionPredicate, EqPredicate]
+            [BoundPredicate, RegionPredicate]
         );
         hir_visit::walk_where_predicate(self, p)
     }
@@ -657,10 +658,10 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
             (self, e, e.kind, None, ast, Expr, ExprKind),
             [
                 Array, ConstBlock, Call, MethodCall, Tup, Binary, Unary, Lit, Cast, Type, Let,
-                If, While, ForLoop, Loop, Match, Closure, Block, Await, Use, TryBlock, Assign,
+                If, While, ForLoop, Loop, Match, Closure, Block, Await, Move, Use, TryBlock, Assign,
                 AssignOp, Field, Index, Range, Underscore, Path, AddrOf, Break, Continue, Ret,
                 InlineAsm, FormatArgs, OffsetOf, MacCall, Struct, Repeat, Paren, Try, Yield, Yeet,
-                Become, IncludedBytes, Gen, UnsafeBinderCast, Err, Dummy
+                Become, IncludedBytes, Gen, UnsafeBinderCast, Err, Dummy, DirectConstArg
             ]
         );
         ast_visit::walk_expr(self, e)
@@ -688,8 +689,10 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
                 ImplicitSelf,
                 MacCall,
                 CVarArgs,
-                Dummy,
                 FieldOf,
+                View,
+                DirectConstArg,
+                Dummy,
                 Err
             ]
         );
@@ -705,7 +708,7 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_where_predicate(&mut self, p: &'v ast::WherePredicate) {
         record_variants!(
             (self, p, &p.kind, None, ast, WherePredicate, WherePredicateKind),
-            [BoundPredicate, RegionPredicate, EqPredicate]
+            [BoundPredicate, RegionPredicate]
         );
         ast_visit::walk_where_predicate(self, p)
     }

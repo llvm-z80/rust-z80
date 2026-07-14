@@ -3,7 +3,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 #[cfg(feature = "nightly")]
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableOrd};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher, StableOrd};
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable, Encodable};
 #[cfg(feature = "nightly")]
@@ -49,6 +49,11 @@ pub enum ExternAbi {
     /// forcing callers to save all registers.
     RustPreserveNone,
 
+    /// Ensures that calls in tail position can always be optimized into a jump.
+    ///
+    /// This ABI is not stable, and relies on LLVM implementation details.
+    RustTail,
+
     /// Unstable impl detail that directly uses Rust types to describe the ABI to LLVM.
     /// Even normally-compatible Rust types can become ABI-incompatible with this ABI!
     Unadjusted,
@@ -61,6 +66,10 @@ pub enum ExternAbi {
     /// UEFI ABI, usually an alias of C, but sometimes an arch-specific alias
     /// and only valid on platforms that have a UEFI standard
     EfiApi,
+
+    /// Swift's calling convention, used to interoperate with Swift code without
+    /// going through C as an intermediary.
+    Swift,
 
     /* arm */
     /// Arm Architecture Procedure Call Standard, sometimes `ExternAbi::C` is an alias for this
@@ -136,6 +145,29 @@ macro_rules! abi_impls {
                     $($e_name::$variant $( { unwind: $uw } )* => $tok,)*
                 }
             }
+            // FIXME(FnSigKind): when PartialEq is stably const, use it instead
+            const fn internal_const_eq(&self, other: &Self) -> bool {
+                match (self, other) {
+                    $( ( $e_name::$variant $( { unwind: $uw } )* , $e_name::$variant $( { unwind: $uw } )* ) => true,)*
+                    _ => false,
+                }
+            }
+            // ALL_VARIANTS.iter().position(|v| v == self), but const
+            pub const fn as_packed(&self) -> u8 {
+                let mut index = 0;
+                while index < $e_name::ALL_VARIANTS.len() {
+                    if self.internal_const_eq(&$e_name::ALL_VARIANTS[index]) {
+                        return index as u8;
+                    }
+                    index += 1;
+                }
+                panic!("unreachable: invalid ExternAbi variant");
+            }
+            pub const fn from_packed(index: u8) -> Self {
+                let index = index as usize;
+                assert!(index < $e_name::ALL_VARIANTS.len(), "invalid ExternAbi index");
+                $e_name::ALL_VARIANTS[index]
+            }
         }
 
         impl ::core::str::FromStr for $e_name {
@@ -155,6 +187,7 @@ abi_impls! {
             C { unwind: false } =><= "C",
             C { unwind: true } =><= "C-unwind",
             Rust =><= "Rust",
+            Swift =><= "Swift",
             Aapcs { unwind: false } =><= "aapcs",
             Aapcs { unwind: true } =><= "aapcs-unwind",
             AvrInterrupt =><= "avr-interrupt",
@@ -183,6 +216,7 @@ abi_impls! {
             System { unwind: true } =><= "system-unwind",
             SysV64 { unwind: false } =><= "sysv64",
             SysV64 { unwind: true } =><= "sysv64-unwind",
+            RustTail =><= "tail",
             Thiscall { unwind: false } =><= "thiscall",
             Thiscall { unwind: true } =><= "thiscall-unwind",
             Unadjusted =><= "unadjusted",
@@ -224,9 +258,9 @@ impl Hash for ExternAbi {
 }
 
 #[cfg(feature = "nightly")]
-impl<C> HashStable<C> for ExternAbi {
+impl StableHash for ExternAbi {
     #[inline]
-    fn hash_stable(&self, _: &mut C, hasher: &mut StableHasher) {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, hasher: &mut StableHasher) {
         Hash::hash(self, hasher);
     }
 }
@@ -243,6 +277,7 @@ impl StableOrd for ExternAbi {
 rustc_error_messages::into_diag_arg_using_display!(ExternAbi);
 
 #[cfg(feature = "nightly")]
+#[derive(Debug)]
 pub enum CVariadicStatus {
     NotSupported,
     Stable,
@@ -258,7 +293,7 @@ impl ExternAbi {
     /// - are subject to change between compiler versions
     pub fn is_rustic_abi(self) -> bool {
         use ExternAbi::*;
-        matches!(self, Rust | RustCall | RustCold | RustPreserveNone)
+        matches!(self, Rust | RustCall | RustCold | RustPreserveNone | RustTail)
     }
 
     /// Returns whether the ABI supports C variadics. This only controls whether we allow *imports*
@@ -316,10 +351,16 @@ impl ExternAbi {
                 // This ABI does not support calls at all (except via assembly).
                 false
             }
+            Self::RustCall => {
+                // Argument untupling requires additional support for tail calls to be possible,
+                // see <https://github.com/rust-lang/rust/pull/158248>. There is no real uses of
+                // tail calling `extern "rust-call"` functions
+                false
+            }
+
             Self::C { .. }
             | Self::System { .. }
             | Self::Rust
-            | Self::RustCall
             | Self::RustCold
             | Self::RustInvalid
             | Self::Unadjusted
@@ -333,7 +374,9 @@ impl ExternAbi {
             | Self::SysV64 { .. }
             | Self::Win64 { .. }
             | Self::RustPreserveNone
-            | Self::SdccCall0 => true,
+            | Self::RustTail
+            | Self::SdccCall0
+            | Self::Swift => true,
         }
     }
 }

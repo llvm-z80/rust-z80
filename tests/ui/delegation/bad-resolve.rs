@@ -1,5 +1,4 @@
 #![feature(fn_delegation)]
-#![allow(incomplete_features)]
 
 trait Trait {
     const C: u32 = 0;
@@ -34,6 +33,7 @@ impl Trait for S {
 
     reuse foo { &self.0 }
     //~^ ERROR cannot find function `foo` in this scope
+    //~| ERROR: method `foo` has a `&self` declaration in the trait, but not in the impl
     reuse Trait::foo2 { self.0 }
     //~^ ERROR cannot find function `foo2` in trait `Trait`
     //~| ERROR method `foo2` is not a member of trait `Trait`
@@ -42,5 +42,6 @@ impl Trait for S {
 mod prefix {}
 reuse unresolved_prefix::{a, b, c}; //~ ERROR cannot find module or crate `unresolved_prefix`
 reuse prefix::{self, super, crate}; //~ ERROR `crate` in paths can only be used in start position
+//~^ ERROR expected function, found module `prefix::self`
 
 fn main() {}

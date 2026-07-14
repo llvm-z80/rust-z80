@@ -26,7 +26,6 @@ use std::time::{Instant, SystemTime};
 use std::{env, fs, io, str};
 
 use build_helper::ci::gha;
-use build_helper::exit;
 use cc::Tool;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use utils::build_stamp::BuildStamp;
@@ -42,9 +41,9 @@ use crate::utils::helpers::{self, dir_is_empty, exe, libdir, set_file_times, spl
 mod core;
 mod utils;
 
-pub use core::builder::PathSet;
 #[cfg(feature = "tracing")]
 pub use core::builder::STEP_SPAN_TARGET;
+pub use core::builder::{PathSet, StepStack};
 pub use core::config::flags::{Flags, Subcommand};
 pub use core::config::{ChangeId, Config};
 
@@ -676,6 +675,10 @@ impl Build {
             return;
         }
 
+        if self.config.dry_run() {
+            return;
+        }
+
         // When testing bootstrap itself, it is much faster to ignore
         // submodules. Almost all Steps work fine without their submodules.
         if cfg!(test) && !self.config.submodules() {
@@ -1276,7 +1279,7 @@ impl Build {
 
     /// Returns C flags that `cc-rs` thinks should be enabled for the
     /// specified target by default.
-    fn cc_handled_clags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
+    fn cc_handled_cflags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
         if self.config.dry_run() {
             return Vec::new();
         }
@@ -1496,7 +1499,7 @@ impl Build {
         if let Some(path) = finder.maybe_have("wasmtime")
             && let Ok(mut path) = path.into_os_string().into_string()
         {
-            path.push_str(" run -C cache=n --dir .");
+            path.push_str(" run -Wexceptions -C cache=n --dir .");
             // Make sure that tests have access to RUSTC_BOOTSTRAP. This (for example) is
             // required for libtest to work on beta/stable channels.
             //
@@ -1675,6 +1678,9 @@ impl Build {
 
     /// Returns the `a.b.c` version that the given package is at.
     fn release_num(&self, package: &str) -> String {
+        if self.config.dry_run() {
+            return "0.0.0 (dry-run)".into();
+        }
         let toml_file_name = self.src.join(format!("src/tools/{package}/Cargo.toml"));
         let toml = t!(fs::read_to_string(toml_file_name));
         for line in toml.lines() {
@@ -1729,7 +1735,9 @@ impl Build {
                 }
             }
         }
-        ret.sort_unstable_by_key(|krate| krate.name.clone()); // reproducible order needed for tests
+
+        // Sort the crates so that bootstrap unit tests can assume a deterministic order.
+        ret.sort_unstable_by(|a, b| Ord::cmp(&a.name, &b.name));
         ret
     }
 
@@ -2113,9 +2121,11 @@ impl Compiler {
 }
 
 fn envify(s: &str) -> String {
+    // Converting foo-bar to FOO_BAR is a fairly idomatic mapping to an environment variable name.
+    // We also convert '.' to '_' to fix https://github.com/rust-lang/rust/issues/158090
     s.chars()
         .map(|c| match c {
-            '-' => '_',
+            '-' | '.' => '_',
             c => c,
         })
         .flat_map(|c| c.to_uppercase())
@@ -2139,4 +2149,11 @@ pub fn prepare_behaviour_dump_dir(build: &Build) {
 
         t!(INITIALIZED.set(true));
     }
+}
+
+#[macro_export]
+macro_rules! exit {
+    ($code:expr) => {
+        $crate::utils::helpers::detail_exit($code, cfg!(test));
+    };
 }

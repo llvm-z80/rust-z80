@@ -44,7 +44,7 @@ use std::{
 };
 
 use ast::{AstNode, StructKind};
-use base_db::Crate;
+use base_db::{Crate, SourceDatabase};
 use cfg::CfgOptions;
 use hir_expand::{
     ExpandTo, HirFileId,
@@ -61,10 +61,9 @@ use span::{
 use stdx::never;
 use syntax::{SourceFile, SyntaxKind, ast, match_ast};
 use thin_vec::ThinVec;
-use triomphe::Arc;
 use tt::TextRange;
 
-use crate::{BlockId, Lookup, attrs::parse_extra_crate_attrs, db::DefDatabase};
+use crate::{BlockId, Lookup, attrs::parse_extra_crate_attrs};
 
 pub(crate) use crate::item_tree::{
     attrs::*,
@@ -95,7 +94,7 @@ impl fmt::Debug for RawVisibilityId {
 }
 
 fn lower_extra_crate_attrs<'a>(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     crate_attrs_as_src: SourceFile,
     file_id: span::EditionedFileId,
     cfg_options: &dyn Fn() -> &'a CfgOptions,
@@ -121,17 +120,34 @@ fn lower_extra_crate_attrs<'a>(
     AttrsOrCfg::lower(db, &crate_attrs_as_src, cfg_options, span_map)
 }
 
-#[salsa_macros::tracked(returns(deref))]
-pub(crate) fn file_item_tree_query(
-    db: &dyn DefDatabase,
+/// Computes an [`ItemTree`] for the given file or macro expansion.
+pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate) -> &ItemTree {
+    match file_item_tree_query(db, file_id, krate) {
+        Some(item_tree) => item_tree,
+        None => {
+            static EMPTY: OnceLock<ItemTree> = OnceLock::new();
+            EMPTY.get_or_init(|| ItemTree {
+                top_level: Box::new([]),
+                attrs: FxHashMap::default(),
+                small_data: FxHashMap::default(),
+                big_data: FxHashMap::default(),
+                top_attrs: AttrsOrCfg::empty(),
+                vis: ItemVisibilities { arena: ThinVec::new() },
+            })
+        }
+    }
+}
+
+#[salsa_macros::tracked(returns(ref))]
+fn file_item_tree_query(
+    db: &dyn SourceDatabase,
     file_id: HirFileId,
     krate: Crate,
-) -> Arc<ItemTree> {
+) -> Option<Box<ItemTree>> {
     let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
-    static EMPTY: OnceLock<Arc<ItemTree>> = OnceLock::new();
 
     let ctx = lower::Ctx::new(db, file_id, krate);
-    let syntax = db.parse_or_expand(file_id);
+    let syntax = file_id.parse_or_expand(db);
     let mut item_tree = match_ast! {
         match syntax {
             ast::SourceFile(file) => {
@@ -174,27 +190,16 @@ pub(crate) fn file_item_tree_query(
         && top_attrs.is_empty()
         && vis.arena.is_empty()
     {
-        EMPTY
-            .get_or_init(|| {
-                Arc::new(ItemTree {
-                    top_level: Box::new([]),
-                    attrs: FxHashMap::default(),
-                    small_data: FxHashMap::default(),
-                    big_data: FxHashMap::default(),
-                    top_attrs: AttrsOrCfg::empty(),
-                    vis: ItemVisibilities { arena: ThinVec::new() },
-                })
-            })
-            .clone()
+        None
     } else {
         item_tree.shrink_to_fit();
-        Arc::new(item_tree)
+        Some(Box::new(item_tree))
     }
 }
 
 #[salsa_macros::tracked(returns(ref))]
 pub(crate) fn block_item_tree_query(
-    db: &dyn DefDatabase,
+    db: &dyn SourceDatabase,
     block: BlockId,
     krate: Crate,
 ) -> ItemTree {
@@ -262,7 +267,7 @@ impl ItemTree {
         ItemTreeDataStats { traits, impls, mods, macro_calls, macro_rules }
     }
 
-    pub fn pretty_print(&self, db: &dyn DefDatabase, edition: Edition) -> String {
+    pub fn pretty_print(&self, db: &dyn SourceDatabase, edition: Edition) -> String {
         pretty::print_item_tree(db, self, edition)
     }
 
@@ -340,10 +345,14 @@ impl TreeId {
         Self { file, block }
     }
 
-    pub(crate) fn item_tree<'db>(&self, db: &'db dyn DefDatabase, krate: Crate) -> &'db ItemTree {
+    pub(crate) fn item_tree<'db>(
+        &self,
+        db: &'db dyn SourceDatabase,
+        krate: Crate,
+    ) -> &'db ItemTree {
         match self.block {
             Some(block) => block_item_tree_query(db, block, krate),
-            None => file_item_tree_query(db, self.file, krate),
+            None => file_item_tree(db, self.file, krate),
         }
     }
 

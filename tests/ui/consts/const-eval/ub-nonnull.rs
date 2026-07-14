@@ -1,8 +1,10 @@
 // Strip out raw byte dumps to make comparison platform-independent:
 //@ normalize-stderr: "(the raw bytes of the constant) \(size: [0-9]*, align: [0-9]*\)" -> "$1 (size: $$SIZE, align: $$ALIGN)"
 //@ normalize-stderr: "([0-9a-f][0-9a-f] |╾─*ALLOC[0-9]+(\+[a-z0-9]+)?─*╼ )+ *│.*" -> "HEX_DUMP"
+//@ normalize-stderr: "╾ALLOC\$ID╼\s+│.*╾.*╼" -> "╾ALLOC$$ID╼ │ ╾─╼"
+//@ normalize-stderr: "[0-9a-f][0-9a-f]( [0-9a-f][0-9a-f]){3,7} ╾ALLOC\$ID╼" -> "HEX_DUMP ╾ALLOC$$ID╼ │ ╾─╼"
 //@ dont-require-annotations: NOTE
-//@ ignore-parallel-frontend different alloc ids
+
 #![allow(invalid_value)] // make sure we cannot allow away the errors tested here
 #![feature(rustc_attrs, ptr_metadata)]
 
@@ -35,20 +37,6 @@ union MaybeUninit<T: Copy> {
 }
 const UNINIT: NonZero<u8> = unsafe { MaybeUninit { uninit: () }.init };
 //~^ ERROR uninitialized
-
-// Also test other uses of rustc_layout_scalar_valid_range_start
-
-#[rustc_layout_scalar_valid_range_start(10)]
-#[rustc_layout_scalar_valid_range_end(30)]
-struct RestrictedRange1(u32);
-const BAD_RANGE1: RestrictedRange1 = unsafe { RestrictedRange1(42) };
-//~^ ERROR invalid value
-
-#[rustc_layout_scalar_valid_range_start(30)]
-#[rustc_layout_scalar_valid_range_end(10)]
-struct RestrictedRange2(u32);
-const BAD_RANGE2: RestrictedRange2 = unsafe { RestrictedRange2(20) };
-//~^ ERROR invalid value
 
 const NULL_FAT_PTR: NonNull<dyn Send> = unsafe {
 //~^ ERROR invalid value

@@ -5,13 +5,13 @@ use std::ops;
 
 use rustc_hir as hir;
 use rustc_lint::builtin::MISSING_DOCS;
-use rustc_middle::lint::{LevelAndSource, LintLevelSource};
-use rustc_session::lint;
+use rustc_middle::lint::LintLevelSource;
 use rustc_span::{FileName, RemapPathScopeComponents};
 use serde::Serialize;
 use tracing::debug;
 
 use crate::clean;
+use crate::config::OutputFormat;
 use crate::core::DocContext;
 use crate::html::markdown::{ErrorCodes, find_testable_code};
 use crate::passes::Pass;
@@ -132,8 +132,7 @@ impl CoverageCalculator<'_, '_> {
 
     fn print_results(&self) {
         let output_format = self.ctx.output_format;
-        // In this case we want to ensure that the `OutputFormat` is JSON and NOT the `DocContext`.
-        if output_format.is_json() {
+        if output_format == OutputFormat::CoverageJson {
             println!("{}", self.to_json());
             return;
         }
@@ -222,8 +221,7 @@ impl DocVisitor<'_> for CoverageCalculator<'_, '_> {
 
                 let has_doc_example = tests.found_tests != 0;
                 let hir_id = DocContext::as_local_hir_id(self.ctx.tcx, i.item_id).unwrap();
-                let LevelAndSource { level, src, .. } =
-                    self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
+                let level_spec = self.ctx.tcx.lint_level_spec_at_node(MISSING_DOCS, hir_id);
 
                 // In case we have:
                 //
@@ -258,7 +256,8 @@ impl DocVisitor<'_> for CoverageCalculator<'_, '_> {
                 // unless the user had an explicit `allow`.
                 //
                 let should_have_docs = !should_be_ignored
-                    && (level != lint::Level::Allow || matches!(src, LintLevelSource::Default));
+                    && (!level_spec.is_allow()
+                        || matches!(level_spec.src, LintLevelSource::Default));
 
                 if let Some(span) = i.span(self.ctx.tcx) {
                     let filename = span.filename(self.ctx.sess());

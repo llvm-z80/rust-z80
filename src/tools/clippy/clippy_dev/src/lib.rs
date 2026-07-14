@@ -1,7 +1,6 @@
 #![feature(
     exit_status_error,
     new_range,
-    new_range_api,
     os_str_slice,
     os_string_truncate,
     pattern,
@@ -14,7 +13,7 @@
     unused_lifetimes,
     unused_qualifications
 )]
-#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::case_sensitive_file_extension_comparisons, clippy::missing_panics_doc)]
 
 extern crate rustc_arena;
 extern crate rustc_data_structures;

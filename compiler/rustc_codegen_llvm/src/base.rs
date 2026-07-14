@@ -21,16 +21,17 @@ use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::attrs::Linkage;
 use rustc_middle::dep_graph;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrs, SanitizerFnAttrs};
-use rustc_middle::mir::mono::Visibility;
+use rustc_middle::mono::Visibility;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{DebugInfo, Offload};
 use rustc_span::Symbol;
-use rustc_target::spec::SanitizerSet;
+use rustc_target::spec::{LlvmAbi, SanitizerSet};
 
 use super::ModuleLlvm;
 use crate::attributes;
 use crate::builder::Builder;
 use crate::builder::gpu_offload::OffloadGlobals;
+use crate::common::pauth_fn_attrs;
 use crate::context::CodegenCx;
 use crate::llvm::{self, Value};
 
@@ -65,8 +66,7 @@ pub(crate) fn compile_codegen_unit(
     let (module, _) = tcx.dep_graph.with_task(
         dep_node,
         tcx,
-        cgu_name,
-        module_codegen,
+        || module_codegen(tcx, cgu_name),
         Some(dep_graph::hash_result),
     );
     let time_to_codegen = start_time.elapsed();
@@ -124,7 +124,18 @@ pub(crate) fn compile_codegen_unit(
             if let Some(entry) =
                 maybe_create_entry_wrapper::<Builder<'_, '_, '_>>(&cx, cx.codegen_unit)
             {
-                let attrs = attributes::sanitize_attrs(&cx, tcx, SanitizerFnAttrs::default());
+                let mut attrs = attributes::sanitize_attrs(&cx, tcx, SanitizerFnAttrs::default());
+                // When pointer authentication is enabled, ensure that the ptrauth-* attributes are
+                // also attached to the entry wrapper.
+                //
+                // FIXME(jchlanda) If it ever becomes necessary to ensure that all compiler
+                // generated functions receive the ptrauth-* attributes, `declare_fn` or
+                // `declare_raw_fn` could be used to provide those.
+                if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
+                    for &ptrauth_attr in pauth_fn_attrs() {
+                        attrs.push(llvm::CreateAttrString(cx.llcx, ptrauth_attr));
+                    }
+                }
                 attributes::apply_to_llfn(entry, llvm::AttributePlace::Function, &attrs);
             }
 
@@ -139,6 +150,30 @@ pub(crate) fn compile_codegen_unit(
                     cx.define_objc_module_info();
                 }
                 cx.add_objc_module_flags();
+            }
+
+            if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
+                // FIXME(jchlanda): In LLVM/Clang, there are also `aarch64-elf-pauthabi-platform`
+                // and `aarch64-elf-pauthabi-version` module flags. These are emitted into the
+                // PAuth core info section of the resulting ELF, which the linker uses to enforce
+                // binary compatibility.
+                //
+                // We intentionally do not emit these flags now, since only a subset of features
+                // included in clang's pauthtest is currently supported. By default, the absence of
+                // this info is treated as compatible with any binary.
+                //
+                // Please note, that this would cause compatibility issues, specifically runtime
+                // crashes due to authentication failures (while compiling and linking
+                // successfully) when linking against binaries that support larger set of features
+                // (for example, signing of C++ member function pointers, virtual function
+                // pointers, virtual table pointers).
+                //
+                // Link to PAuth core info documentation:
+                // <https://github.com/ARM-software/abi-aa/blob/2025Q4/pauthabielf64/pauthabielf64.rst#core-information>
+                if cx.sess().opts.unstable_opts.ptrauth_elf_got {
+                    cx.add_ptrauth_elf_got_flag();
+                }
+                cx.add_ptrauth_sign_personality_flag();
             }
 
             // Finalize code coverage by injecting the coverage map. Note, the coverage map will

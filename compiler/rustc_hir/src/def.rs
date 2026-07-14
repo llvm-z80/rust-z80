@@ -4,10 +4,9 @@ use std::fmt::Debug;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
-use rustc_data_structures::stable_hasher::ToStableHashKey;
 use rustc_data_structures::unord::UnordMap;
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::Symbol;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
@@ -16,7 +15,7 @@ use crate::definitions::DefPathData;
 use crate::hir;
 
 /// Encodes if a `DefKind::Ctor` is the constructor of an enum variant or a struct.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum CtorOf {
     /// This `DefKind::Ctor` is a synthesized constructor of a tuple or unit struct.
     Struct,
@@ -25,7 +24,7 @@ pub enum CtorOf {
 }
 
 /// What kind of constructor something is.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum CtorKind {
     /// Constructor function automatically created by a tuple struct/variant.
     Fn,
@@ -35,7 +34,7 @@ pub enum CtorKind {
 
 /// A set of macro kinds, for macros that can have more than one kind
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub struct MacroKinds(u8);
 bitflags::bitflags! {
     impl MacroKinds: u8 {
@@ -81,7 +80,7 @@ impl MacroKinds {
 }
 
 /// An attribute that is not a macro; e.g., `#[inline]` or `#[rustfmt::skip]`.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum NonMacroAttrKind {
     /// Single-segment attribute defined by the language (`#[inline]`)
     Builtin(Symbol),
@@ -96,7 +95,7 @@ pub enum NonMacroAttrKind {
 
 /// What kind of definition something is; e.g., `mod` vs `struct`.
 /// `enum DefPathData` may need to be updated if a new variant is added here.
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum DefKind {
     // Type namespace
     Mod,
@@ -135,6 +134,11 @@ pub enum DefKind {
     },
     /// Refers to the struct or enum variant's constructor.
     ///
+    /// ```
+    /// struct S;
+    /// let x = S; // S in the value namespace is a Ctor
+    /// ```
+    ///
     /// The reason `Ctor` exists in addition to [`DefKind::Struct`] and
     /// [`DefKind::Variant`] is because structs and enum variants exist
     /// in the *type* namespace, whereas struct and enum variant *constructors*
@@ -161,7 +165,8 @@ pub enum DefKind {
     Use,
     /// An `extern` block.
     ForeignMod,
-    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]`.
+    /// Anonymous constant, e.g. the `1 + 2` in `[u8; 1 + 2]` or `enum E { A = 1 + 2 }`, or an
+    /// inline constant, e.g. `const { 1 + 2 }`.
     ///
     /// Not all anon-consts are actually still relevant in the HIR. We lower
     /// trivial const-arguments directly to `hir::ConstArgKind::Path`, at which
@@ -172,8 +177,6 @@ pub enum DefKind {
     /// constants should only be reachable by iterating all definitions of a
     /// given crate, you should not have to worry about this.
     AnonConst,
-    /// An inline constant, e.g. `const { 1 + 2 }`
-    InlineConst,
     /// Opaque type, aka `impl Trait`.
     OpaqueTy,
     /// A field in a struct, enum or union. e.g.
@@ -235,7 +238,6 @@ impl DefKind {
             DefKind::Use => "import",
             DefKind::ForeignMod => "foreign module",
             DefKind::AnonConst => "constant expression",
-            DefKind::InlineConst => "inline constant",
             DefKind::Field => "field",
             DefKind::Impl { .. } => "implementation",
             DefKind::Closure => "closure",
@@ -259,7 +261,6 @@ impl DefKind {
             | DefKind::OpaqueTy
             | DefKind::Impl { .. }
             | DefKind::Use
-            | DefKind::InlineConst
             | DefKind::ExternCrate => "an",
             DefKind::Macro(kinds) => kinds.article(),
             _ => "a",
@@ -292,7 +293,6 @@ impl DefKind {
 
             // Not namespaced.
             DefKind::AnonConst
-            | DefKind::InlineConst
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::ExternCrate
@@ -339,7 +339,6 @@ impl DefKind {
             DefKind::Use => DefPathData::Use,
             DefKind::ForeignMod => DefPathData::ForeignMod,
             DefKind::AnonConst => DefPathData::AnonConst,
-            DefKind::InlineConst => DefPathData::AnonConst,
             DefKind::OpaqueTy => DefPathData::OpaqueTy,
             DefKind::GlobalAsm => DefPathData::GlobalAsm,
             DefKind::Impl { .. } => DefPathData::Impl,
@@ -386,7 +385,6 @@ impl DefKind {
             | DefKind::Fn
             | DefKind::ForeignTy
             | DefKind::Impl { .. }
-            | DefKind::InlineConst
             | DefKind::OpaqueTy
             | DefKind::Static { .. }
             | DefKind::Struct
@@ -439,46 +437,8 @@ impl DefKind {
             | DefKind::ConstParam
             | DefKind::LifetimeParam
             | DefKind::AnonConst
-            | DefKind::InlineConst
             | DefKind::GlobalAsm
             | DefKind::ExternCrate => false,
-        }
-    }
-
-    /// Returns `true` if `self` is a kind of definition that does not have its own
-    /// type-checking context, i.e. closure, coroutine or inline const.
-    #[inline]
-    pub fn is_typeck_child(self) -> bool {
-        match self {
-            DefKind::Closure | DefKind::InlineConst | DefKind::SyntheticCoroutineBody => true,
-            DefKind::Mod
-            | DefKind::Struct
-            | DefKind::Union
-            | DefKind::Enum
-            | DefKind::Variant
-            | DefKind::Trait
-            | DefKind::TyAlias
-            | DefKind::ForeignTy
-            | DefKind::TraitAlias
-            | DefKind::AssocTy
-            | DefKind::TyParam
-            | DefKind::Fn
-            | DefKind::Const { .. }
-            | DefKind::ConstParam
-            | DefKind::Static { .. }
-            | DefKind::Ctor(_, _)
-            | DefKind::AssocFn
-            | DefKind::AssocConst { .. }
-            | DefKind::Macro(_)
-            | DefKind::ExternCrate
-            | DefKind::Use
-            | DefKind::ForeignMod
-            | DefKind::AnonConst
-            | DefKind::OpaqueTy
-            | DefKind::Field
-            | DefKind::LifetimeParam
-            | DefKind::GlobalAsm
-            | DefKind::Impl { .. } => false,
         }
     }
 }
@@ -511,7 +471,7 @@ impl DefKind {
 /// - the call to `str_to_string` will resolve to [`Res::Def`], with the [`DefId`]
 ///   pointing to the definition of `str_to_string` in the current crate.
 //
-#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Hash, Debug, StableHash)]
 pub enum Res<Id = hir::HirId> {
     /// Definition having a unique ID (`DefId`), corresponds to something defined in user code.
     ///
@@ -679,7 +639,7 @@ impl PartialRes {
 /// Different kinds of symbols can coexist even if they share the same textual name.
 /// Therefore, they each have a separate universe (known as a "namespace").
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
-#[derive(HashStable_Generic)]
+#[derive(StableHash)]
 pub enum Namespace {
     /// The type namespace includes `struct`s, `enum`s, `union`s, `trait`s, and `mod`s
     /// (and, by extension, crates).
@@ -712,17 +672,9 @@ impl IntoDiagArg for Namespace {
     }
 }
 
-impl<CTX: crate::HashStableContext> ToStableHashKey<CTX> for Namespace {
-    type KeyType = Namespace;
-
-    #[inline]
-    fn to_stable_hash_key(&self, _: &CTX) -> Namespace {
-        *self
-    }
-}
-
 /// Just a helper ‒ separate structure for each namespace.
-#[derive(Copy, Clone, Default, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, StableHash)]
+#[derive_const(Default)]
 pub struct PerNS<T> {
     pub value_ns: T,
     pub type_ns: T,
@@ -996,8 +948,6 @@ pub enum LifetimeRes {
         ///
         /// Creating the associated `LocalDefId` is the responsibility of lowering.
         param: NodeId,
-        /// Id of the introducing place. See `Param`.
-        binder: NodeId,
         /// Kind of elided lifetime
         kind: hir::MissingLifetimeKind,
     },

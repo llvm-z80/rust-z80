@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 use std::{cmp, env, fs};
 
 use build_helper::ci::CiEnv;
-use build_helper::exit;
 use build_helper::git::{GitConfig, PathFreshness, check_path_modifications};
 use serde::Deserialize;
 #[cfg(feature = "tracing")]
@@ -30,6 +29,7 @@ use tracing::{instrument, span};
 
 use crate::core::build_steps::llvm;
 use crate::core::build_steps::llvm::LLVM_INVALIDATION_PATHS;
+use crate::core::build_steps::test::failed_tests::collect_previously_failed_tests;
 pub use crate::core::config::flags::Subcommand;
 use crate::core::config::flags::{Color, Flags, Warnings};
 use crate::core::config::target_selection::TargetSelectionList;
@@ -40,6 +40,7 @@ use crate::core::config::toml::dist::Dist;
 use crate::core::config::toml::gcc::Gcc;
 use crate::core::config::toml::install::Install;
 use crate::core::config::toml::llvm::Llvm;
+use crate::core::config::toml::pgo::{Pgo, PgoConfig};
 use crate::core::config::toml::rust::{
     BootstrapOverrideLld, Rust, RustOptimize, check_incompatible_options_for_ci_rustc,
     parse_codegen_backends,
@@ -48,16 +49,18 @@ use crate::core::config::toml::target::{
     DefaultLinuxLinkerOverride, Target, TomlTarget, default_linux_linker_overrides,
 };
 use crate::core::config::{
-    CompilerBuiltins, DebuginfoLevel, DryRun, GccCiMode, LlvmLibunwind, Merge, ReplaceOpt,
-    RustcLto, SplitDebuginfo, StringOrBool, threads_from_config,
+    CompilerBuiltins, CompressDebuginfo, DebuginfoLevel, DryRun, GccCiMode, LlvmLibunwind, Merge,
+    ReplaceOpt, RustcLto, SplitDebuginfo, StringOrBool, threads_from_config,
 };
 use crate::core::download::{
     DownloadContext, download_beta_toolchain, is_download_ci_available, maybe_download_rustfmt,
 };
 use crate::utils::channel;
 use crate::utils::exec::{ExecutionContext, command};
-use crate::utils::helpers::{exe, get_host_target};
-use crate::{CodegenBackendKind, GitInfo, OnceLock, TargetSelection, check_ci_llvm, helpers, t};
+use crate::utils::helpers::{exe, fail, get_host_target};
+use crate::{
+    CodegenBackendKind, GitInfo, OnceLock, TargetSelection, check_ci_llvm, exit, helpers, t,
+};
 
 /// Each path in this list is considered "allowed" in the `download-rustc="if-unchanged"` logic.
 /// This means they can be modified and changes to these paths should never trigger a compiler build
@@ -78,6 +81,7 @@ pub const RUSTC_IF_UNCHANGED_ALLOWED_PATHS: &[&str] = &[
     ":!src/rustdoc-json-types",
     ":!tests",
     ":!triagebot.toml",
+    ":!src/bootstrap/defaults",
 ];
 
 /// Global configuration for the entire build and/or bootstrap.
@@ -124,6 +128,7 @@ pub struct Config {
     pub stage0_metadata: build_helper::stage0_parser::Stage0,
     pub android_ndk: Option<PathBuf>,
     pub optimized_compiler_builtins: CompilerBuiltins,
+    pub record_failed_tests_path: PathBuf,
 
     pub stdout_is_tty: bool,
     pub stderr_is_tty: bool,
@@ -139,6 +144,7 @@ pub struct Config {
     pub config: Option<PathBuf>,
     pub jobs: Option<u32>,
     pub cmd: Subcommand,
+    pub quiet: bool,
     pub incremental: bool,
     pub dump_bootstrap_shims: bool,
     /// Arguments appearing after `--` to be forwarded to tools,
@@ -186,6 +192,7 @@ pub struct Config {
     pub llvm_cxxflags: Option<String>,
     pub llvm_ldflags: Option<String>,
     pub llvm_use_libcxx: bool,
+    pub llvm_pgo: LlvmPgoConfig,
 
     // gcc codegen options
     pub gcc_ci_mode: GccCiMode,
@@ -206,6 +213,7 @@ pub struct Config {
     pub rust_debuginfo_level_std: DebuginfoLevel,
     pub rust_debuginfo_level_tools: DebuginfoLevel,
     pub rust_debuginfo_level_tests: DebuginfoLevel,
+    pub rust_compress_debuginfo: CompressDebuginfo,
     pub rust_rpath: bool,
     pub rust_strip: bool,
     pub rust_frame_pointers: bool,
@@ -220,17 +228,14 @@ pub struct Config {
     pub rust_remap_debuginfo: bool,
     pub rust_new_symbol_mangling: Option<bool>,
     pub rust_annotate_moves_size_limit: Option<u64>,
-    pub rust_profile_use: Option<String>,
-    pub rust_profile_generate: Option<String>,
     pub rust_lto: RustcLto,
     pub rust_validate_mir_opts: Option<u32>,
     pub rust_std_features: BTreeSet<String>,
     pub rust_break_on_ice: bool,
     pub rust_parallel_frontend_threads: Option<u32>,
     pub rust_rustflags: Vec<String>,
+    pub rust_pgo: PgoConfig,
 
-    pub llvm_profile_use: Option<String>,
-    pub llvm_profile_generate: bool,
     pub llvm_libunwind_default: Option<LlvmLibunwind>,
     pub enable_bolt_settings: bool,
 
@@ -368,6 +373,7 @@ impl Config {
         let Flags {
             cmd: flags_cmd,
             verbose: flags_verbose,
+            quiet: flags_quiet,
             incremental: flags_incremental,
             config: flags_config,
             build_dir: flags_build_dir,
@@ -450,8 +456,20 @@ impl Config {
 
         // Now load the TOML config, as soon as possible
         let (mut toml, toml_path) = load_toml_config(&src, flags_config, &get_toml);
-
         postprocess_toml(&mut toml, &src, toml_path.clone(), &exec_ctx, &flags_set, &get_toml);
+        let TomlConfig {
+            change_id: toml_change_id,
+            build: toml_build,
+            install: toml_install,
+            llvm: toml_llvm,
+            gcc: toml_gcc,
+            rust: toml_rust,
+            target: toml_target,
+            dist: toml_dist,
+            pgo: toml_pgo,
+            profile: _,
+            include: _,
+        } = toml;
 
         // Now override TOML values with flags, to make sure that we won't later override flags with
         // TOML values by accident instead, because flags have higher priority.
@@ -504,6 +522,7 @@ impl Config {
             dist_stage: build_dist_stage,
             bench_stage: build_bench_stage,
             patch_binaries_for_nix: build_patch_binaries_for_nix,
+            record_failed_tests_path: build_record_failed_tests_path,
             // This field is only used by bootstrap.py
             metrics: _,
             android_ndk: build_android_ndk,
@@ -516,7 +535,7 @@ impl Config {
             ccache: build_ccache,
             exclude: build_exclude,
             compiletest_allow_stage0: build_compiletest_allow_stage0,
-        } = toml.build.unwrap_or_default();
+        } = toml_build.unwrap_or_default();
 
         let Install {
             prefix: install_prefix,
@@ -526,7 +545,7 @@ impl Config {
             libdir: install_libdir,
             mandir: install_mandir,
             datadir: install_datadir,
-        } = toml.install.unwrap_or_default();
+        } = toml_install.unwrap_or_default();
 
         let Rust {
             optimize: rust_optimize,
@@ -544,6 +563,7 @@ impl Config {
             debuginfo_level_std: rust_debuginfo_level_std,
             debuginfo_level_tools: rust_debuginfo_level_tools,
             debuginfo_level_tests: rust_debuginfo_level_tests,
+            compress_debuginfo: rust_compress_debuginfo,
             backtrace: rust_backtrace,
             incremental: rust_incremental,
             randomize_layout: rust_randomize_layout,
@@ -587,7 +607,7 @@ impl Config {
             std_features: rust_std_features,
             break_on_ice: rust_break_on_ice,
             rustflags: rust_rustflags,
-        } = toml.rust.unwrap_or_default();
+        } = toml_rust.unwrap_or_default();
 
         let Llvm {
             optimize: llvm_optimize,
@@ -619,7 +639,7 @@ impl Config {
             enable_warnings: llvm_enable_warnings,
             download_ci_llvm: llvm_download_ci_llvm,
             build_config: llvm_build_config,
-        } = toml.llvm.unwrap_or_default();
+        } = toml_llvm.unwrap_or_default();
 
         let Dist {
             sign_folder: dist_sign_folder,
@@ -629,12 +649,57 @@ impl Config {
             compression_profile: dist_compression_profile,
             include_mingw_linker: dist_include_mingw_linker,
             vendor: dist_vendor,
-        } = toml.dist.unwrap_or_default();
+        } = toml_dist.unwrap_or_default();
 
         let Gcc {
             download_ci_gcc: gcc_download_ci_gcc,
             libgccjit_libs_dir: gcc_libgccjit_libs_dir,
-        } = toml.gcc.unwrap_or_default();
+        } = toml_gcc.unwrap_or_default();
+
+        let Pgo { rustc: pgo_rustc, llvm: pgo_llvm } = toml_pgo.unwrap_or_default();
+
+        // Backcompat: flags have priority over config
+        if flags_rust_profile_use.is_some() || flags_rust_profile_generate.is_some() {
+            eprintln!(
+                "WARNING: the `--rust-profile-generate` and `--rust-profile-use` flags have been deprecated. Configure PGO through the config file instead, in the [pgo.rustc] section."
+            );
+        }
+        if rust_profile_use.is_some() || rust_profile_generate.is_some() {
+            eprintln!(
+                "WARNING: the `rust.profile-generate` and `rust.profile-use` config options have been deprecated. Configure PGO through the config file instead, in the [pgo.rustc] section."
+            );
+        }
+        if flags_llvm_profile_use.is_some() || flags_llvm_profile_generate {
+            eprintln!(
+                "WARNING: the `--llvm-profile-generate` and `--llvm-profile-use` flags have been deprecated. Configure PGO through the config file instead, in the [pgo.llvm] section."
+            );
+        }
+
+        let mut pgo_rustc = pgo_rustc.unwrap_or_default();
+        pgo_rustc.use_profile =
+            flags_rust_profile_use.or(pgo_rustc.use_profile).or(rust_profile_use);
+        pgo_rustc.generate_profile =
+            flags_rust_profile_generate.or(pgo_rustc.generate_profile).or(rust_profile_generate);
+        if pgo_rustc.use_profile.is_some() && pgo_rustc.generate_profile.is_some() {
+            panic!("Cannot use and generate rust PGO profiles at the same time");
+        }
+
+        let pgo_llvm = pgo_llvm.unwrap_or_default();
+        let pgo_llvm = LlvmPgoConfig {
+            use_profile: flags_llvm_profile_use.or(pgo_llvm.use_profile),
+            generate_profile: if flags_llvm_profile_generate {
+                Some(if let Ok(llvm_profile_dir) = std::env::var("LLVM_PROFILE_DIR") {
+                    LlvmPgoGenerationMode::Directory(PathBuf::from(llvm_profile_dir))
+                } else {
+                    LlvmPgoGenerationMode::Implicit
+                })
+            } else {
+                pgo_llvm.generate_profile.map(LlvmPgoGenerationMode::Directory)
+            },
+        };
+        if pgo_llvm.use_profile.is_some() && pgo_llvm.generate_profile.is_some() {
+            panic!("Cannot use and generate LLVM PGO profiles at the same time");
+        }
 
         if rust_bootstrap_override_lld.is_some() && rust_bootstrap_override_lld_legacy.is_some() {
             panic!(
@@ -869,7 +934,7 @@ impl Config {
         // Linux targets for which the user explicitly overrode the used linker
         let mut targets_with_user_linker_override = HashSet::new();
 
-        if let Some(t) = toml.target {
+        if let Some(t) = toml_target {
             for (triple, cfg) in t {
                 let TomlTarget {
                     cc: target_cc,
@@ -1181,6 +1246,12 @@ impl Config {
             exit!(1);
         }
 
+        if matches!(flags_cmd, Subcommand::Fix) {
+            eprintln!(
+                "WARNING: `x fix` is provided on a best-effort basis and does not support all `cargo fix` options correctly."
+            );
+        }
+
         // CI should always run stage 2 builds, unless it specifically states otherwise
         #[cfg(not(test))]
         if flags_stage.is_none() && ci_env.is_running_in_ci() {
@@ -1194,7 +1265,9 @@ impl Config {
                 | Subcommand::Install => {
                     assert_eq!(
                         stage, 2,
-                        "x.py should be run with `--stage 2` on CI, but was run with `--stage {stage}`",
+                        "\
+x.py was run under CI with an implicit `--stage {stage}`. This is probably wrong and you want stage 2.
+NOTE: Please add `--stage 2` to your command line, or if you're sure you want to run stage {stage} then add `--stage {stage}` explicitly"
                     );
                 }
                 Subcommand::Clean { .. }
@@ -1296,6 +1369,19 @@ impl Config {
         );
         let verbose_tests = rust_verbose_tests.unwrap_or(exec_ctx.is_verbose());
 
+        let record_failed_tests_path =
+            out.join(build_record_failed_tests_path.unwrap_or_else(|| "failed-tests".to_string()));
+
+        let paths = {
+            let mut paths = Vec::new();
+            if flags_cmd.rerun() {
+                paths = collect_previously_failed_tests(&record_failed_tests_path);
+            } else {
+                paths.extend(flags_paths);
+            }
+            paths
+        };
+
         Config {
             // tidy-alphabetical-start
             android_ndk: build_android_ndk,
@@ -1308,7 +1394,7 @@ impl Config {
             cargo_info,
             cargo_native_static: build_cargo_native_static.unwrap_or(false),
             ccache,
-            change_id: toml.change_id.inner,
+            change_id: toml_change_id.inner,
             channel,
             ci_env,
             clippy_info,
@@ -1399,10 +1485,9 @@ impl Config {
             ),
             llvm_offload: llvm_offload.unwrap_or(false),
             llvm_optimize: llvm_optimize.unwrap_or(true),
+            llvm_pgo: pgo_llvm,
             llvm_plugins: llvm_plugin.unwrap_or(false),
             llvm_polly: llvm_polly.unwrap_or(false),
-            llvm_profile_generate: flags_llvm_profile_generate,
-            llvm_profile_use: flags_llvm_profile_use,
             llvm_release_debuginfo: llvm_release_debuginfo.unwrap_or(false),
             llvm_static_stdcpp: llvm_static_libstdcpp.unwrap_or(false),
             llvm_targets,
@@ -1426,12 +1511,14 @@ impl Config {
             out,
             patch_binaries_for_nix: build_patch_binaries_for_nix,
             path_modification_cache,
-            paths: flags_paths,
+            paths,
             prefix: install_prefix.map(PathBuf::from),
             print_step_rusage: build_print_step_rusage.unwrap_or(false),
             print_step_timings: build_print_step_timings.unwrap_or(false),
             profiler: build_profiler.unwrap_or(false),
             python: build_python.map(PathBuf::from),
+            quiet: flags_quiet,
+            record_failed_tests_path,
             reproducible_artifacts: flags_reproducible_artifact,
             reuse: build_reuse.map(PathBuf::from),
             rust_analyzer_info,
@@ -1442,6 +1529,7 @@ impl Config {
                 .unwrap_or(vec![CodegenBackendKind::Llvm]),
             rust_codegen_units: rust_codegen_units.map(threads_from_config),
             rust_codegen_units_std: rust_codegen_units_std.map(threads_from_config),
+            rust_compress_debuginfo: rust_compress_debuginfo.unwrap_or_default(),
             rust_debug_logging: rust_debug_logging
                 .or(rust_rustc_debug_assertions)
                 .unwrap_or(rust_debug == Some(true)),
@@ -1464,8 +1552,7 @@ impl Config {
                 .or(rust_overflow_checks)
                 .unwrap_or(rust_debug == Some(true)),
             rust_parallel_frontend_threads: rust_parallel_frontend_threads.map(threads_from_config),
-            rust_profile_generate: flags_rust_profile_generate.or(rust_profile_generate),
-            rust_profile_use: flags_rust_profile_use.or(rust_profile_use),
+            rust_pgo: pgo_rustc,
             rust_randomize_layout: rust_randomize_layout.unwrap_or(false),
             rust_remap_debuginfo: rust_remap_debuginfo.unwrap_or(false),
             rust_rpath: rust_rpath.unwrap_or(true),
@@ -1898,6 +1985,13 @@ impl Config {
             .unwrap_or_else(|| SplitDebuginfo::default_for_platform(target))
     }
 
+    pub fn compress_debuginfo(&self, target: TargetSelection) -> CompressDebuginfo {
+        self.target_config
+            .get(&target)
+            .and_then(|t| t.compress_debuginfo)
+            .unwrap_or(self.rust_compress_debuginfo)
+    }
+
     /// Checks if the given target is the same as the host target.
     pub fn is_host_target(&self, target: TargetSelection) -> bool {
         self.host_target == target
@@ -1989,6 +2083,20 @@ fn compute_src_directory(src_dir: Option<PathBuf>, exec_ctx: &ExecutionContext) 
         }
     };
     None
+}
+
+#[derive(Clone)]
+pub enum LlvmPgoGenerationMode {
+    /// Enable PGO instrumentation that will write profiles into a default path.
+    Implicit,
+    /// Enable PGO instrumentation that will write profiles into the specified directory.
+    Directory(PathBuf),
+}
+
+#[derive(Clone)]
+pub struct LlvmPgoConfig {
+    pub use_profile: Option<PathBuf>,
+    pub generate_profile: Option<LlvmPgoGenerationMode>,
 }
 
 /// Loads bootstrap TOML config and returns the config together with a path from where
@@ -2134,7 +2242,7 @@ fn postprocess_toml(
             }
         }
         eprintln!("failed to parse override `{option}`: `{err}");
-        exit!(2)
+        exit!(2);
     }
     toml.merge(None, &mut Default::default(), override_toml, ReplaceOpt::Override);
 }
@@ -2156,8 +2264,6 @@ pub fn check_stage0_version(
     src_dir: &Path,
     exec_ctx: &ExecutionContext,
 ) {
-    use build_helper::util::fail;
-
     if exec_ctx.dry_run() {
         return;
     }
@@ -2189,6 +2295,42 @@ pub fn check_stage0_version(
         fail(&format!(
             "Unexpected {component_name} version: {stage0_version}, we should use {prev_version}/{source_version} to build source with {source_version}"
         ));
+    }
+}
+
+fn print_rustc_modifications(
+    dwn_ctx: &DownloadContext<'_>,
+    if_unchanged: bool,
+    mut modifications: Vec<PathBuf>,
+) -> Option<()> {
+    if !dwn_ctx.exec_ctx.is_verbose() {
+        modifications.retain(|path| !path.starts_with("compiler"));
+    }
+    if modifications.is_empty() {
+        // only compiler changes; still force a rebuild but don't say why.
+        eprintln!(
+            "skipping rustc download with `download-rustc = 'if-unchanged'` due to local changes"
+        );
+        return None;
+    }
+
+    eprintln!(
+        "NOTE: detected {} modifications that could affect a build of rustc",
+        modifications.len()
+    );
+    for file in modifications.iter().take(10) {
+        eprintln!("- {}", file.display());
+    }
+    if modifications.len() > 10 {
+        eprintln!("- ... and {} more", modifications.len() - 10);
+    }
+
+    if if_unchanged {
+        eprintln!("skipping rustc download due to `download-rustc = 'if-unchanged'`");
+        None
+    } else {
+        eprintln!("downloading unconditionally due to `download-rustc = true`");
+        Some(())
     }
 }
 
@@ -2237,11 +2379,7 @@ pub fn download_ci_rustc_commit<'a>(
         });
         match freshness {
             PathFreshness::LastModifiedUpstream { upstream } => upstream,
-            PathFreshness::HasLocalModifications { upstream } => {
-                if if_unchanged {
-                    return None;
-                }
-
+            PathFreshness::HasLocalModifications { upstream, modifications } => {
                 if dwn_ctx.is_running_on_ci() {
                     eprintln!("CI rustc commit matches with HEAD and we are in CI.");
                     eprintln!(
@@ -2250,6 +2388,7 @@ pub fn download_ci_rustc_commit<'a>(
                     return None;
                 }
 
+                print_rustc_modifications(dwn_ctx, if_unchanged, modifications)?;
                 upstream
             }
             PathFreshness::MissingUpstream => {
@@ -2405,17 +2544,7 @@ pub(crate) fn update_submodule<'a>(
         return;
     }
 
-    // Submodule updating actually happens during in the dry run mode. We need to make sure that
-    // all the git commands below are actually executed, because some follow-up code
-    // in bootstrap might depend on the submodules being checked out. Furthermore, not all
-    // the command executions below work with an empty output (produced during dry run).
-    // Therefore, all commands below are marked with `run_in_dry_run()`, so that they also run in
-    // dry run mode.
-    let submodule_git = || {
-        let mut cmd = helpers::git(Some(&absolute_path));
-        cmd.run_in_dry_run();
-        cmd
-    };
+    let submodule_git = || helpers::git(Some(&absolute_path));
 
     // Determine commit checked out in submodule.
     let checked_out_hash =
@@ -2423,7 +2552,7 @@ pub(crate) fn update_submodule<'a>(
     let checked_out_hash = checked_out_hash.trim_end();
     // Determine commit that the submodule *should* have.
     let recorded = helpers::git(Some(dwn_ctx.src))
-        .run_in_dry_run()
+        .run_in_dry_run() // otherwise parsing `actual_hash` fails
         .args(["ls-tree", "HEAD"])
         .arg(relative_path)
         .run_capture_stdout(dwn_ctx.exec_ctx)
@@ -2439,11 +2568,12 @@ pub(crate) fn update_submodule<'a>(
         return;
     }
 
-    println!("Updating submodule {relative_path}");
+    if !dwn_ctx.exec_ctx.dry_run() {
+        println!("Updating submodule {relative_path}");
+    };
 
     helpers::git(Some(dwn_ctx.src))
         .allow_failure()
-        .run_in_dry_run()
         .args(["submodule", "-q", "sync"])
         .arg(relative_path)
         .run(dwn_ctx.exec_ctx);
@@ -2454,12 +2584,10 @@ pub(crate) fn update_submodule<'a>(
         // even though that has no relation to the upstream for the submodule.
         let current_branch = helpers::git(Some(dwn_ctx.src))
             .allow_failure()
-            .run_in_dry_run()
             .args(["symbolic-ref", "--short", "HEAD"])
             .run_capture(dwn_ctx.exec_ctx);
 
         let mut git = helpers::git(Some(dwn_ctx.src)).allow_failure();
-        git.run_in_dry_run();
         if current_branch.is_success() {
             // If there is a tag named after the current branch, git will try to disambiguate by prepending `heads/` to the branch name.
             // This syntax isn't accepted by `branch.{branch}`. Strip it.

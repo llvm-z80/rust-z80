@@ -6,7 +6,6 @@ use std::io::ErrorKind;
 use crate::concurrency::VClock;
 use crate::shims::files::{FdId, FileDescription, FileDescriptionRef, WeakFileDescriptionRef};
 use crate::shims::unix::UnixFileDescription;
-use crate::shims::unix::linux_like::epoll::{EpollEvents, EvalContextExt as _};
 use crate::*;
 
 /// Maximum value that the eventfd counter can hold.
@@ -35,6 +34,13 @@ struct EventFd {
 impl FileDescription for EventFd {
     fn name(&self) -> &'static str {
         "event"
+    }
+
+    fn metadata<'tcx>(
+        &self,
+    ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        // On Linux, eventfd is an "anonymous inode" reported as S_IFREG.
+        interp_ok(Either::Right("S_IFREG"))
     }
 
     fn destroy<'tcx>(
@@ -90,8 +96,9 @@ impl FileDescription for EventFd {
     ) -> InterpResult<'tcx> {
         // We're treating the buffer as a `u64`.
         let ty = ecx.machine.layouts.u64;
-        // Check the size of slice, and return error only if the size of the slice < 8.
-        if len < ty.layout.size.bytes_usize() {
+        // Check the size of slice, and return error if the size is wrong. The docs say we only
+        // error when the size is too small, but Linux seems to also error when the size is too big.
+        if len != ty.layout.size.bytes_usize() {
             return finish.call(ecx, Err(ErrorKind::InvalidInput.into()));
         }
 
@@ -101,23 +108,26 @@ impl FileDescription for EventFd {
         eventfd_write(buf_place, self, ecx, finish)
     }
 
-    fn as_unix<'tcx>(&self, _ecx: &MiriInterpCx<'tcx>) -> &dyn UnixFileDescription {
+    fn readiness<'tcx>(&self) -> InterpResult<'tcx, Readiness> {
+        // We only check the "readable" and "writable" readiness for eventfd. If other event flags
+        // need to be supported in the future, the check should be added here.
+
+        interp_ok(Readiness {
+            readable: self.counter.get() != 0,
+            writable: self.counter.get() != MAX_COUNTER,
+            ..Readiness::EMPTY
+        })
+    }
+
+    fn as_unix<'tcx>(
+        self: FileDescriptionRef<Self>,
+        _ecx: &MiriInterpCx<'tcx>,
+    ) -> FileDescriptionRef<dyn UnixFileDescription> {
         self
     }
 }
 
-impl UnixFileDescription for EventFd {
-    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
-        // We only check the status of EPOLLIN and EPOLLOUT flags for eventfd. If other event flags
-        // need to be supported in the future, the check should be added here.
-
-        interp_ok(EpollEvents {
-            epollin: self.counter.get() != 0,
-            epollout: self.counter.get() != MAX_COUNTER,
-            ..EpollEvents::new()
-        })
-    }
-}
+impl UnixFileDescription for EventFd {}
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
@@ -220,7 +230,7 @@ fn eventfd_write<'tcx>(
             // Linux seems to cause spurious wakeups here, and Tokio seems to rely on that
             // (see <https://github.com/rust-lang/miri/pull/4676#discussion_r2510528994>
             // and also <https://www.illumos.org/issues/16700>).
-            ecx.update_epoll_active_events(eventfd, /* force_edge */ true)?;
+            ecx.update_fd_readiness(eventfd, /* force_edge */ true)?;
 
             // Return how many bytes we consumed from the user-provided buffer.
             return finish.call(ecx, Ok(buf_place.layout.size.bytes_usize()));
@@ -316,7 +326,7 @@ fn eventfd_read<'tcx>(
         // The state changed; we check and update the status of all supported event
         // types for current file description.
         // Linux seems to always emit do notifications here, even if we were already writable.
-        ecx.update_epoll_active_events(eventfd, /* force_edge */ true)?;
+        ecx.update_fd_readiness(eventfd, /* force_edge */ true)?;
 
         // Tell userspace how many bytes we put into the buffer.
         return finish.call(ecx, Ok(buf_place.layout.size.bytes_usize()));

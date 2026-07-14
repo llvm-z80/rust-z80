@@ -187,6 +187,9 @@ pub fn ty_tuple(types: impl IntoIterator<Item = ast::Type>) -> ast::Type {
 
     ty_from_text(&format!("({contents})"))
 }
+pub fn ty_paren(ty: ast::Type) -> ast::Type {
+    ty_from_text(&format!("({ty})"))
+}
 pub fn ty_ref(target: ast::Type, exclusive: bool) -> ast::Type {
     ty_from_text(&if exclusive { format!("&mut {target}") } else { format!("&{target}") })
 }
@@ -294,12 +297,7 @@ fn merge_where_clause(
         (None, None) => None,
         (None, Some(bs)) => Some(bs),
         (Some(ps), None) => Some(ps),
-        (Some(ps), Some(bs)) => {
-            let preds = where_clause(std::iter::empty()).clone_for_update();
-            ps.predicates().for_each(|p| preds.add_predicate(p));
-            bs.predicates().for_each(|p| preds.add_predicate(p));
-            Some(preds)
-        }
+        (Some(ps), Some(bs)) => Some(where_clause(ps.predicates().chain(bs.predicates()))),
     }
 }
 
@@ -541,9 +539,10 @@ pub fn block_expr(
     quote! {
         BlockExpr {
             StmtList {
-                ['{'] "\n"
-                #("    " #stmts "\n")*
-                #("    " #tail_expr "\n")*
+                ['{']
+                #("\n    " #stmts)*
+                #("\n    " #tail_expr)*
+                "\n"
                 ['}']
             }
         }
@@ -661,12 +660,12 @@ pub fn expr_if(
     else_branch: Option<ast::ElseBranch>,
 ) -> ast::IfExpr {
     let else_branch = match else_branch {
-        Some(ast::ElseBranch::Block(block)) => format!("else {block}"),
-        Some(ast::ElseBranch::IfExpr(if_expr)) => format!("else {if_expr}"),
+        Some(ast::ElseBranch::Block(block)) => format!(" else {block}"),
+        Some(ast::ElseBranch::IfExpr(if_expr)) => format!(" else {if_expr}"),
         None => String::new(),
     };
     let ws = block_whitespace(&condition);
-    expr_from_text(&format!("if {condition}{ws}{then_branch} {else_branch}"))
+    expr_from_text(&format!("if {condition}{ws}{then_branch}{else_branch}"))
 }
 pub fn expr_for_loop(pat: ast::Pat, expr: ast::Expr, block: ast::BlockExpr) -> ast::ForExpr {
     let ws = block_whitespace(&expr);
@@ -732,16 +731,9 @@ pub fn expr_tuple(elements: impl IntoIterator<Item = ast::Expr>) -> ast::TupleEx
 pub fn expr_assignment(lhs: ast::Expr, rhs: ast::Expr) -> ast::BinExpr {
     expr_from_text(&format!("{lhs} = {rhs}"))
 }
-fn expr_from_text<E: Into<ast::Expr> + AstNode>(text: &str) -> E {
-    ast_from_text(&format!("const C: () = {text};"))
-}
 fn block_whitespace(after: &impl AstNode) -> &'static str {
     if after.syntax().text().contains_char('\n') { "\n" } else { " " }
 }
-pub fn expr_let(pattern: ast::Pat, expr: ast::Expr) -> ast::LetExpr {
-    ast_from_text(&format!("const _: () = while let {pattern} = {expr} {{}};"))
-}
-
 pub fn arg_list(args: impl IntoIterator<Item = ast::Expr>) -> ast::ArgList {
     let args = args.into_iter().format(", ");
     ast_from_text(&format!("fn main() {{ ()({args}) }}"))
@@ -875,6 +867,10 @@ pub fn or_pat(pats: impl IntoIterator<Item = ast::Pat>, leading_pipe: bool) -> a
 
 pub fn box_pat(pat: ast::Pat) -> ast::BoxPat {
     ast_from_text(&format!("fn f(box {pat}: ())"))
+}
+
+pub fn deref_pat(pat: ast::Pat) -> ast::Pat {
+    ast_from_text(&format!("fn f(deref!({pat}): ())"))
 }
 
 pub fn paren_pat(pat: ast::Pat) -> ast::ParenPat {
@@ -1322,6 +1318,18 @@ pub fn meta_path(path: ast::Path) -> ast::Meta {
     ast_from_text(&format!("#[{path}]"))
 }
 
+pub fn cfg_attr_meta(
+    predicate: ast::CfgPredicate,
+    inner: impl IntoIterator<Item = ast::Meta>,
+) -> ast::CfgAttrMeta {
+    let inner = inner.into_iter().join(", ");
+    ast_from_text(&format!("#![cfg_attr({predicate}, {inner})]"))
+}
+
+pub fn cfg_flag(flag: &str) -> ast::CfgPredicate {
+    ast_from_text(&format!("#![cfg({flag})]"))
+}
+
 pub fn token_tree(
     delimiter: SyntaxKind,
     tt: impl IntoIterator<Item = NodeOrToken<ast::TokenTree, SyntaxToken>>,
@@ -1335,6 +1343,30 @@ pub fn token_tree(
     let tt = tt.into_iter().join("");
 
     ast_from_text(&format!("tt!{l_delimiter}{tt}{r_delimiter}"))
+}
+
+pub fn expr_let(pattern: ast::Pat, expr: ast::Expr) -> ast::LetExpr {
+    expr_from_text(&format!("while let {pattern} = {expr} {{}}"))
+}
+
+#[track_caller]
+fn expr_from_text<E: Into<ast::Expr> + AstNode>(text: &str) -> E {
+    expr_from_text_with_edition(text, Edition::CURRENT)
+}
+
+#[track_caller]
+fn expr_from_text_with_edition<E: Into<ast::Expr> + AstNode>(text: &str, edition: Edition) -> E {
+    let parse = ast::Expr::parse(text, edition);
+    let node = match parse.tree().syntax().descendants().find_map(E::cast) {
+        Some(it) => it,
+        None => {
+            let node = std::any::type_name::<E>();
+            panic!("Failed to make ast node `{node}` from text {text}")
+        }
+    };
+    let node = node.clone_subtree();
+    assert_eq!(node.syntax().text_range().start(), 0.into());
+    node
 }
 
 #[track_caller]
@@ -1361,7 +1393,6 @@ pub fn token(kind: SyntaxKind) -> SyntaxToken {
     tokens::SOURCE_FILE
         .tree()
         .syntax()
-        .clone_for_update()
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .find(|it| it.kind() == kind)
@@ -1382,43 +1413,10 @@ pub mod tokens {
         )
     });
 
-    pub fn semicolon() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == SEMICOLON)
-            .unwrap()
-    }
-
-    pub fn single_space() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == " ")
-            .unwrap()
-    }
-
-    pub fn crate_kw() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == CRATE_KW)
-            .unwrap()
-    }
-
     pub fn whitespace(text: &str) -> SyntaxToken {
         assert!(text.trim().is_empty());
         let sf = SourceFile::parse(text, Edition::CURRENT).ok().unwrap();
-        sf.syntax().clone_for_update().first_child_or_token().unwrap().into_token().unwrap()
+        sf.syntax().first_child_or_token().unwrap().into_token().unwrap()
     }
 
     pub fn doc_comment(text: &str) -> SyntaxToken {
@@ -1441,41 +1439,6 @@ pub mod tokens {
             .filter_map(|it| it.into_token())
             .find(|it| it.kind() == IDENT)
             .unwrap()
-    }
-
-    pub fn single_newline() -> SyntaxToken {
-        let res = SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == "\n")
-            .unwrap();
-        res.detach();
-        res
-    }
-
-    pub fn blank_line() -> SyntaxToken {
-        SOURCE_FILE
-            .tree()
-            .syntax()
-            .clone_for_update()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|it| it.kind() == WHITESPACE && it.text() == "\n\n")
-            .unwrap()
-    }
-
-    pub struct WsBuilder(SourceFile);
-
-    impl WsBuilder {
-        pub fn new(text: &str) -> WsBuilder {
-            WsBuilder(SourceFile::parse(text, Edition::CURRENT).ok().unwrap())
-        }
-        pub fn ws(&self) -> SyntaxToken {
-            self.0.syntax().first_child_or_token().unwrap().into_token().unwrap()
-        }
     }
 }
 
@@ -1525,6 +1488,16 @@ mod tests {
                           R_ANGLE@5..6 ">"
             "#]],
         );
+    }
+
+    #[test]
+    fn expr_if_without_else_has_no_trailing_whitespace() {
+        let if_expr = expr_if(ext::expr_underscore(), block_expr(None, None), None);
+        assert_eq!(if_expr.syntax().to_string(), "if _ {\n}");
+
+        let stmt = expr_stmt(if_expr.into());
+        let block = block_expr([stmt.into()], None);
+        assert_eq!(block.syntax().to_string(), "{\n    if _ {\n}\n}");
     }
 
     #[test]

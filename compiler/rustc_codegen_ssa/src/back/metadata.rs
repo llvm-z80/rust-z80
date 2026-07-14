@@ -24,6 +24,7 @@ use rustc_target::spec::{CfgAbi, LlvmAbi, Os, RelocModel, Target, ef_avr_arch};
 use tracing::debug;
 
 use super::apple;
+use crate::errors;
 
 /// The default metadata loader. This is used by cg_llvm and cg_clif.
 ///
@@ -36,7 +37,7 @@ use super::apple;
 /// <dd>The metadata can be found in the `.rustc` section of the shared library.</dd>
 /// </dl>
 #[derive(Debug)]
-pub(crate) struct DefaultMetadataLoader;
+pub struct DefaultMetadataLoader;
 
 static AIX_METADATA_SYMBOL_NAME: &'static str = "__aix_rust_metadata";
 
@@ -216,7 +217,9 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
     file.set_sub_architecture(sub_architecture);
     if sess.target.is_like_darwin {
         if macho_is_arm64e(&sess.target) {
-            file.set_macho_cpu_subtype(object::macho::CPU_SUBTYPE_ARM64E);
+            file.set_macho_cpu_subtype(
+                object::macho::CPU_SUBTYPE_ARM64E | object::macho::CPU_SUBTYPE_PTRAUTH_ABI,
+            );
         }
 
         file.set_macho_build_version(macho_object_build_version_for_target(sess))
@@ -368,7 +371,7 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
             if let Some(ref cpu) = sess.opts.cg.target_cpu {
                 ef_avr_arch(cpu)
             } else {
-                bug!("AVR CPU not explicitly specified")
+                sess.dcx().emit_fatal(errors::CpuRequired)
             }
         }
         Architecture::Csky => {
@@ -396,6 +399,7 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
                 _ => EF_PPC64_ABI_UNKNOWN,
             }
         }
+        Architecture::Sparc32Plus => elf::EF_SPARC_32PLUS,
         _ => 0,
     }
 }

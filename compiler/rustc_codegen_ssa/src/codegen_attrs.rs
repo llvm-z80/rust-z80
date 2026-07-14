@@ -1,19 +1,20 @@
 use rustc_abi::{Align, ExternAbi};
 use rustc_hir::attrs::{
-    AttributeKind, EiiImplResolution, InlineAttr, Linkage, RtsanSetting, UsedBy,
+    AttributeKind, EiiImplResolution, InlineAttr, InstrumentFnAttr as HirInstrumentFnAttr, Linkage,
+    RtsanSetting, UsedBy,
 };
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{self as hir, Attribute, find_attr};
 use rustc_macros::Diagnostic;
 use rustc_middle::middle::codegen_fn_attrs::{
-    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry, SanitizerFnAttrs,
+    CodegenFnAttrFlags, CodegenFnAttrs, InstrumentFnAttr, PatchableFunctionEntry, SanitizerFnAttrs,
 };
-use rustc_middle::mir::mono::Visibility;
+use rustc_middle::mono::Visibility;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self as ty, TyCtxt};
+use rustc_session::errors::feature_err;
 use rustc_session::lint;
-use rustc_session::parse::feature_err;
 use rustc_span::{Span, sym};
 use rustc_target::spec::Os;
 
@@ -69,7 +70,7 @@ fn process_builtin_attrs(
         .filter_map(|attr| if let hir::Attribute::Parsed(attr) = attr { Some(attr) } else { None });
     for attr in parsed_attrs {
         match attr {
-            AttributeKind::Cold(_) => codegen_fn_attrs.flags |= CodegenFnAttrFlags::COLD,
+            AttributeKind::Cold => codegen_fn_attrs.flags |= CodegenFnAttrFlags::COLD,
             AttributeKind::ExportName { name, .. } => codegen_fn_attrs.symbol_name = Some(*name),
             AttributeKind::Inline(inline, span) => {
                 codegen_fn_attrs.inline = *inline;
@@ -88,7 +89,7 @@ fn process_builtin_attrs(
                 codegen_fn_attrs.link_ordinal = Some(*ordinal);
                 interesting_spans.link_ordinal = Some(*span);
             }
-            AttributeKind::LinkSection { name, .. } => codegen_fn_attrs.link_section = Some(*name),
+            AttributeKind::LinkSection { name } => codegen_fn_attrs.link_section = Some(*name),
             AttributeKind::NoMangle(attr_span) => {
                 interesting_spans.no_mangle = Some(*attr_span);
                 if tcx.opt_item_name(did.to_def_id()).is_some() {
@@ -167,7 +168,7 @@ fn process_builtin_attrs(
                 }
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::TRACK_CALLER
             }
-            AttributeKind::Used { used_by, .. } => match used_by {
+            AttributeKind::Used { used_by } => match used_by {
                 UsedBy::Compiler => codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED_COMPILER,
                 UsedBy::Linker => codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED_LINKER,
                 UsedBy::Default => {
@@ -184,9 +185,9 @@ fn process_builtin_attrs(
                     codegen_fn_attrs.flags |= used_form;
                 }
             },
-            AttributeKind::FfiConst(_) => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_CONST,
+            AttributeKind::FfiConst => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_CONST,
             AttributeKind::FfiPure(_) => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_PURE,
-            AttributeKind::RustcStdInternalSymbol(_) => {
+            AttributeKind::RustcStdInternalSymbol => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
             }
             AttributeKind::Linkage(linkage, span) => {
@@ -214,10 +215,10 @@ fn process_builtin_attrs(
             AttributeKind::Sanitize { span, .. } => {
                 interesting_spans.sanitize = Some(*span);
             }
-            AttributeKind::RustcObjcClass { classname, .. } => {
+            AttributeKind::RustcObjcClass { classname } => {
                 codegen_fn_attrs.objc_class = Some(*classname);
             }
-            AttributeKind::RustcObjcSelector { methname, .. } => {
+            AttributeKind::RustcObjcSelector { methname } => {
                 codegen_fn_attrs.objc_selector = Some(*methname);
             }
             AttributeKind::RustcEiiForeignItem => {
@@ -259,10 +260,22 @@ fn process_builtin_attrs(
 
                     codegen_fn_attrs.foreign_item_symbol_aliases.push((
                         foreign_item,
-                        if i.is_default { Linkage::LinkOnceAny } else { Linkage::External },
+                        if i.is_default { Linkage::WeakAny } else { Linkage::External },
                         Visibility::Default,
                     ));
                     codegen_fn_attrs.flags |= CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM;
+
+                    // If the declaration is `#[track_caller]`, derive it onto the implementation
+                    // too. The shim that forwards to this impl (see `add_function_aliases`) takes
+                    // its ABI from the impl's `fn_abi`, so every impl must agree on whether the
+                    // caller-location argument is present, otherwise it would be silently dropped.
+                    if tcx
+                        .codegen_fn_attrs(foreign_item)
+                        .flags
+                        .contains(CodegenFnAttrFlags::TRACK_CALLER)
+                    {
+                        codegen_fn_attrs.flags |= CodegenFnAttrFlags::TRACK_CALLER;
+                    }
                 }
             }
             AttributeKind::ThreadLocal => {
@@ -289,9 +302,17 @@ fn process_builtin_attrs(
             AttributeKind::RustcOffloadKernel => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::OFFLOAD_KERNEL
             }
-            AttributeKind::PatchableFunctionEntry { prefix, entry } => {
+            AttributeKind::PatchableFunctionEntry { prefix, entry, section } => {
                 codegen_fn_attrs.patchable_function_entry =
-                    Some(PatchableFunctionEntry::from_prefix_and_entry(*prefix, *entry));
+                    Some(PatchableFunctionEntry::from_prefix_entry_and_section(
+                        *prefix, *entry, *section,
+                    ));
+            }
+            AttributeKind::InstrumentFn(instrument_fn) => {
+                codegen_fn_attrs.instrument_fn = match instrument_fn {
+                    HirInstrumentFnAttr::On => InstrumentFnAttr::On,
+                    HirInstrumentFnAttr::Off => InstrumentFnAttr::Off,
+                };
             }
             _ => {}
         }
@@ -419,16 +440,16 @@ fn check_result(
     // llvm/llvm-project#70563).
     if !codegen_fn_attrs.target_features.is_empty()
         && matches!(codegen_fn_attrs.inline, InlineAttr::Always)
-        && !tcx.features().target_feature_inline_always()
         && let Some(span) = interesting_spans.inline
     {
-        feature_err(
-            tcx.sess,
-            sym::target_feature_inline_always,
-            span,
-            "cannot use `#[inline(always)]` with `#[target_feature]`",
-        )
-        .emit();
+        let mut diag = tcx
+            .dcx()
+            .struct_span_err(span, "cannot use `#[inline(always)]` with `#[target_feature]`");
+        diag.note(
+            "See this issue for full discussion: \
+            https://github.com/rust-lang/rust/issues/145574",
+        );
+        diag.emit();
     }
 
     // warn that inline has no effect when no_sanitize is present
@@ -508,7 +529,7 @@ fn handle_lang_items(
     attrs: &[Attribute],
     codegen_fn_attrs: &mut CodegenFnAttrs,
 ) {
-    let lang_item = find_attr!(attrs, Lang(lang, _) => lang);
+    let lang_item = find_attr!(attrs, Lang(lang) => lang);
 
     // Weak lang items have the same semantics as "std internal" symbols in the
     // sense that they're preserved through all our LTO passes and only

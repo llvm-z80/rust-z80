@@ -99,7 +99,7 @@ impl ProjectJsonTargetSpec {
                     arg.replace("{label}", &this.label)
                 }),
             RunnableKind::Test { test_id, .. } => {
-                self.find_replace_runnable(project_json::RunnableKind::Run, &|this, arg| {
+                self.find_replace_runnable(project_json::RunnableKind::TestOne, &|this, arg| {
                     arg.replace("{label}", &this.label).replace("{test_id}", &test_id.to_string())
                 })
             }
@@ -153,6 +153,9 @@ impl CargoTargetSpec {
                     Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => {
                         config.test_command
                     }
+                    Some(CargoTargetSpec { target_kind: TargetKind::Bench, .. }) => {
+                        config.bench_command
+                    }
                     _ => "run".to_owned(),
                 };
                 cargo_args.push(subcommand);
@@ -201,6 +204,10 @@ impl CargoTargetSpec {
             }
         }
         cargo_args.extend(config.cargo_extra_args.iter().cloned());
+        if let Some(config_path) = &config.config_path {
+            cargo_args.push("--config".to_owned());
+            cargo_args.push(config_path.to_string());
+        }
         (cargo_args, executable_args)
     }
 
@@ -225,10 +232,25 @@ impl CargoTargetSpec {
                 Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => {
                     (config.test_override_command, None)
                 }
+                Some(CargoTargetSpec { target_kind: TargetKind::Bench, .. }) => {
+                    (config.bench_override_command, None)
+                }
                 _ => (None, None),
             },
         };
         let test_name = test_name.unwrap_or_default();
+
+        let exact = match kind {
+            RunnableKind::Test { test_id } | RunnableKind::Bench { test_id } => match test_id {
+                TestId::Path(_) => "--exact",
+                TestId::Name(_) => "",
+            },
+            _ => "",
+        };
+        let include_ignored = match kind {
+            RunnableKind::Test { .. } => "--include-ignored",
+            _ => "",
+        };
 
         let target_arg = |kind| match kind {
             TargetKind::Bin => "--bin",
@@ -249,7 +271,9 @@ impl CargoTargetSpec {
                 .replace("${package}", &spec.package)
                 .replace("${target_arg}", target_arg(spec.target_kind))
                 .replace("${target}", target(spec.target_kind, &spec.target))
-                .replace("${test_name}", &test_name),
+                .replace("${test_name}", &test_name)
+                .replace("${exact}", exact)
+                .replace("${include_ignored}", include_ignored),
             _ => arg,
         };
 
@@ -274,15 +298,13 @@ impl CargoTargetSpec {
         let mut executable_args = Vec::new();
 
         match kind {
-            RunnableKind::Test { test_id, attr } => {
+            RunnableKind::Test { test_id } => {
                 executable_args.push(test_id.to_string());
                 if let TestId::Path(_) = test_id {
                     executable_args.push("--exact".to_owned());
                 }
                 executable_args.extend(extra_test_binary_args);
-                if attr.ignore {
-                    executable_args.push("--ignored".to_owned());
-                }
+                executable_args.push("--include-ignored".to_owned());
             }
             RunnableKind::TestMod { path } => {
                 executable_args.push(path.clone());
@@ -307,7 +329,11 @@ impl CargoTargetSpec {
 
     pub(crate) fn push_to(self, buf: &mut Vec<String>, kind: &RunnableKind) {
         buf.push("--package".to_owned());
-        buf.push(self.package);
+        if self.package.contains(":") {
+            buf.push(self.package_id.to_string());
+        } else {
+            buf.push(self.package);
+        }
 
         // Can't mix --doc with other target flags
         if let RunnableKind::DocTest { .. } = kind {
@@ -369,23 +395,13 @@ mod tests {
         SmolStr,
         ast::{self, AstNode},
     };
-    use syntax_bridge::{
-        DocCommentDesugarMode,
-        dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-        syntax_node_to_token_tree,
-    };
 
     fn check(cfg: &str, expected_features: &[&str]) {
         let cfg_expr = {
             let source_file = ast::SourceFile::parse(cfg, Edition::CURRENT).ok().unwrap();
-            let tt = source_file.syntax().descendants().find_map(ast::TokenTree::cast).unwrap();
-            let tt = syntax_node_to_token_tree(
-                tt.syntax(),
-                &DummyTestSpanMap,
-                DUMMY,
-                DocCommentDesugarMode::Mbe,
-            );
-            CfgExpr::parse(&tt)
+            let cfg_predicate =
+                source_file.syntax().descendants().find_map(ast::CfgPredicate::cast).unwrap();
+            CfgExpr::parse_from_ast(cfg_predicate)
         };
 
         let mut features = vec![];

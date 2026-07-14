@@ -4,23 +4,81 @@ use std::borrow::Borrow;
 
 use libc::{c_char, c_uint};
 use rustc_abi::Primitive::Pointer;
-use rustc_abi::{self as abi, HasDataLayout as _};
+use rustc_abi::{self as abi, ExternAbi, HasDataLayout as _};
 use rustc_ast::Mutability;
 use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash128;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
 use rustc_middle::bug;
 use rustc_middle::mir::interpret::{GlobalAlloc, PointerArithmetic, Scalar};
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{Instance, TyCtxt};
 use rustc_session::cstore::DllImport;
+use rustc_target::spec::LlvmAbi;
 use tracing::debug;
 
-use crate::consts::const_alloc_to_llvm;
+use crate::consts::{IsInitOrFini, IsStatic, const_alloc_to_llvm};
 pub(crate) use crate::context::CodegenCx;
 use crate::context::{GenericCx, SCx};
-use crate::llvm::{self, BasicBlock, ConstantInt, FALSE, TRUE, ToLlvmBool, Type, Value};
+use crate::llvm::{
+    self, BasicBlock, ConstantInt, FALSE, TRUE, ToLlvmBool, Type, Value, const_ptr_auth,
+};
+
+#[inline]
+pub(crate) fn pauth_fn_attrs() -> &'static [&'static str] {
+    // FIXME(jchlanda) This is not an exhaustive list of all `ptrauth`-related attributes, but only
+    // those currently supported. The list is expected to grow as additional functionality is
+    // implemented, particularly for C++ interoperability.
+    &[
+        "aarch64-jump-table-hardening",
+        "ptrauth-indirect-gotos",
+        "ptrauth-calls",
+        "ptrauth-returns",
+        "ptrauth-auth-traps",
+    ]
+}
+
+pub(crate) fn maybe_sign_fn_ptr<'ll, 'tcx>(
+    cx: &CodegenCx<'ll, '_>,
+    instance: Instance<'tcx>,
+    llfn: &'ll llvm::Value,
+    pac: PacMetadata,
+) -> &'ll llvm::Value {
+    if cx.sess().target.llvm_abiname != LlvmAbi::Pauthtest {
+        return llfn;
+    }
+
+    // Only free functions or methods
+    let def_id = instance.def_id();
+    if !matches!(cx.tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+        return llfn;
+    }
+    // Only C ABI
+    let abi = cx.tcx.fn_sig(def_id).skip_binder().abi();
+    if !matches!(abi, ExternAbi::C { .. } | ExternAbi::System { .. }) {
+        return llfn;
+    }
+    // Ignore LLVM intrinsics
+    if llvm::get_value_name(llfn).starts_with(b"llvm.") {
+        return llfn;
+    }
+    if Some(def_id) == cx.tcx.lang_items().eh_personality() {
+        return llfn;
+    }
+
+    let addr_diversity = match pac.addr_diversity {
+        AddressDiversity::None => None,
+        AddressDiversity::Real => Some(llfn),
+        AddressDiversity::Synthetic(val) => {
+            let llval = cx.const_u64(val);
+            let llty = cx.val_ty(llfn);
+            Some(unsafe { llvm::LLVMConstIntToPtr(llval, llty) })
+        }
+    };
+    const_ptr_auth(llfn, pac.key, pac.disc, addr_diversity)
+}
 
 /*
 * A note on nomenclature of linking: "extern", "foreign", and "upcall".
@@ -159,6 +217,10 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
         self.const_int(self.type_i32(), i as i64)
     }
 
+    fn const_i64(&self, i: i64) -> &'ll Value {
+        self.const_int(self.type_i64(), i as i64)
+    }
+
     fn const_int(&self, t: &'ll Type, i: i64) -> &'ll Value {
         debug_assert!(
             self.type_kind(t) == TypeKind::Integer,
@@ -264,7 +326,13 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
         })
     }
 
-    fn scalar_to_backend(&self, cv: Scalar, layout: abi::Scalar, llty: &'ll Type) -> &'ll Value {
+    fn scalar_to_backend_with_pac(
+        &self,
+        cv: Scalar,
+        layout: abi::Scalar,
+        llty: &'ll Type,
+        pac: Option<PacMetadata>,
+    ) -> &'ll Value {
         let bitsize = if layout.is_bool() { 1 } else { layout.size(self).bits() };
         match cv {
             Scalar::Int(int) => {
@@ -293,8 +361,12 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
                                 self.const_bitcast(llval, llty)
                             };
                         } else {
-                            let init =
-                                const_alloc_to_llvm(self, alloc.inner(), /*static*/ false);
+                            let init = const_alloc_to_llvm(
+                                self,
+                                alloc.inner(),
+                                IsStatic::No,
+                                IsInitOrFini::No,
+                            );
                             let alloc = alloc.inner();
                             let value = match alloc.mutability {
                                 Mutability::Mut => self.static_addr_of_mut(init, alloc.align, None),
@@ -304,7 +376,7 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
                             {
                                 let hash = self.tcx.with_stable_hashing_context(|mut hcx| {
                                     let mut hasher = StableHasher::new();
-                                    alloc.hash_stable(&mut hcx, &mut hasher);
+                                    alloc.stable_hash(&mut hcx, &mut hasher);
                                     hasher.finish::<Hash128>()
                                 });
                                 llvm::set_value_name(
@@ -315,7 +387,7 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
                             value
                         }
                     }
-                    GlobalAlloc::Function { instance, .. } => self.get_fn_addr(instance),
+                    GlobalAlloc::Function { instance, .. } => self.get_fn_addr(instance, pac),
                     GlobalAlloc::VTable(ty, dyn_ty) => {
                         let alloc = self
                             .tcx
@@ -326,7 +398,12 @@ impl<'ll, 'tcx> ConstCodegenMethods for CodegenCx<'ll, 'tcx> {
                                 }),
                             )))
                             .unwrap_memory();
-                        let init = const_alloc_to_llvm(self, alloc.inner(), /*static*/ false);
+                        let init = const_alloc_to_llvm(
+                            self,
+                            alloc.inner(),
+                            IsStatic::No,
+                            IsInitOrFini::No,
+                        );
                         self.static_addr_of_impl(init, alloc.inner().align, None)
                     }
                     GlobalAlloc::Static(def_id) => {

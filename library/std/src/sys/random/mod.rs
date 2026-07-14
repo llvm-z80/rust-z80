@@ -54,6 +54,7 @@ cfg_select! {
         target_os = "hurd",
         target_os = "l4re",
         target_os = "nto",
+        target_os = "qnx",
     ) => {
         mod unix_legacy;
         pub use unix_legacy::fill_bytes;
@@ -95,8 +96,8 @@ cfg_select! {
         pub use wasip1::fill_bytes;
     }
     all(target_os = "wasi", any(target_env = "p2", target_env = "p3")) => {
-        mod wasip2;
-        pub use wasip2::{fill_bytes, hashmap_random_keys};
+        mod wasi;
+        pub use wasi::{fill_bytes, hashmap_random_keys};
     }
     target_os = "zkvm" => {
         mod zkvm;
