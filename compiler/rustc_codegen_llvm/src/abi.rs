@@ -453,6 +453,9 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             CanonAbi::Interrupt(InterruptKind::RiscvSupervisor) => {
                 func_attrs.push(llvm::CreateAttrStringValue(cx.llcx, "interrupt", "supervisor"))
             }
+            CanonAbi::Interrupt(InterruptKind::Z80) => {
+                func_attrs.push(llvm::CreateAttrString(cx.llcx, "interrupt"))
+            }
             CanonAbi::Arm(ArmCall::CCmseNonSecureEntry) => {
                 func_attrs.push(llvm::CreateAttrString(cx.llcx, "cmse_nonsecure_entry"))
             }
