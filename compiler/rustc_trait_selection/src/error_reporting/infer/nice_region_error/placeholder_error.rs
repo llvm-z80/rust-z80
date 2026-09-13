@@ -9,6 +9,7 @@ use rustc_middle::bug;
 use rustc_middle::ty::error::ExpectedFound;
 use rustc_middle::ty::print::{FmtPrinter, Print, PrintTraitRefExt as _, RegionHighlightMode};
 use rustc_middle::ty::{self, GenericArgsRef, IsSuggestable, RePlaceholder, Region, TyCtxt};
+use rustc_structures::Limit;
 use tracing::{debug, instrument};
 
 use crate::diagnostics::{
@@ -29,7 +30,7 @@ pub(crate) struct Highlighted<'tcx, T> {
 
 impl<'tcx, T> IntoDiagArg for Highlighted<'tcx, T>
 where
-    T: for<'a> Print<FmtPrinter<'a, 'tcx>>,
+    T: for<'a> Print<FmtPrinter<'a, 'tcx>> + Copy,
 {
     fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> rustc_errors::DiagArgValue {
         rustc_errors::DiagArgValue::Str(self.to_string().into())
@@ -44,14 +45,28 @@ impl<'tcx, T> Highlighted<'tcx, T> {
 
 impl<'tcx, T> fmt::Display for Highlighted<'tcx, T>
 where
-    T: for<'a> Print<FmtPrinter<'a, 'tcx>>,
+    T: for<'a> Print<FmtPrinter<'a, 'tcx>> + Copy,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut p = ty::print::FmtPrinter::new(self.tcx, self.ns);
         p.region_highlight_mode = self.highlight;
 
         self.value.print(&mut p)?;
-        f.write_str(&p.into_buffer())
+        let b = p.into_buffer();
+        if b.len() <= 40 || !self.highlight.keep_regions || self.tcx.sess.opts.verbose {
+            // This is a short enough type that can be safely be printed to the user, or we aren't
+            // showing the type with a particular interest in its lifetimes.
+            f.write_str(&b)?;
+        } else {
+            // We are highlighting lifetimes in the output, we will print out the smallest possible
+            // portion of the type while keeping the lifetimes visible.
+            let mut p = FmtPrinter::new_with_limit(self.tcx, self.ns, Limit(0));
+            p.region_highlight_mode = self.highlight;
+            self.value.print(&mut p).expect("could not print type");
+            let x = p.into_buffer();
+            f.write_str(&x)?;
+        }
+        Ok(())
     }
 }
 
@@ -256,16 +271,12 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 (false, None, None, Some(span), String::new())
             };
 
-        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
-            self.cx.tcx,
-            trait_def_id,
-            expected_args,
-        ));
-        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new_from_args(
-            self.cx.tcx,
-            trait_def_id,
-            actual_args,
-        ));
+        let expected_trait_ref = self.cx.deeply_resolve_ignoring_regions(
+            ty::TraitRef::new_from_args(self.cx.tcx, trait_def_id, expected_args),
+        );
+        let actual_trait_ref = self.cx.deeply_resolve_ignoring_regions(
+            ty::TraitRef::new_from_args(self.cx.tcx, trait_def_id, actual_args),
+        );
 
         // Search the expected and actual trait references to see (a)
         // whether the sub/sup placeholders appear in them (sometimes
@@ -385,7 +396,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
         // the confusing lifetime-generality error into an actionable hint, e.g.:
         //   |buf|  →  |buf: &mut [u8]|
         if self.tcx().is_fn_trait(trait_def_id) {
-            let actual_self_ty = self.cx.resolve_vars_if_possible(
+            let actual_self_ty = self.cx.deeply_resolve_ignoring_regions(
                 ty::TraitRef::new_from_args(self.cx.tcx, trait_def_id, actual_args).self_ty(),
             );
             if let ty::Closure(closure_def_id, _) = *actual_self_ty.kind()

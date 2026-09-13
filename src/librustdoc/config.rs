@@ -7,16 +7,18 @@ use std::{fmt, io};
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::DiagCtxtHandle;
+use rustc_lint::Level;
 use rustc_session::config::{
-    self, CodegenOptions, CrateType, ErrorOutputType, Externs, Input, JsonUnusedExterns,
-    OptionsTargetModifiers, OutFileName, Sysroot, UnstableOptions, get_cmd_lint_options,
-    nightly_options, parse_crate_types_from_list, parse_externs, parse_target_triple,
+    self, CodegenOptions, ErrorOutputType, Externs, Input, JsonUnusedExterns,
+    OptionsTargetModifiers, OutFileName, PrintCategory, PrintRequest, Sysroot, UnstableOptions,
+    collect_print_requests, get_cmd_lint_options, nightly_options, parse_crate_types_from_list,
+    parse_externs, parse_target_triple,
 };
-use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::{EarlyDiagCtxt, getopts};
 use rustc_span::edition::Edition;
 use rustc_span::{FileName, RemapPathScopeComponents};
+use rustc_structures::CrateType;
 use rustc_target::spec::TargetTuple;
 use smallvec::SmallVec;
 
@@ -25,7 +27,6 @@ use crate::externalfiles::ExternalHtml;
 use crate::html::markdown::IdMap;
 use crate::html::render::StylePath;
 use crate::html::static_files;
-use crate::passes::{self, Condition};
 use crate::scrape_examples::{AllCallLocations, ScrapeExamplesOptions};
 use crate::{html, opts, theme};
 
@@ -105,6 +106,8 @@ pub(crate) struct Options {
     pub(crate) describe_lints: bool,
     /// What level to cap lints at.
     pub(crate) lint_cap: Option<Level>,
+    /// Print requests to hand to the compiler.
+    pub(crate) prints: Vec<PrintRequest>,
 
     // Options specific to running doctests
     /// Whether we should run doctests instead of generating docs.
@@ -198,6 +201,7 @@ impl fmt::Debug for Options {
             .field("lint_opts", &self.lint_opts)
             .field("describe_lints", &self.describe_lints)
             .field("lint_cap", &self.lint_cap)
+            .field("prints", &self.prints)
             .field("should_test", &self.should_test)
             .field("test_args", &self.test_args)
             .field("test_run_directory", &self.test_run_directory)
@@ -336,10 +340,6 @@ impl FromStr for EmitType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            // old nightly-only choices that are going away soon
-            "toolchain-shared-resources" => Ok(Self::HtmlStaticFiles),
-            "invocation-specific" => Ok(Self::HtmlNonStaticFiles),
-            // modern choices
             "html-static-files" => Ok(Self::HtmlStaticFiles),
             "html-non-static-files" => Ok(Self::HtmlNonStaticFiles),
             "dep-info" => Ok(Self::DepInfo(None)),
@@ -412,7 +412,7 @@ impl Options {
         let diagnostic_width = matches.opt_get("diagnostic-width").unwrap_or_default();
 
         let mut collected_options = Default::default();
-        let codegen_options = CodegenOptions::build(early_dcx, matches, &mut collected_options);
+        let mut codegen_options = CodegenOptions::build(early_dcx, matches, &mut collected_options);
         let unstable_opts = UnstableOptions::build(early_dcx, matches, &mut collected_options);
 
         let remap_path_prefix = match parse_remap_path_prefix(matches) {
@@ -430,40 +430,7 @@ impl Options {
         // check for deprecated options
         check_deprecated_options(matches, dcx);
 
-        if matches.opt_strs("passes") == ["list"] {
-            println!("Available passes for running rustdoc:");
-            for pass in passes::PASSES {
-                println!("{:>20} - {}", pass.name, pass.description);
-            }
-            println!("\nDefault passes for rustdoc:");
-            for p in passes::DEFAULT_PASSES {
-                print!("{:>20}", p.pass.name);
-                println_condition(p.condition);
-            }
-
-            if nightly_options::match_is_nightly_build(matches) {
-                println!("\nPasses run with `--show-coverage`:");
-                for p in passes::COVERAGE_PASSES {
-                    print!("{:>20}", p.pass.name);
-                    println_condition(p.condition);
-                }
-            }
-
-            fn println_condition(condition: Condition) {
-                use Condition::*;
-                match condition {
-                    Always => println!(),
-                    WhenDocumentPrivate => println!("  (when --document-private-items)"),
-                    WhenNotDocumentPrivate => println!("  (when not --document-private-items)"),
-                    WhenNotDocumentHidden => println!("  (when not --document-hidden-items)"),
-                }
-            }
-
-            return None;
-        }
-
         let should_test = matches.opt_present("test");
-
         let show_coverage = matches.opt_present("show-coverage");
         let output_format_s = matches.opt_str("output-format");
         let output_format = match output_format_s.as_deref() {
@@ -601,33 +568,76 @@ impl Options {
 
         let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(early_dcx, matches);
 
-        let input = if describe_lints {
-            InputMode::HasFile(make_input(early_dcx, ""))
-        } else {
-            match matches.free.as_slice() {
-                [] if matches.opt_str("merge").as_deref() == Some("finalize") => {
-                    InputMode::NoInputMergeFinalize
-                }
-                [] => dcx.fatal("missing file operand"),
-                [input] => InputMode::HasFile(make_input(early_dcx, input)),
-                _ => dcx.fatal("too many file operands"),
-            }
-        };
-
         let externs = parse_externs(early_dcx, matches, &unstable_opts);
         let extern_html_root_urls = match parse_extern_html_roots(matches) {
             Ok(ex) => ex,
             Err(err) => dcx.fatal(err),
         };
 
-        let parts_out_dir =
-            match matches.opt_str("parts-out-dir").map(PathToParts::from_flag).transpose() {
+        let prints = collect_print_requests(
+            early_dcx,
+            &mut codegen_options,
+            &unstable_opts,
+            matches,
+            &[PrintCategory::Target, PrintCategory::Crate],
+        );
+
+        let mut parts_out_dir =
+            match matches.opt_str("write-doc-meta-dir").map(PathToParts::from_flag).transpose() {
                 Ok(parts_out_dir) => parts_out_dir,
                 Err(e) => dcx.fatal(e),
             };
-        let include_parts_dir = match parse_include_parts_dir(matches) {
+        let mut include_parts_dir = match parse_read_doc_meta(matches, "read-doc-meta-dir") {
             Ok(include_parts_dir) => include_parts_dir,
             Err(e) => dcx.fatal(e),
+        };
+        let mut should_merge = match compute_should_merge(matches) {
+            Ok(should_merge) => should_merge,
+            Err(e) => dcx.fatal(e),
+        };
+        if parts_out_dir.is_none() && include_parts_dir.is_empty() {
+            // we'll need to get rid of this stuff once Cargo stops using them
+            parts_out_dir =
+                match matches.opt_str("parts-out-dir").map(PathToParts::from_flag).transpose() {
+                    Ok(parts_out_dir) => parts_out_dir,
+                    Err(e) => dcx.fatal(e),
+                };
+            include_parts_dir = match parse_read_doc_meta(matches, "include-parts-dir") {
+                Ok(include_parts_dir) => include_parts_dir,
+                Err(e) => dcx.fatal(e),
+            };
+            should_merge = match matches.opt_str("merge").as_deref() {
+                None => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+                Some("none") => ShouldMerge { read_rendered_cci: false, write_rendered_cci: false },
+                Some("shared") => ShouldMerge { read_rendered_cci: true, write_rendered_cci: true },
+                Some("finalize") => {
+                    ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }
+                }
+                Some(_) => dcx.fatal("argument to --merge must be `none`, `shared`, or `finalize`"),
+            };
+        } else if matches.opt_str("parts-out-dir").is_some() {
+            dcx.fatal(
+                "deprecated version of write-doc-meta-dir is used with new doc-meta-dir stuff",
+            );
+        } else if matches.opt_str("include-parts-dir").is_some() {
+            dcx.fatal(
+                "deprecated version of read-doc-meta-dir is used with new doc-meta-dir stuff",
+            );
+        } else if matches.opt_str("merge").is_some() {
+            dcx.fatal("deprecated parameter merge is used with new doc-meta-dir stuff");
+        }
+
+        let input = if describe_lints {
+            InputMode::HasFile(make_input(early_dcx, ""))
+        } else {
+            match matches.free.as_slice() {
+                [] if !include_parts_dir.is_empty() && should_merge.write_rendered_cci => {
+                    InputMode::NoInputMergeFinalize
+                }
+                [] => dcx.fatal("missing file operand"),
+                [input] => InputMode::HasFile(make_input(early_dcx, input)),
+                _ => dcx.fatal("too many file operands"),
+            }
         };
 
         let default_settings: Vec<Vec<(String, String)>> = vec![
@@ -697,7 +707,14 @@ impl Options {
                 output_to_stdout = out_dir == "-";
                 PathBuf::from(out_dir)
             }
-            (None, None) => PathBuf::from("doc"),
+            (None, None) => {
+                if show_coverage {
+                    // If no `-o` option is given and we're in the `--show-coverage` mode, by
+                    // default we print on the stdout.
+                    output_to_stdout = true;
+                }
+                PathBuf::from("doc")
+            }
         };
 
         let cfgs = matches.opt_strs("cfg");
@@ -853,10 +870,6 @@ impl Options {
         let extern_html_root_takes_precedence =
             matches.opt_present("extern-html-root-takes-precedence");
         let html_no_source = matches.opt_present("html-no-source");
-        let should_merge = match parse_merge(matches) {
-            Ok(result) => result,
-            Err(e) => dcx.fatal(format!("--merge option error: {e}")),
-        };
         let merge_doctests = parse_merge_doctests(matches, edition, dcx);
         tracing::debug!("merge_doctests: {merge_doctests:?}");
 
@@ -904,6 +917,7 @@ impl Options {
             lint_opts,
             describe_lints,
             lint_cap,
+            prints,
             should_test,
             test_args,
             show_coverage,
@@ -1051,7 +1065,7 @@ impl PathToParts {
         // check here is for diagnostics
         if path.exists() && !path.is_dir() {
             Err(format!(
-                "--parts-out-dir and --include-parts-dir expect directories, found: {}",
+                "--write-doc-meta-dir and --read-doc-meta-dir expect directories, found: {}",
                 path.display(),
             ))
         } else {
@@ -1061,15 +1075,15 @@ impl PathToParts {
     }
 }
 
-/// Reports error if --include-parts-dir is not a directory
-fn parse_include_parts_dir(m: &getopts::Matches) -> Result<Vec<PathToParts>, String> {
+/// Reports error if --read-doc-meta-dir is not a directory
+fn parse_read_doc_meta(m: &getopts::Matches, name: &str) -> Result<Vec<PathToParts>, String> {
     let mut ret = Vec::new();
-    for p in m.opt_strs("include-parts-dir") {
+    for p in m.opt_strs(name) {
         let p = PathToParts::from_flag(p)?;
         // this is just for diagnostic
         if !p.0.is_dir() {
             return Err(format!(
-                "--include-parts-dir expected {} to be a directory",
+                "--read-doc-meta-dir expected {} to be a directory",
                 p.0.display()
             ));
         }
@@ -1089,23 +1103,16 @@ pub(crate) struct ShouldMerge {
 
 /// Extracts read_rendered_cci and write_rendered_cci from command line arguments, or
 /// reports an error if an invalid option was provided
-fn parse_merge(m: &getopts::Matches) -> Result<ShouldMerge, &'static str> {
-    match m.opt_str("merge").as_deref() {
-        // default = read-write
-        None => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
-        Some("none") if m.opt_present("include-parts-dir") => {
-            Err("--include-parts-dir not allowed if --merge=none")
-        }
-        Some("none") => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: false }),
-        Some("shared") if m.opt_present("parts-out-dir") || m.opt_present("include-parts-dir") => {
-            Err("--parts-out-dir and --include-parts-dir not allowed if --merge=shared")
-        }
-        Some("shared") => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
-        Some("finalize") if m.opt_present("parts-out-dir") => {
-            Err("--parts-out-dir not allowed if --merge=finalize")
-        }
-        Some("finalize") => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }),
-        Some(_) => Err("argument to --merge must be `none`, `shared`, or `finalize`"),
+fn compute_should_merge(m: &getopts::Matches) -> Result<ShouldMerge, &'static str> {
+    match (m.opt_present("read-doc-meta-dir"), m.opt_present("write-doc-meta-dir")) {
+        // shared mode
+        (false, false) => Ok(ShouldMerge { read_rendered_cci: true, write_rendered_cci: true }),
+        // intermediate mode
+        (false, true) => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: false }),
+        // finalize mode
+        (true, false) => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }),
+        // not valid
+        (true, true) => Err("cannot pass both --read-doc-meta-dir and --write-doc-meta-dir"),
     }
 }
 

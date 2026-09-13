@@ -1,7 +1,7 @@
 use rustc_ast as ast;
 use rustc_ast::token::{self, MetaVarKind};
 use rustc_ast::tokenstream::{ParserRange, WithTokens};
-use rustc_ast::{AttrItemKind, Attribute, attr};
+use rustc_ast::{Attribute, attr};
 use rustc_errors::codes::*;
 use rustc_errors::{Diag, PResult, msg};
 use rustc_span::{BytePos, Span};
@@ -33,12 +33,6 @@ enum OuterAttributeType {
     DocComment,
     DocBlockComment,
     Attribute,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AllowLeadingUnsafe {
-    Yes,
-    No,
 }
 
 impl<'a> Parser<'a> {
@@ -316,11 +310,15 @@ impl<'a> Parser<'a> {
     /// Parses an inner part of an attribute (the path and following tokens).
     /// The tokens must be either a delimited token stream, or empty token stream,
     /// or the "legacy" key-value form.
-    ///     PATH `(` TOKEN_STREAM `)`
-    ///     PATH `[` TOKEN_STREAM `]`
-    ///     PATH `{` TOKEN_STREAM `}`
-    ///     PATH
-    ///     PATH `=` UNSUFFIXED_LIT
+    ///
+    /// ```text
+    /// PATH `(` TOKEN_STREAM `)`
+    /// PATH `[` TOKEN_STREAM `]`
+    /// PATH `{` TOKEN_STREAM `}`
+    /// PATH
+    /// PATH `=` UNSUFFIXED_LIT
+    /// ```
+    ///
     /// The delimiters or `=` are still put into the resulting token stream.
     pub fn parse_attr_item(
         &mut self,
@@ -335,6 +333,7 @@ impl<'a> Parser<'a> {
 
         // Attr items don't have attributes.
         self.collect_tokens(None, AttrWrapper::empty(), force_collect, |this, _empty_attrs| {
+            let lo = this.token.span;
             let is_unsafe = this.eat_keyword(exp!(Unsafe));
             let unsafety = if is_unsafe {
                 let unsafe_span = this.prev_token.span;
@@ -349,12 +348,9 @@ impl<'a> Parser<'a> {
             if is_unsafe {
                 this.expect(exp!(CloseParen))?;
             }
+            let span = lo.to(this.prev_token.span);
             Ok((
-                WithTokens::new(ast::AttrItem {
-                    unsafety,
-                    path,
-                    args: AttrItemKind::Unparsed(args),
-                }),
+                WithTokens::new(ast::AttrItem { unsafety, path, args, span }),
                 Trailing::No,
                 UsePreAttrPos::No,
             ))
@@ -437,10 +433,7 @@ impl<'a> Parser<'a> {
     /// MetaItem = SimplePath ( '=' UNSUFFIXED_LIT | '(' MetaSeq? ')' )? ;
     /// MetaSeq = MetaItemInner (',' MetaItemInner)* ','? ;
     /// ```
-    pub fn parse_meta_item(
-        &mut self,
-        unsafe_allowed: AllowLeadingUnsafe,
-    ) -> PResult<'a, ast::MetaItem> {
+    pub fn parse_meta_item(&mut self) -> PResult<'a, ast::MetaItem> {
         if let Some(MetaVarKind::Meta { has_meta_form }) = self.token.is_metavar_seq() {
             return if has_meta_form {
                 let attr_item = self
@@ -449,35 +442,18 @@ impl<'a> Parser<'a> {
                     })
                     .unwrap()
                     .node;
-                Ok(attr_item.meta(attr_item.path.span).unwrap())
+                Ok(attr_item.meta(attr_item.span).unwrap())
             } else {
                 self.unexpected_any()
             };
         }
-
         let lo = self.token.span;
-        let is_unsafe = if unsafe_allowed == AllowLeadingUnsafe::Yes {
-            self.eat_keyword(exp!(Unsafe))
-        } else {
-            false
-        };
-        let unsafety = if is_unsafe {
-            let unsafe_span = self.prev_token.span;
-            self.expect(exp!(OpenParen))?;
-
-            ast::Safety::Unsafe(unsafe_span)
-        } else {
-            ast::Safety::Default
-        };
 
         let path = self.parse_path(PathStyle::Mod)?;
         let kind = self.parse_meta_item_kind()?;
-        if is_unsafe {
-            self.expect(exp!(CloseParen))?;
-        }
         let span = lo.to(self.prev_token.span);
 
-        Ok(ast::MetaItem { unsafety, path, kind, span })
+        Ok(ast::MetaItem { unsafety: ast::Safety::Default, path, kind, span })
     }
 
     pub(crate) fn parse_meta_item_kind(&mut self) -> PResult<'a, ast::MetaItemKind> {
@@ -502,7 +478,7 @@ impl<'a> Parser<'a> {
             Err(err) => err.cancel(), // we provide a better error below
         }
 
-        match self.parse_meta_item(AllowLeadingUnsafe::No) {
+        match self.parse_meta_item() {
             Ok(mi) => return Ok(ast::MetaItemInner::MetaItem(mi)),
             Err(err) => err.cancel(), // we provide a better error below
         }
@@ -530,5 +506,43 @@ impl<'a> Parser<'a> {
         }
 
         Err(self.dcx().create_err(err))
+    }
+
+    /// Recover from outer attributes in places where none were expected.
+    pub fn recover_from_outer_attributes(&mut self, target: &str) -> PResult<'a, ()> {
+        // We check the token ourselves first to prevent `#`
+        // from getting added to the set of expected tokens.
+        if !self.may_recover() || !matches!(self.token.kind, token::Pound | token::DocComment(..)) {
+            return Ok(());
+        }
+
+        let attrs = self.parse_outer_attributes()?;
+        if attrs.is_empty() {
+            return Ok(());
+        }
+
+        let attrs = attrs.take_for_recovery(self.psess);
+        let span = attrs.first().unwrap().span.to(attrs.last().unwrap().span);
+
+        let subject = if attrs.iter().all(|attr| matches!(attr.kind, ast::AttrKind::DocComment(..)))
+        {
+            "doc comments"
+        } else {
+            "attributes"
+        };
+
+        self.dcx()
+            .struct_span_err(span, format!("{subject} cannot be applied to {target}"))
+            .with_span_label(span, format!("{subject} are not allowed here"))
+            .with_span_suggestion_with_style(
+                span.until(self.token.span),
+                format!("remove these {subject}"),
+                String::new(),
+                rustc_errors::Applicability::MachineApplicable,
+                rustc_errors::SuggestionStyle::CompletelyHidden,
+            )
+            .emit();
+
+        Ok(())
     }
 }

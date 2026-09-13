@@ -34,6 +34,20 @@ pub enum OverflowOp {
     Mul,
 }
 
+/// The location of the return value for the call.
+#[derive(Copy, Clone, Debug)]
+pub enum ReturnSlot<V> {
+    Direct,
+    /// The return value will be passed via sret (e.g. `PassMode::Indirect`).
+    Indirect(V),
+}
+
+impl<V> ReturnSlot<V> {
+    pub fn is_indirect(&self) -> bool {
+        matches!(self, ReturnSlot::Indirect(_))
+    }
+}
+
 pub trait BuilderMethods<'a, 'tcx>:
     Sized
     + LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>>
@@ -135,6 +149,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
+        return_slot: ReturnSlot<Self::Value>,
         args: &[Self::Value],
         then: Self::BasicBlock,
         catch: Self::BasicBlock,
@@ -250,6 +265,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         ty: Self::Type,
         ptr: Self::Value,
         order: AtomicOrdering,
+        volatile: bool,
         size: Size,
     ) -> Self::Value;
     fn load_from_place(&mut self, ty: Self::Type, place: PlaceValue<Self::Value>) -> Self::Value {
@@ -330,6 +346,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         val: Self::Value,
         ptr: Self::Value,
         order: AtomicOrdering,
+        volatile: bool,
         size: Size,
     );
 
@@ -401,10 +418,6 @@ pub trait BuilderMethods<'a, 'tcx>:
             TypeKind::Half | TypeKind::Float | TypeKind::Double | TypeKind::FP128
         );
         assert_eq!(self.cx().type_kind(int_ty), TypeKind::Integer);
-
-        if let Some(false) = self.cx().sess().opts.unstable_opts.saturating_float_casts {
-            return if signed { self.fptosi(x, dest_ty) } else { self.fptoui(x, dest_ty) };
-        }
 
         if signed { self.fptosi_sat(x, dest_ty) } else { self.fptoui_sat(x, dest_ty) }
     }
@@ -513,7 +526,9 @@ pub trait BuilderMethods<'a, 'tcx>:
             let ty = self.backend_type(layout);
             let val = self.load_from_place(ty, src);
             self.store_to_place_with_flags(val, dst, flags);
-        } else if self.sess().opts.optimize == OptLevel::No && self.is_backend_immediate(layout) {
+        } else if self.sess().opts.optimize == OptLevel::No
+            && layout.backend_repr.is_scalar_or_simd()
+        {
             // If we're not optimizing, the aliasing information from `memcpy`
             // isn't useful, so just load-store the value for smaller code.
             let temp = self.load_operand(src.with_type(layout));
@@ -638,16 +653,20 @@ pub trait BuilderMethods<'a, 'tcx>:
     /// The typical case that they are None is during the codegen of intrinsics and lang-items,
     /// as those are "fake functions" with only a trivial ABI if any, et cetera.
     ///
+    /// `return_slot` must be `ReturnSlot::Indirect` if an argument uses `PassMode::Indirect`.
+    ///
     /// ## Return
     ///
-    /// Must return the value the function will return so it can be written to the destination,
-    /// assuming the function does not explicitly pass the destination as a pointer in `args`.
+    /// Must return the value the function will return so it can be written to the destination.
+    /// For calls with an indirect return, the returned value is meaningless and must not be
+    /// used: the return value lives in the return slot.
     fn call(
         &mut self,
         llty: Self::FunctionSignature,
         caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         fn_val: Self::Value,
+        return_slot: ReturnSlot<Self::Value>,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
         callee_instance: Option<Instance<'tcx>>,
@@ -659,6 +678,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Value,
+        return_slot: ReturnSlot<Self::Value>,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
         callee_instance: Option<Instance<'tcx>>,

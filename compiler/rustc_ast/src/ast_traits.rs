@@ -62,7 +62,7 @@ impl<T: HasNodeId> HasNodeId for Box<T> {
 }
 
 /// A trait for AST nodes having (or not having) collected tokens.
-pub trait HasTokens {
+pub trait HasTokens: HasAttrs {
     fn tokens(&self) -> Option<&LazyAttrTokenStream>;
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>>;
 }
@@ -109,7 +109,7 @@ impl_has_tokens_none!(
     WherePredicate
 );
 
-impl<T> HasTokens for WithTokens<T> {
+impl<T: HasAttrs> HasTokens for WithTokens<T> {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
         self.tokens.as_ref()
     }
@@ -170,17 +170,13 @@ impl HasTokens for Attribute {
     fn tokens(&self) -> Option<&LazyAttrTokenStream> {
         match &self.kind {
             AttrKind::Normal(normal) => normal.tokens.as_ref(),
-            kind @ AttrKind::DocComment(..) => {
-                panic!("Called tokens on doc comment attr {kind:?}")
-            }
+            AttrKind::Synthetic(..) | AttrKind::DocComment(..) => unreachable!(),
         }
     }
     fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
         Some(match &mut self.kind {
             AttrKind::Normal(normal) => &mut normal.tokens,
-            kind @ AttrKind::DocComment(..) => {
-                panic!("Called tokens_mut on doc comment attr {kind:?}")
-            }
+            AttrKind::Synthetic(..) | AttrKind::DocComment(..) => unreachable!(),
         })
     }
 }

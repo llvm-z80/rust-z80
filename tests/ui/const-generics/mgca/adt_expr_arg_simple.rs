@@ -1,4 +1,4 @@
-#![feature(min_generic_const_args, adt_const_params)]
+#![feature(min_generic_const_args, macroless_generic_const_args, adt_const_params)]
 #![expect(incomplete_features)]
 
 #[derive(Eq, PartialEq, std::marker::ConstParamTy)]
@@ -11,7 +11,8 @@ use Option::Some;
 fn foo<const N: Option<u32>>() {}
 
 trait Trait {
-    type const ASSOC: u32;
+    #[rustc_always_gca]
+    const ASSOC: u32;
 }
 
 fn bar<T: Trait, const N: u32>() {

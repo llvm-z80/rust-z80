@@ -23,7 +23,7 @@ enum PerfCommand {
     },
     /// Run `profile_local samply`
     /// This executes the compiler on the given benchmarks and profiles it with `samply`.
-    /// You need to install `samply`, e.g. using `cargo install samply`.
+    /// You need to install `samply`, e.g. using `cargo install --locked samply`.
     Samply {
         #[clap(flatten)]
         opts: SharedOpts,
@@ -95,6 +95,7 @@ pub enum Profile {
     Check,
     Debug,
     Doc,
+    DocJson,
     Opt,
     Clippy,
 }
@@ -105,6 +106,7 @@ impl Display for Profile {
             Profile::Check => "Check",
             Profile::Debug => "Debug",
             Profile::Doc => "Doc",
+            Profile::DocJson => "DocJson",
             Profile::Opt => "Opt",
             Profile::Clippy => "Clippy",
         };
@@ -134,13 +136,13 @@ impl Display for Scenario {
 }
 
 /// Performs profiling using `rustc-perf` on a built version of the compiler.
-pub fn perf(builder: &Builder<'_>, args: &PerfArgs) {
+pub fn perf(builder: &Builder<'_>, args: &PerfArgs, trailing_args: &[String]) {
     let collector = builder.ensure(RustcPerf {
         compiler: builder.compiler(0, builder.config.host_target),
         target: builder.config.host_target,
     });
 
-    let rustc_perf_dir = builder.build.tempdir().join("rustc-perf");
+    let rustc_perf_dir = builder.sess.tempdir().join("rustc-perf");
     let results_dir = rustc_perf_dir.join("results");
     builder.create_dir(&results_dir);
 
@@ -158,7 +160,7 @@ pub fn perf(builder: &Builder<'_>, args: &PerfArgs) {
         | PerfCommand::Cachegrind { .. } => true,
         PerfCommand::Benchmark { .. } | PerfCommand::Compare { .. } => false,
     };
-    if is_profiling && builder.build.config.rust_debuginfo_level_rustc == DebuginfoLevel::None {
+    if is_profiling && builder.sess.config.rust_debuginfo_level_rustc == DebuginfoLevel::None {
         builder.info(r#"WARNING: You are compiling rustc without debuginfo, this will make profiling less useful.
 Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
     }
@@ -197,6 +199,7 @@ Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
             cmd.arg(prepare_rustc());
 
             apply_shared_opts(&mut cmd, opts);
+            cmd.args(trailing_args);
             cmd.run(builder);
 
             println!("You can find the results at `{}`", results_dir.display());
@@ -208,6 +211,7 @@ Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
             cmd.arg(prepare_rustc());
 
             apply_shared_opts(&mut cmd, opts);
+            cmd.args(trailing_args);
             cmd.run(builder);
         }
         PerfCommand::Compare { base, modified } => {
@@ -215,6 +219,7 @@ Consider setting `rust.debuginfo-level = 1` in `bootstrap.toml`."#);
             cmd.arg("--db").arg(&db_path);
             cmd.arg(base).arg(modified);
 
+            cmd.args(trailing_args);
             cmd.run(builder);
         }
     }

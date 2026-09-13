@@ -1,4 +1,5 @@
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes};
 use rustc_infer::traits::{
     ImplDerivedHostCause, ImplSource, Obligation, ObligationCause, ObligationCauseCode,
@@ -14,7 +15,7 @@ use thin_vec::{ThinVec, thin_vec};
 use super::SelectionContext;
 use super::normalize::normalize_with_depth_to;
 
-pub type HostEffectObligation<'tcx> = Obligation<'tcx, ty::HostEffectPredicate<'tcx>>;
+pub type HostEffectObligation<'tcx> = Obligation<'tcx, ty::HostEffectClause<'tcx>>;
 
 pub enum EvaluationFailure {
     Ambiguous,
@@ -32,7 +33,7 @@ pub fn evaluate_host_effect_obligation<'tcx>(
         );
     }
 
-    let ref obligation = selcx.infcx.resolve_vars_if_possible(obligation.clone());
+    let ref obligation = selcx.infcx.deeply_resolve_ignoring_regions(obligation.clone());
 
     // Force ambiguity for infer self ty.
     if obligation.predicate.self_ty().is_ty_var() {
@@ -81,7 +82,7 @@ pub fn evaluate_host_effect_obligation<'tcx>(
 fn match_candidate<'tcx>(
     selcx: &mut SelectionContext<'_, 'tcx>,
     obligation: &HostEffectObligation<'tcx>,
-    candidate: ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>,
+    candidate: ty::Binder<'tcx, ty::HostEffectClause<'tcx>>,
     candidate_is_unnormalized: bool,
     more_nested: impl FnOnce(&mut SelectionContext<'_, 'tcx>, &mut ThinVec<PredicateObligation<'tcx>>),
 ) -> Result<ThinVec<PredicateObligation<'tcx>>, NoSolution> {
@@ -104,7 +105,7 @@ fn match_candidate<'tcx>(
             obligation.param_env,
             obligation.cause.clone(),
             obligation.recursion_depth,
-            candidate,
+            Unnormalized::new_wip(candidate),
             &mut nested,
         );
     }
@@ -245,7 +246,7 @@ fn evaluate_host_effect_from_conditionally_const_item_bounds<'tcx>(
                         obligation.param_env,
                         obligation.cause.clone(),
                         obligation.recursion_depth,
-                        trait_ref.skip_norm_wip(),
+                        trait_ref,
                         nested,
                     );
                     (trait_ref, span)
@@ -601,7 +602,8 @@ fn evaluate_host_effect_from_selection_candidate<'tcx>(
                     match tcx.impl_trait_header(impl_.impl_def_id).constness {
                         rustc_hir::Constness::Const { always } => {
                             if always {
-                                unimplemented!()
+                                // FIXME(comptime): just bailing for now to avoid an ICE in a test.
+                                return Err(EvaluationFailure::NoSolution);
                             }
                         }
                         rustc_hir::Constness::NotConst => {

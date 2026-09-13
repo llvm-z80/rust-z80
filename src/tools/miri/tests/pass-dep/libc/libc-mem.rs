@@ -206,7 +206,7 @@ fn test_aligned_alloc() {
     for _ in 0..16 {
         // alignment 1, size 4 should succeed and actually must align to 4 (because C says so...)
         // ... but on native macOS they don't seem to actually implement this correctly.
-        if cfg!(miri) || cfg!(not(target_vendor = "apple")) {
+        if cfg!(miri) || cfg!(not(target_os = "macos")) {
             unsafe {
                 let p = libc::aligned_alloc(1, 4);
                 assert!(!p.is_null());
@@ -342,6 +342,14 @@ fn test_memset() {
     }
 }
 
+fn test_memcmp() {
+    unsafe {
+        assert!(libc::memcmp(b"123".as_ptr().cast(), b"132".as_ptr().cast(), 3) < 0);
+        assert!(libc::memcmp(b"abc".as_ptr().cast(), b"aaa".as_ptr().cast(), 3) > 0);
+        assert!(libc::memcmp(b"xyz".as_ptr().cast(), b"xyz".as_ptr().cast(), 3) == 0);
+    }
+}
+
 fn test_memchr() {
     unsafe {
         let buf = b"0abcdefd";
@@ -400,6 +408,24 @@ fn test_strnlen() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn test_malloc_usable_size() {
+    unsafe {
+        // `malloc_usable_size(NULL)` returns 0.
+        assert_eq!(libc::malloc_usable_size(ptr::null_mut()), 0);
+
+        for size in [1, 2, 5, 16, 123, 1024] {
+            let p = libc::malloc(size);
+            if cfg!(miri) {
+                // Miri returns the exact size, but it doesn't need to.
+                assert_eq!(libc::malloc_usable_size(p), size);
+            }
+            assert!(libc::malloc_usable_size(p) >= size);
+            libc::free(p);
+        }
+    }
+}
+
 fn test_wcslen() {
     fn to_c_wchar_t_str(s: &str) -> Vec<libc::wchar_t> {
         let mut r = Vec::<libc::wchar_t>::new();
@@ -436,10 +462,13 @@ fn main() {
     test_reallocarray();
     #[cfg(not(target_os = "windows"))]
     test_aligned_alloc();
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    test_malloc_usable_size();
 
     test_memcpy();
     test_strcpy();
     test_memset();
+    test_memcmp();
     test_memchr();
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     test_memrchr();

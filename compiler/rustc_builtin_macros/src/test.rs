@@ -5,11 +5,10 @@ use std::{assert_matches, iter};
 
 use rustc_ast::{self as ast, GenericParamKind, attr, join_path_idents};
 use rustc_ast_pretty::pprust;
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::{Applicability, Diag, Level};
 use rustc_expand::base::*;
-use rustc_hir::Attribute;
-use rustc_hir::attrs::AttributeKind;
 use rustc_span::{ErrorGuaranteed, Ident, RemapPathScopeComponents, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
@@ -24,9 +23,6 @@ use crate::util::{check_builtin_macro_attribute, warn_on_duplicate_attribute};
 ///
 /// We mark item with an inert attribute "rustc_test_marker" which the test generation
 /// logic will pick up on.
-///
-/// The test function also gains a `#[rustc_test_entrypoint_marker]` attribute for tools to pick up
-/// on. This behavior is *unstable*.
 pub(crate) fn expand_test_case(
     ecx: &mut ExtCtxt<'_>,
     attr_sp: Span,
@@ -96,13 +92,13 @@ pub(crate) fn expand_test(
 
 pub(crate) fn expand_bench(
     cx: &mut ExtCtxt<'_>,
-    attr_sp: Span,
+    attr_path_sp: Span,
     meta_item: &ast::MetaItem,
     item: Annotatable,
 ) -> Vec<Annotatable> {
     check_builtin_macro_attribute(cx, meta_item, sym::bench);
     warn_on_duplicate_attribute(cx, &item, sym::bench);
-    expand_test_or_bench(cx, attr_sp, item, true)
+    expand_test_or_bench(cx, attr_path_sp, item, true)
 }
 
 pub(crate) fn expand_test_or_bench(
@@ -265,7 +261,7 @@ pub(crate) fn expand_test_or_bench(
         &fn_.ident,
     ));
 
-    let location_info = get_location_info(cx, &fn_);
+    let location_info = get_location_info(cx, fn_);
 
     let mut test_const =
         cx.item(
@@ -287,7 +283,7 @@ pub(crate) fn expand_test_or_bench(
                     ty: cx.ty(sp, ast::TyKind::Path(None, test_path("TestDescAndFn"))),
                     define_opaque: None,
                     // test::TestDescAndFn {
-                    rhs_kind: ast::ConstItemRhsKind::new_body(
+                    body: Some(
                         cx.expr_struct(
                             sp,
                             test_path("TestDescAndFn"),
@@ -380,12 +376,6 @@ pub(crate) fn expand_test_or_bench(
     let test_extern =
         cx.item(sp, ast::AttrVec::new(), ast::ItemKind::ExternCrate(None, test_ident));
 
-    let item = {
-        let mut item = item;
-        item.attrs.push(cx.attr_word(sym::rustc_test_entrypoint_marker, attr_sp));
-        item
-    };
-
     debug!("synthetic test item:\n{}\n", pprust::item_to_string(&test_const));
 
     if is_stmt {
@@ -412,7 +402,7 @@ pub(crate) fn expand_test_or_bench(
 fn not_testable_error(cx: &ExtCtxt<'_>, is_bench: bool, attr_sp: Span, item: Option<&ast::Item>) {
     let dcx = cx.dcx();
     let name = if is_bench { "bench" } else { "test" };
-    let msg = format!("the `#[{name}]` attribute may only be used on a free function");
+    let msg = format!("the `{name}` attribute may only be used on a free function");
     let level = match item.map(|i| &i.kind) {
         // These were a warning before #92959 and need to continue being that to avoid breaking
         // stable user code (#94508).
@@ -431,7 +421,7 @@ fn not_testable_error(cx: &ExtCtxt<'_>, is_bench: bool, attr_sp: Span, item: Opt
             ),
         );
     }
-    err.span_label(attr_sp, format!("the `#[{name}]` macro causes a function to be run as a test and has no effect on non-functions"));
+    err.span_label(attr_sp, format!("the `{name}` attribute causes a function to be run as a test and has no effect on non-functions"));
 
     if !is_bench {
         err.with_span_suggestion(attr_sp,
@@ -485,7 +475,7 @@ fn should_ignore_message(i: &ast::Item) -> Option<Symbol> {
 
 fn should_panic(cx: &ExtCtxt<'_>, i: &ast::Item) -> ShouldPanic {
     if let Some(Attribute::Parsed(AttributeKind::ShouldPanic { reason, .. })) =
-        AttributeParser::parse_limited(cx.sess, &i.attrs, &[sym::should_panic])
+        AttributeParser::parse_limited_sym(cx.sess, &i.attrs, &[sym::should_panic])
     {
         ShouldPanic::Yes(reason)
     } else {
@@ -537,30 +527,12 @@ fn check_test_signature(
         }));
     }
 
-    if let Some(coroutine_kind) = f.sig.header.coroutine_kind {
-        match coroutine_kind {
-            ast::CoroutineKind::Async { span, .. } => {
-                return Err(dcx.emit_err(diagnostics::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "async",
-                }));
-            }
-            ast::CoroutineKind::Gen { span, .. } => {
-                return Err(dcx.emit_err(diagnostics::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "gen",
-                }));
-            }
-            ast::CoroutineKind::AsyncGen { span, .. } => {
-                return Err(dcx.emit_err(diagnostics::TestBadFn {
-                    span: i.span,
-                    cause: span,
-                    kind: "async gen",
-                }));
-            }
-        }
+    if let Some(coroutine_marker) = f.sig.header.coroutine_marker {
+        return Err(dcx.emit_err(diagnostics::TestBadFn {
+            span: i.span,
+            cause: coroutine_marker.span,
+            kind: coroutine_marker.kind.as_str(),
+        }));
     }
 
     // If the termination trait is active, the compiler will check that the output

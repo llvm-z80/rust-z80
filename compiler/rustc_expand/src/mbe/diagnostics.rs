@@ -2,10 +2,10 @@ use std::borrow::Cow;
 
 use rustc_ast::token::{self, Token};
 use rustc_ast::tokenstream::TokenStream;
+use rustc_attr_ir::diagnostic::{CustomDiagnostic, Directive, FormatArgs};
+use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, DiagMessage, pluralize};
-use rustc_hir::attrs::diagnostic::{CustomDiagnostic, Directive, FormatArgs};
 use rustc_macros::Subdiagnostic;
-use rustc_middle::bug;
 use rustc_parse::parser::{Parser, Recovery, token_descr};
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::SourceMap;
@@ -48,11 +48,11 @@ pub(super) fn failed_to_match_macro(
     let mut tracker = CollectTrackerAndEmitter::new(name, psess.dcx(), sp);
 
     let try_success_result = match args {
-        FailedMacro::Func => try_match_macro(psess, name, body, rules, &mut tracker),
+        FailedMacro::Func => try_match_macro(psess, body, rules, &mut tracker),
         FailedMacro::Attr(attr_args) => {
-            try_match_macro_attr(psess, name, attr_args, body, rules, &mut tracker)
+            try_match_macro_attr(psess, attr_args, body, rules, &mut tracker)
         }
-        FailedMacro::Derive => try_match_macro_derive(psess, name, body, rules, &mut tracker),
+        FailedMacro::Derive => try_match_macro_derive(psess, body, rules, &mut tracker),
     };
 
     if try_success_result.is_ok() {
@@ -152,13 +152,30 @@ struct CollectTrackerAndEmitter<'dcx, 'matcher> {
     /// The matcher currently being parsed.
     //
     // FIXME: Factor out a per-arm `Tracker` so that the `Option` is unnecessary.
-    current: Option<WhichMatcher>,
+    current: Option<(WhichMatcher, &'matcher [MatcherLoc])>,
+
+    /// Matches of [`MatcherLoc`]s that successfully consumed input from the parser.
+    ///
+    /// This accumulates all calls to [`Tracker::matched_one()`]. It is used to identify all
+    /// competing matches for ambiguity errors.
+    matches: FxHashSet<SuccessfulMatch>,
 
     remaining_matcher: Option<&'matcher MatcherLoc>,
     /// Which arm's failure should we report? (the one furthest along)
     best_failure: Option<BestFailure>,
     root_span: Span,
     result: Option<(Span, ErrorGuaranteed)>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct SuccessfulMatch {
+    /// The position in the parser.
+    ///
+    /// As per [`Parser::approx_token_stream_pos()`].
+    input_pos: u32,
+
+    /// The index of the [`MatcherLoc`].
+    loc_index: u32,
 }
 
 struct BestFailure {
@@ -183,12 +200,12 @@ impl BestFailure {
 }
 
 impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'matcher> {
-    fn prepare(&mut self, which_matcher: WhichMatcher) {
+    fn prepare(&mut self, which_matcher: WhichMatcher, matcher: &'matcher [MatcherLoc]) {
         if self.current.is_some() {
-            bug!("`Self::after_arm()` was not called to clean up context");
+            panic!("`Self::after_arm()` was not called to clean up context");
         }
 
-        self.current = Some(which_matcher);
+        self.current = Some((which_matcher, matcher));
     }
 
     fn before_match_loc(&mut self, parser: &TtParser, matcher: &'matcher MatcherLoc) {
@@ -197,6 +214,13 @@ impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'match
         {
             self.remaining_matcher = Some(matcher);
         }
+    }
+
+    fn matched_one(&mut self, parser: &Parser<'_>, loc_index: usize) {
+        let input_pos = parser.approx_token_stream_pos();
+        let loc_index: u32 = loc_index.try_into().unwrap();
+        let m = SuccessfulMatch { input_pos, loc_index };
+        self.matches.insert(m);
     }
 
     fn after_arm(&mut self, result: &NamedParseResult) {
@@ -211,23 +235,24 @@ impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'match
             }
             Failure => {
                 if self.best_failure.is_none() {
-                    bug!("A matching failure occurred but `Self::failure()` was not called");
+                    panic!("A matching failure occurred but `Self::failure()` was not called");
                 }
             }
             Ambiguity => {
                 if self.result.is_none() {
-                    bug!("An ambiguity error occurred but `Self::ambiguity()` was not called");
+                    panic!("An ambiguity error occurred but `Self::ambiguity()` was not called");
                 }
             }
             ErrorReported(guar) => self.result = Some((self.root_span, guar)),
         }
 
         self.current = None;
+        self.matches.clear();
     }
 
     fn failure(&mut self, parser: &Parser<'_>) {
-        let Some(which_matcher) = self.current else {
-            bug!("`Self::prepare()` was not called to initialize context");
+        let Some((which_matcher, _)) = self.current else {
+            panic!("`Self::prepare()` was not called to initialize context");
         };
 
         let mut token = parser.token;
@@ -262,12 +287,28 @@ impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'match
         }
     }
 
-    fn ambiguity(
-        &mut self,
-        parser: &Parser<'_>,
-        bb_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
-        next_locs: impl IntoIterator<Item = &'matcher MatcherLoc>,
-    ) {
+    fn ambiguity(&mut self, parser: &Parser<'_>) {
+        let Some((_, matcher)) = self.current else {
+            panic!("`Self::prepare()` was not called to initialize context");
+        };
+
+        #[expect(
+            rustc::potential_query_instability,
+            reason = "sorting the results deterministically afterwards"
+        )]
+        let (mut bb_locs, mut next_locs) = self
+            .matches
+            .iter()
+            .filter(|m| m.input_pos == parser.approx_token_stream_pos())
+            .partition::<Vec<&SuccessfulMatch>, _>(|m| {
+                let loc = &matcher[m.loc_index as usize];
+                matches!(loc, MatcherLoc::MetaVarDecl { .. })
+            });
+
+        // Use a reasonable and deterministic ordering for data in the error message.
+        bb_locs.sort_unstable_by_key(|m| m.loc_index);
+        next_locs.sort_unstable_by_key(|m| m.loc_index);
+
         let span = parser.token.span.substitute_dummy(self.root_span);
 
         if parser.token == token::Eof {
@@ -279,11 +320,10 @@ impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'match
 
         let nts = bb_locs
             .into_iter()
-            .map(|loc| match loc {
-                MatcherLoc::MetaVarDecl { bind, kind, .. } => {
-                    format!("{kind} ('{bind}')")
-                }
-                _ => unreachable!(),
+            .map(|m| {
+                let loc = &matcher[m.loc_index as usize];
+                let MatcherLoc::MetaVarDecl { bind, kind, .. } = loc else { unreachable!() };
+                format!("{kind} ('{bind}')")
             })
             .collect::<Vec<String>>()
             .join(" or ");
@@ -291,7 +331,7 @@ impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'match
         let msg = format!(
             "local ambiguity when calling macro `{}`: multiple parsing options: {}",
             self.macro_name,
-            match next_locs.into_iter().count() {
+            match next_locs.len() {
                 0 => format!("built-in NTs {nts}."),
                 n => format!("built-in NTs {nts} or {n} other option{s}.", s = pluralize!(n)),
             }
@@ -316,6 +356,7 @@ impl<'dcx> CollectTrackerAndEmitter<'dcx, '_> {
             macro_name,
             dcx,
             current: None,
+            matches: FxHashSet::default(),
             remaining_matcher: None,
             best_failure: None,
             root_span,

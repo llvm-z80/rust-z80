@@ -82,7 +82,7 @@
 ///
 /// [`unused_must_use`]: ../rustc/lints/listing/warn-by-default.html#unused-must-use
 /// [the `must_use` attribute]: ../reference/attributes/diagnostics.html#the-must_use-attribute
-mod must_use_attribute {}
+const _: () = ();
 
 #[doc(attribute = "allow")]
 //
@@ -144,7 +144,7 @@ mod must_use_attribute {}
 /// [`forbid`]: ./attribute.forbid.html
 /// [`warn`]: ./attribute.warn.html
 /// [`deny`]: ./attribute.deny.html
-mod allow_attribute {}
+const _: () = ();
 
 #[doc(attribute = "cfg")]
 //
@@ -192,7 +192,7 @@ mod allow_attribute {}
 /// [`cfg_attr`]: ../reference/conditional-compilation.html#the-cfg_attr-attribute
 /// [the `cfg` attribute]: ../reference/conditional-compilation.html#the-cfg-attribute
 /// [`if`]: ./keyword.if.html
-mod cfg_attribute {}
+const _: () = ();
 
 #[doc(attribute = "deny")]
 //
@@ -240,7 +240,7 @@ mod cfg_attribute {}
 /// [`allow`]: ./attribute.allow.html
 /// [`warn`]: ./attribute.warn.html
 /// [`deny`]: ./attribute.deny.html
-mod deny_attribute {}
+const _: () = ();
 
 #[doc(attribute = "forbid")]
 //
@@ -276,7 +276,7 @@ mod deny_attribute {}
 /// [the `forbid` attribute]: ../reference/attributes/diagnostics.html#lint-check-attributes
 /// [`allow`]: ./attribute.allow.html
 /// [`warn`]: ./attribute.warn.html
-mod forbid_attribute {}
+const _: () = ();
 
 #[doc(attribute = "deprecated")]
 //
@@ -302,7 +302,7 @@ mod forbid_attribute {}
 /// For more information, see the Reference on [the `deprecated` attribute].
 ///
 /// [the `deprecated` attribute]: ../reference/attributes/diagnostics.html#the-deprecated-attribute
-mod deprecated_attribute {}
+const _: () = ();
 
 #[doc(attribute = "warn")]
 //
@@ -348,7 +348,7 @@ mod deprecated_attribute {}
 /// [`allow`]: ./attribute.allow.html
 /// [`deny`]: ./attribute.deny.html
 /// [`forbid`]: ./attribute.forbid.html
-mod warn_attribute {}
+const _: () = ();
 
 #[doc(attribute = "no_std")]
 //
@@ -404,4 +404,232 @@ mod warn_attribute {}
 /// [`Option`]: option::Option
 /// [`Result`]: result::Result
 /// [the `no_std` attribute]: ../reference/names/preludes.html#the-no_std-attribute
-mod no_std_attribute {}
+const _: () = ();
+
+#[doc(attribute = "inline")]
+//
+/// Suggest that the compiler inline a function at its call sites.
+///
+/// Inlining replaces a call with a copy of the called function's body, which can remove the
+/// overhead of the call. The `inline` attribute is only a hint: the compiler may ignore it, and
+/// it already inlines functions on its own when that looks worthwhile. Poor choices about what to
+/// inline can make a program larger or slower.
+///
+/// Where it does matter is inlining across crate boundaries. A non-generic function is not
+/// normally inlined into another crate, since the calling crate compiles against only its
+/// signature. Marking it `#[inline]` makes the body available to other crates so they can inline
+/// it too:
+///
+/// ```rust
+/// # #![allow(dead_code)]
+/// #[inline]
+/// pub fn square(x: i32) -> i32 {
+///     x * x
+/// }
+/// ```
+///
+/// Generic functions do not need this. They are instantiated in each crate that uses them, so
+/// their bodies are already available to inline.
+///
+/// The attribute applies to functions and has three forms:
+///
+/// - `#[inline]` suggests inlining the function.
+/// - `#[inline(always)]` suggests inlining it at every call site.
+/// - `#[inline(never)]` suggests never inlining it.
+///
+/// You should almost never need `#[inline(always)]`: prefer to let the compiler decide unless
+/// profiling shows a small, hot function that benefits from it. `#[inline(never)]` is useful to
+/// keep a rarely used path, such as a function that only reports an error, out of its caller.
+///
+/// For more information, see the Reference on [the `inline` attribute].
+///
+/// [the `inline` attribute]: ../reference/attributes/codegen.html#the-inline-attribute
+const _: () = ();
+
+#[doc(attribute = "cold")]
+//
+/// Hint to the compiler that a function is unlikely to be called.
+///
+/// Marking a function `#[cold]` tells the compiler that calls to it are rare, so it can
+/// optimize for the common case where the function is not called. It is only a hint: the
+/// compiler may ignore it, and it does not change the function's behavior.
+///
+/// It is typically used on functions that handle uncommon cases, such as error or panic paths:
+///
+/// ```rust
+/// # #![allow(dead_code)]
+/// fn check(value: i32) {
+///     if value < 0 {
+///         report_error("value must be non-negative");
+///     }
+///     // ... the common case continues here ...
+/// }
+///
+/// #[cold]
+/// fn report_error(message: &str) {
+///     eprintln!("error: {message}");
+/// }
+/// ```
+///
+/// For more information, see the Reference on [the `cold` attribute].
+///
+/// [the `cold` attribute]: ../reference/attributes/codegen.html#the-cold-attribute
+const _: () = ();
+
+#[doc(attribute = "track_caller")]
+//
+/// Make a function report the location of its caller instead of its own.
+///
+/// When a function panics, the panic message normally points at the line inside that function
+/// where the panic happened. `#[track_caller]` changes that: it lets the function see the
+/// [`Location`] it was called from, so the panic (and any direct use of [`Location::caller`])
+/// points at the call site instead. The standard library uses this on methods like
+/// [`Option::unwrap`], so a failed `unwrap` blames the line that called it rather than a line
+/// inside the standard library.
+///
+/// ```rust,should_panic
+/// #[track_caller]
+/// fn assert_even(n: i32) {
+///     assert!(n % 2 == 0, "{n} is not even");
+/// }
+///
+/// // The panic blames this line, not the `assert!` inside `assert_even`.
+/// assert_even(3);
+/// ```
+///
+/// The attribute applies to functions with the default `"Rust"` ABI, other than `fn main`.
+///
+/// For more information, see the Reference on [the `track_caller` attribute].
+///
+/// [`Location`]: panic::Location
+/// [`Location::caller`]: panic::Location::caller
+/// [`Option::unwrap`]: Option::unwrap
+/// [the `track_caller` attribute]: ../reference/attributes/codegen.html#the-track_caller-attribute
+const _: () = ();
+
+#[doc(attribute = "proc_macro")]
+//
+/// Defines a function-like procedural macro.
+///
+/// Applied to a `pub` function at the root of a proc-macro crate, `proc_macro` makes that function usable as a macro invoked as
+/// `foo!(...)` in other crates. The function receives the tokens written inside the invocation as a [`TokenStream`] and returns
+/// the [`TokenStream`] that replaces the invocation:
+///
+/// ```rust, ignore (requires depending on the proc-macro crate)
+/// # extern crate proc_macro;
+/// use proc_macro::TokenStream;
+///
+/// #[proc_macro]
+/// pub fn foo(input: TokenStream) -> TokenStream {
+///    "fn answer() -> u32 { 67 }".parse().unwrap()
+/// }
+/// ```
+///
+/// The macro can only be invoked from other crates, not from the crate where it is defined:
+///
+/// ```rust,ignore (requires depending on the proc-macro crate)
+/// use my_macro_crate::foo;
+///
+/// // Expands to `fn answer() -> u32 { 67 }`.
+/// foo!();
+///
+/// fn main() {
+///    println!("{}", answer()); // Prints 67
+/// }
+/// ```
+///
+/// The attribute is only usable with crates of the `proc-macro` crate type, which is set in the crate's `Cargo.toml`
+/// with `proc-macro = true` in the `[lib]` section. Using it anywhere else is a compilation error:
+///
+/// ```text
+///error: the `#[proc_macro]` attribute is only usable with crates of the `proc-macro` crate type
+/// --> src/lib.rs:4:1
+///  |
+/// 4| #[proc_macro]
+///  | ^^^^^^^^^^^^
+/// ```
+///
+/// For more information, see the Reference on [function-like procedural macros] and the [`proc_macro`] crate documentation.
+///
+/// [`TokenStream`]: ../proc_macro/struct.TokenStream.html
+/// [function-like procedural macros]: ../reference/procedural-macros.html#the-proc_macro-attribute
+/// [`proc_macro`]: ../proc_macro/index.html
+const _: () = ();
+
+#[doc(attribute = "link_section")]
+//
+/// Places a function or static in a specific object-file section.
+///
+/// The `link_section` attribute specifies the section of the generated object file where a
+/// function or static is placed. Section names and their meaning are target-specific.
+///
+/// ```rust,no_run
+/// # #[cfg(target_os = "linux")] {
+/// #[unsafe(link_section = ".example_section")]
+/// pub static VALUE: u32 = 42;
+/// # }
+/// ```
+///
+/// Incorrectly placing code or data in a section can violate requirements imposed by the target,
+/// linker, or runtime. For example, placing mutable data in a read-only section may result in
+/// undefined behavior. For this reason, `link_section` is an unsafe attribute.
+///
+/// Starting with the 2024 edition, the attribute must be written using the `unsafe(...)` syntax.
+/// Earlier editions also permit `#[link_section = "..."]`.
+///
+/// For more information, see the Reference on [the `link_section` attribute].
+///
+/// [the `link_section` attribute]: ../reference/abi.html#the-link_section-attribute
+const _: () = ();
+
+#[doc(attribute = "non_exhaustive")]
+//
+/// Indicates that a type might have more fields or variants added in the future.
+///
+/// Placing `#[non_exhaustive]` on a struct or enum tells code in other crates not to assume
+/// the definition is complete. This lets a library add new fields or variants without breaking
+/// existing code.
+///
+/// On an enum, code outside the defining crate must include a wildcard arm when matching:
+///
+/// ```rust,ignore (cross-crate effect only)
+/// // in crate `errors`:
+/// #[non_exhaustive]
+/// pub enum ConnectionError {
+///     Refused,
+///     Timeout,
+/// }
+///
+/// // in another crate:
+/// use errors::ConnectionError;
+///
+/// match error {
+///     ConnectionError::Refused => println!("connection refused"),
+///     ConnectionError::Timeout => println!("timed out"),
+///     _ => println!("other error"), // required because of #[non_exhaustive]
+/// }
+/// ```
+///
+/// On a struct, code outside the defining crate cannot construct instances using struct literal
+/// syntax:
+///
+/// ```rust,ignore (cross-crate effect only)
+/// // in crate `config`:
+/// #[non_exhaustive]
+/// pub struct Config {
+///     pub width: u32,
+///     pub height: u32,
+/// }
+///
+/// // in another crate:
+/// use config::Config;
+///
+/// let c = Config { width: 800, height: 600 }; // ERROR: cannot construct
+/// ```
+///
+/// Inside the defining crate, exhaustive matching and direct construction are still allowed.
+///
+/// For more information, see the Reference on [the `non_exhaustive` attribute].
+///
+/// [the `non_exhaustive` attribute]: ../reference/attributes/type_system.html#the-non_exhaustive-attribute
+const _: () = ();

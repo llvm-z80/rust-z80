@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::thin_vec::{ThinVec, thin_vec};
 use rustc_hir::def::{DefKind, MacroKinds, Res};
-use rustc_hir::def_id::{DefId, DefIdSet, LocalDefId, LocalModDefId};
+use rustc_hir::def_id::{DefId, DefIdSet, LocalDefId, LocalModId};
 use rustc_hir::{self as hir, Mutability, find_attr};
 use rustc_metadata::creader::{CStore, LoadedMacro};
 use rustc_middle::ty::fast_reject::SimplifiedType;
@@ -14,7 +14,7 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::symbol::{Symbol, sym};
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 
 use super::{Item, extract_cfg_from_attrs};
 use crate::clean::{
@@ -150,7 +150,7 @@ pub(crate) fn try_inline(
                 clean::StaticItem(build_static(cx, did, cx.tcx.is_mutable_static(did)))
             })
         }
-        Res::Def(DefKind::Const { .. }, did) => {
+        Res::Def(DefKind::Const, did) => {
             record_extern_fqn(cx, did, ItemType::Constant);
             cx.with_param_env(did, |cx| {
                 let ct = build_const_item(cx, did);
@@ -181,7 +181,7 @@ pub(crate) fn try_inline(
 pub(crate) fn try_inline_glob(
     cx: &mut DocContext<'_>,
     res: Res,
-    current_mod: LocalModDefId,
+    current_mod: LocalModId,
     visited: &mut DefIdSet,
     inlined_names: &mut FxHashSet<(ItemType, Symbol)>,
     import: &hir::Item<'_>,
@@ -250,17 +250,21 @@ pub(crate) fn get_item_path(tcx: TyCtxt<'_>, def_id: DefId, kind: ItemType) -> V
     if let ItemType::Macro = kind {
         // Check to see if it is a macro 2.0 or built-in macro
         // More information in <https://rust-lang.github.io/rfcs/1584-macros.html>.
-        if matches!(
-            CStore::from_tcx(tcx).load_macro_untracked(tcx, def_id),
-            LoadedMacro::MacroDef { def, .. } if !def.macro_rules
-        ) {
-            once(crate_name).chain(relative).collect()
+        let is_macro_2_0_or_builtin = if let Some(local_def_id) = def_id.as_local() {
+            let (_, macro_def, _) = tcx.hir_expect_item(local_def_id).expect_macro();
+            !macro_def.macro_rules
         } else {
-            vec![crate_name, *relative.last().expect("relative was empty")]
+            matches!(
+                CStore::from_tcx(tcx).load_macro_untracked(tcx, def_id),
+                LoadedMacro::MacroDef { def, .. } if !def.macro_rules
+            )
+        };
+        if !is_macro_2_0_or_builtin {
+            return vec![crate_name, *relative.last().expect("relative was empty")];
         }
-    } else {
-        once(crate_name).chain(relative).collect()
     }
+
+    once(crate_name).chain(relative).collect()
 }
 
 /// Record an external fully qualified name in the external_paths cache.
@@ -453,6 +457,7 @@ pub(crate) fn merge_attrs(
 }
 
 /// Inline an `impl`, inherent or of a trait. The `did` must be for an `impl`.
+#[instrument(level = "debug", skip(cx, ret))]
 pub(crate) fn build_impl(
     cx: &mut DocContext<'_>,
     did: DefId,
@@ -698,7 +703,7 @@ fn should_ignore_def_kind(kind: DefKind) -> bool {
             | DefKind::Variant
             | DefKind::Mod
             | DefKind::Static { .. }
-            | DefKind::Const { .. }
+            | DefKind::Const
             | DefKind::Macro(_)
             | DefKind::Use
     )

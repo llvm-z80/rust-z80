@@ -313,7 +313,7 @@ impl RustcInternal for FnSig {
         tables: &mut Tables<'_, BridgeTys>,
         tcx: impl InternalCx<'tcx>,
     ) -> Self::T<'tcx> {
-        // FIXME(splat): When `#[splat]` is complete (or stable), add splatted to the public FnSig
+        // FIXME(splat): When `#[rustc_splat]` is complete (or stable), add splatted to the public FnSig
         let fn_sig_kind = rustc_ty::FnSigKind::default()
             .set_abi(self.abi.internal(tables, tcx))
             .set_safety(self.safety.internal(tables, tcx))
@@ -614,7 +614,7 @@ impl RustcInternal for Abi {
             Abi::AvrNonBlockingInterrupt => rustc_abi::ExternAbi::AvrNonBlockingInterrupt,
             Abi::System { unwind } => rustc_abi::ExternAbi::System { unwind },
             Abi::RustCall => rustc_abi::ExternAbi::RustCall,
-            Abi::Unadjusted => rustc_abi::ExternAbi::Unadjusted,
+            Abi::LlvmIntrinsic => rustc_abi::ExternAbi::LlvmIntrinsic,
             Abi::RustCold => rustc_abi::ExternAbi::RustCold,
             Abi::RustInvalid => rustc_abi::ExternAbi::RustInvalid,
             Abi::RiscvInterruptM => rustc_abi::ExternAbi::RiscvInterruptM,

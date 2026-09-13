@@ -1,9 +1,10 @@
 //! Concrete error types for all operations which may be invalid in a certain const context.
 
-use hir::{ConstContext, LangItem};
+use hir::ConstContext;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, MultiSpan, msg};
 use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{ImplSource, Obligation, ObligationCause};
@@ -14,7 +15,7 @@ use rustc_middle::ty::{
     self, AssocContainer, Closure, FnDef, FnPtr, GenericArgKind, GenericArgsRef, Param, TraitRef,
     Ty, suggest_constraining_type_param,
 };
-use rustc_session::errors::add_feature_diagnostics;
+use rustc_session::diagnostics::add_feature_diagnostics;
 use rustc_span::{BytePos, Pos, Span, Symbol, sym};
 use rustc_trait_selection::error_reporting::traits::call_kind::{
     CallDesugaringKind, CallKind, call_kind,
@@ -247,7 +248,9 @@ fn build_error_for_const_call<'tcx>(
             // Don't point at the trait if this is a desugaring...
             // FIXME(const_trait_impl): we could perhaps do this for `Iterator`.
             match kind {
-                CallDesugaringKind::ForLoopIntoIter | CallDesugaringKind::ForLoopNext => {
+                CallDesugaringKind::ForLoopIntoIter
+                | CallDesugaringKind::ForLoopIntoAsyncIter
+                | CallDesugaringKind::ForLoopNext => {
                     error!(NonConstForLoopIntoIter)
                 }
                 CallDesugaringKind::QuestionBranch => {
@@ -594,7 +597,7 @@ impl<'tcx> NonConstOp<'tcx> for LiveDrop<'tcx> {
     }
 
     fn build_error(&self, ccx: &ConstCx<'_, 'tcx>, span: Span) -> Diag<'tcx> {
-        if self.needs_non_const_drop {
+        let mut err = if self.needs_non_const_drop {
             ccx.dcx().create_err(diagnostics::LiveDrop {
                 span,
                 dropped_ty: self.dropped_ty,
@@ -611,7 +614,30 @@ impl<'tcx> NonConstOp<'tcx> for LiveDrop<'tcx> {
                 },
                 sym::const_destruct,
             )
+        };
+
+        // If the dropped type is a type parameter, suggest adding a `[const] Destruct` bound.
+        // The suggestion is only offered on nightly, since `[const]` bounds are unstable.
+        if let Param(param_ty) = self.dropped_ty.kind()
+            && ccx.tcx.sess.is_nightly_build()
+        {
+            let tcx = ccx.tcx;
+            let caller = ccx.def_id();
+            if let Some(generics) = tcx.hir_node_by_def_id(caller).generics() {
+                let destruct_def_id = tcx.lang_items().destruct_trait();
+                suggest_constraining_type_param(
+                    tcx,
+                    generics,
+                    &mut err,
+                    param_ty.name.as_str(),
+                    "[const] Destruct",
+                    destruct_def_id,
+                    None,
+                );
+            }
         }
+
+        err
     }
 }
 

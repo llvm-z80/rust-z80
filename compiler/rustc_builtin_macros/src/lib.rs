@@ -47,6 +47,7 @@ mod offload;
 mod pattern_type;
 mod source_util;
 mod test;
+mod test_binder_constraints;
 mod trace_macros;
 mod view_type;
 
@@ -100,6 +101,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         pattern_type: pattern_type::expand,
         std_panic: edition_panic::expand_panic,
         stringify: source_util::expand_stringify,
+        test_binder_constraints: test_binder_constraints::expand,
         trace_macros: trace_macros::expand_trace_macros,
         unreachable: edition_panic::expand_unreachable,
         view_type: view_type::expand,
@@ -130,8 +132,9 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
 
     register_derive! {
         Clone: clone::expand_deriving_clone,
-        Copy: bounds::expand_deriving_copy,
-        ConstParamTy: bounds::expand_deriving_const_param_ty,
+        CoerceShared: reborrow::expand_deriving_coerce_shared,
+        Copy: copy::expand_deriving_copy,
+        ConstParamTy: const_param_ty::expand_deriving_const_param_ty,
         Debug: debug::expand_deriving_debug,
         Default: default::expand_deriving_default,
         Eq: eq::expand_deriving_eq,
@@ -140,6 +143,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         PartialEq: partial_eq::expand_deriving_partial_eq,
         PartialOrd: partial_ord::expand_deriving_partial_ord,
         CoercePointee: coerce_pointee::expand_deriving_coerce_pointee,
+        Reborrow: reborrow::expand_deriving_reborrow,
         From: from::expand_deriving_from,
     }
 

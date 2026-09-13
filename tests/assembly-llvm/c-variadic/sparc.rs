@@ -6,7 +6,7 @@
 //@ [SPARC] needs-llvm-components: sparc
 //@ [SPARC64] compile-flags: -Copt-level=3 --target sparc64-unknown-linux-gnu
 //@ [SPARC64] needs-llvm-components: sparc
-#![feature(c_variadic, no_core, lang_items, intrinsics, rustc_attrs, asm_experimental_arch)]
+#![feature(no_core, lang_items, intrinsics, rustc_attrs, asm_experimental_arch)]
 #![cfg_attr(target_arch = "sparc", feature(c_variadic_experimental_arch))]
 #![no_core]
 #![crate_type = "lib"]
@@ -90,14 +90,17 @@ unsafe extern "C" fn read_i64(ap: &mut VaList<'_>) -> i64 {
     // CHECK-LABEL: read_i64
     //
     // SPARC: ld [%o0], %o1
-    // SPARC-NEXT: add %o1, 4, %o2
+    // SPARC-NEXT: add %o1, 8, %o2
     // SPARC-NEXT: st %o2, [%o0]
-    // SPARC-NEXT: ld [%o1], %o2
-    // SPARC-NEXT: add %o1, 8, %o3
-    // SPARC-NEXT: st %o3, [%o0]
-    // SPARC-NEXT: ld [%o1+4], %o1
+    // SPARC-NEXT: ld [%o1+4], %o0
+    // SPARC-NEXT: add %sp, 96, %o2
+    // SPARC-NEXT: or %o2, 4, %o2
+    // SPARC-NEXT: st %o0, [%o2]
+    // SPARC-NEXT: ld [%o1], %o0
+    // SPARC-NEXT: st %o0, [%sp+96]
+    // SPARC-NEXT: ldd [%sp+96], %o0
     // SPARC-NEXT: retl
-    // SPARC-NEXT: mov %o2, %o0
+    // SPARC-NEXT: add %sp, 104, %sp
     //
     // SPARC64: ldx [%o0], %o1
     // SPARC64-NEXT: add %o1, 8, %o2

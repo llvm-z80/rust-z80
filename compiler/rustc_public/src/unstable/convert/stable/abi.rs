@@ -169,8 +169,8 @@ impl<'tcx> Stable<'tcx> for callconv::PassMode {
             callconv::PassMode::Pair(first, second) => {
                 PassMode::Pair(opaque(first), opaque(second))
             }
-            callconv::PassMode::Cast { pad_i32, cast } => {
-                PassMode::Cast { pad_i32: *pad_i32, cast: opaque(cast) }
+            callconv::PassMode::Cast { pad_i32_count, cast } => {
+                PassMode::Cast { pad_i32_count: *pad_i32_count, cast: opaque(cast) }
             }
             callconv::PassMode::Indirect { attrs, meta_attrs, on_stack } => PassMode::Indirect {
                 attrs: opaque(attrs),
@@ -265,6 +265,18 @@ impl<'tcx> Stable<'tcx> for rustc_abi::NumScalableVectors {
     }
 }
 
+impl<'tcx> Stable<'tcx> for rustc_abi::BackendLaneCount {
+    type T = u64;
+
+    fn stable<'cx>(
+        &self,
+        _tables: &mut Tables<'cx, BridgeTys>,
+        _cx: &CompilerCtxt<'cx, BridgeTys>,
+    ) -> Self::T {
+        self.as_u64()
+    }
+}
+
 impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
     type T = ValueAbi;
 
@@ -282,13 +294,14 @@ impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
                     b_offset: second_offset.stable(tables, cx),
                 }
             }
-            rustc_abi::BackendRepr::SimdVector { element, count } => {
-                ValueAbi::Vector { element: element.stable(tables, cx), count }
-            }
+            rustc_abi::BackendRepr::SimdVector { element, count } => ValueAbi::Vector {
+                element: element.stable(tables, cx),
+                count: count.stable(tables, cx),
+            },
             rustc_abi::BackendRepr::SimdScalableVector { element, count, number_of_vectors } => {
                 ValueAbi::ScalableVector {
                     element: element.stable(tables, cx),
-                    count,
+                    count: count.stable(tables, cx),
                     number_of_vectors: number_of_vectors.stable(tables, cx),
                 }
             }

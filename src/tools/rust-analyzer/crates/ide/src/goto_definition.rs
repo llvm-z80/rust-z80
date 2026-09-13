@@ -71,7 +71,9 @@ pub(crate) fn goto_definition(
         | T![super]
         | T![crate]
         | T![Self]
-        | COMMENT => 4,
+        | COMMENT
+        | INNER_DOC_COMMENT
+        | OUTER_DOC_COMMENT => 4,
         // index and prefix ops
         T!['['] | T![']'] | T![?] | T![*] | T![-] | T![!] => 3,
         kind if kind.is_keyword(edition) => 2,
@@ -399,7 +401,7 @@ fn try_lookup_macro_def_in_macro_use(
 /// ```
 fn try_filter_trait_item_definition(
     sema: &Semantics<'_, RootDatabase>,
-    def: &Definition,
+    def: &Definition<'_>,
 ) -> Option<Vec<NavigationTarget>> {
     let db = sema.db;
     let assoc = def.as_assoc_item(db)?;
@@ -653,7 +655,7 @@ fn nav_for_break_points(
     Some(navs)
 }
 
-fn def_to_nav(sema: &Semantics<'_, RootDatabase>, def: Definition) -> Vec<NavigationTarget> {
+fn def_to_nav(sema: &Semantics<'_, RootDatabase>, def: Definition<'_>) -> Vec<NavigationTarget> {
     def.try_to_nav(sema).map(|it| it.collect()).unwrap_or_default()
 }
 
@@ -2328,10 +2330,7 @@ fn main() {
         );
     }
 
-    // macros in this position are not yet supported
     #[test]
-    // FIXME
-    #[should_panic]
     fn goto_doc_include_str() {
         check(
             r#"

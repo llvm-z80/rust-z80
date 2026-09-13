@@ -2,8 +2,8 @@ use clippy_config::Conf;
 use clippy_utils::consts::{ConstEvalCtxt, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::MaybeResPath;
-use clippy_utils::source::{SpanExt, snippet, snippet_with_applicability};
+use clippy_utils::res::MaybeResPath as _;
+use clippy_utils::source::{SpanExt as _, snippet, snippet_with_applicability};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::implements_trait;
 use clippy_utils::{
@@ -12,10 +12,10 @@ use clippy_utils::{
 use rustc_ast::Mutability;
 use rustc_ast::ast::RangeLimits;
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, LangItem, Node};
-use rustc_lint::{LateContext, LateLintPass, Lint};
-use rustc_middle::ty::{self, ClauseKind, GenericArgKind, PredicatePolarity, Ty};
-use rustc_session::impl_lint_pass;
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, Node};
+use rustc_lint::{LateContext, LateLintPass, Lint, impl_lint_pass};
+use rustc_middle::ty::{self, ClauseKind, ClausePolarity, GenericArgKind, Ty};
 use rustc_span::{DesugaringKind, Span, Spanned, SyntaxContext};
 use std::cmp::Ordering;
 
@@ -184,7 +184,7 @@ pub struct Ranges {
 
 impl Ranges {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -435,7 +435,7 @@ fn can_switch_ranges<'tcx>(
                 .into_iter()
                 .any(|c| {
                     if let ClauseKind::Trait(t) = c.kind().skip_binder()
-                        && t.polarity == PredicatePolarity::Positive
+                        && t.polarity == ClausePolarity::Positive
                         && matches!(
                             cx.tcx.get_diagnostic_name(t.trait_ref.def_id),
                             Some(sym::Iterator | sym::IntoIterator | sym::RangeBounds)

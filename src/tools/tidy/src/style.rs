@@ -226,9 +226,9 @@ fn long_line_is_ok(extension: &str, is_error_code: bool, max_columns: usize, lin
 }
 
 macro_rules! suppressible_tidy_err {
-    ($err:ident, $skip:expr, $msg:literal) => {
+    ($err:ident, $skip:expr, $msg:literal $($args: tt)*) => {
         if let Err(()) = $skip.check() {
-            $err(&format!($msg));
+            $err(&format!($msg $($args)*));
         }
     };
 }
@@ -310,7 +310,7 @@ pub fn check(path: &Path, tidy_ctx: TidyCtx) {
 
     walk(path, skip, &mut |entry, contents| {
         let file = entry.path();
-        check_file_style(&mut check, file, contents);
+        check_file_style(path, &mut check, file, contents);
     });
 }
 
@@ -323,7 +323,7 @@ static PROBLEMATIC_REGEX: LazyLock<regex::RegexSet> = LazyLock::new(|| {
         .unwrap()
 });
 
-fn check_file_style(check: &mut RunningCheck, file: &Path, contents: &str) {
+fn check_file_style(base_path: &Path, check: &mut RunningCheck, file: &Path, contents: &str) {
     // In some cases, a style check would be triggered by its own implementation
     // or comments. A simple workaround is to just allowlist this file.
     let this_file = Path::new(file!());
@@ -342,6 +342,11 @@ fn check_file_style(check: &mut RunningCheck, file: &Path, contents: &str) {
             });
 
     if contents.is_empty() {
+        // __init__.py files are expected to be empty in many cases. Early returning prevents
+        // extraneous errors (e.g. leading/trailing newline).
+        if file.file_name().is_some_and(|x| x == "__init__.py") {
+            return;
+        }
         check.error(format!("{}: empty file", file.display()));
     }
 
@@ -455,10 +460,22 @@ fn check_file_style(check: &mut RunningCheck, file: &Path, contents: &str) {
             })
             && filename != "tests.rs"
         {
+            let without_macro_call =
+                trimmed.split_once("todo!").expect("todo in line because of previous check").1;
+            let without_start =
+                without_macro_call.split_once("(").map_or(without_macro_call, |(_, s)| s);
+            let without_end =
+                without_start.rsplit_once(")").map_or(without_start, |(s, _)| s).trim();
+            let message = if without_end.is_empty() {
+                format_args!("")
+            } else {
+                format_args!("\n >> TODO: {}", without_end)
+            };
+
             suppressible_tidy_err!(
                 err,
                 ignore.todo,
-                "the `todo!` macro is used for tasks that should be done before merging a PR. If you want to panic here, use `panic!`, `unimplemented!`, `unreachable!`, `rustc_middle::bug!` or an assertion"
+                "the `todo!` macro is used for tasks that should be done before merging a PR.\nIf you want to panic here, use `panic!`, `unimplemented!`, `unreachable!`, `rustc_middle::bug!` or an assertion{message}"
             )
         }
 
@@ -508,11 +525,20 @@ fn check_file_style(check: &mut RunningCheck, file: &Path, contents: &str) {
             if contains_potential_directive && (!has_recognized_directive) {
                 err("Unrecognized tidy directive")
             }
-            // Allow using TODO in diagnostic suggestions by marking the
-            // relevant line with `ignore-tidy-todo`.
-            if trimmed.contains("TODO") && !trimmed.contains("ignore-tidy-todo") {
-                err(
-                    "TODO is used for tasks that should be done before merging a PR; If you want to leave a message in the codebase use FIXME",
+            if trimmed.contains("TODO") {
+                let without_todo =
+                    trimmed.split_once("TODO").expect("TODO in line because of previous check").1;
+                let without_colon = without_todo.trim().trim_start_matches(":").trim();
+
+                let message = if without_colon.is_empty() {
+                    format_args!("")
+                } else {
+                    format_args!("\n >> TODO: {}", without_colon)
+                };
+                suppressible_tidy_err!(
+                    err,
+                    ignore.todo,
+                    "TODO is used for tasks that should be done before merging a PR;\nIf you want to leave a message in the codebase use FIXME{message}",
                 )
             }
             if trimmed.contains("//") && trimmed.contains(" XXX") {
@@ -522,12 +548,16 @@ fn check_file_style(check: &mut RunningCheck, file: &Path, contents: &str) {
                 err("Don't use magic numbers that spell things (consider 0x12345678)");
             }
         }
-        // for now we just check libcore
+        // Only check core & alloc for now; to be expanded to (parts of)
+        // std in the future as well.
         if trimmed.contains("unsafe {")
             && !trimmed.starts_with("//")
             && !last_safety_comment
-            && file.components().any(|c| c.as_os_str() == "core")
             && !is_test
+            && base_path.ends_with("library")
+            && file
+                .strip_prefix(base_path)
+                .is_ok_and(|rel| rel.starts_with("core") || rel.starts_with("alloc"))
         {
             suppressible_tidy_err!(err, ignore.undocumented_unsafe, "undocumented unsafe");
         }

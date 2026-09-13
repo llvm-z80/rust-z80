@@ -6,7 +6,7 @@ use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceValue;
-use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods};
+use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, BuilderMethods, ReturnSlot};
 use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir::attrs::RustcAutodiff;
 use rustc_middle::ty::{PseudoCanonicalInput, Ty, TyCtxt, TypingEnv};
@@ -45,18 +45,13 @@ pub(crate) fn adjust_activity_to_abi<'tcx>(
     let mut del_activities = 0;
     for (i, ty) in sig.inputs().iter().enumerate() {
         if let Some(inner_ty) = ty.builtin_deref(true) {
-            if inner_ty.is_slice() {
+            let tail_ty = tcx.struct_tail_for_codegen(inner_ty, typing_env);
+            if let ty::Slice(element_ty) = tail_ty.kind() {
                 // Now we need to figure out the size of each slice element in memory to allow
                 // safety checks and usability improvements in the backend.
-                let sty = match inner_ty.builtin_index() {
-                    Some(sty) => sty,
-                    None => {
-                        panic!("slice element type unknown");
-                    }
-                };
                 let pci = PseudoCanonicalInput {
                     typing_env: TypingEnv::fully_monomorphized(),
-                    value: sty,
+                    value: *element_ty,
                 };
 
                 let layout = tcx.layout_of(pci);
@@ -377,7 +372,7 @@ pub(crate) fn generate_enzyme_call<'ll, 'tcx>(
         crate::typetree::add_tt(&bx, fn_to_diff, fnc_tree);
     }
 
-    let call = bx.call(enzyme_ty, None, None, ad_fn, &args, None, None);
+    let call = bx.call(enzyme_ty, None, None, ad_fn, ReturnSlot::Direct, &args, None, None);
 
     let fn_ret_ty = bx.cx.val_ty(call);
     if fn_ret_ty == bx.cx.type_void() || fn_ret_ty == bx.cx.type_struct(&[], false) {

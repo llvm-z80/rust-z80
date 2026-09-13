@@ -11,7 +11,6 @@ use rustc_errors::{
     Level, Subdiagnostic, SuggestionStyle, msg,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_span::edition::{Edition, LATEST_STABLE_EDITION};
 use rustc_span::{Ident, Span, Symbol};
 
@@ -923,6 +922,24 @@ pub(crate) struct FoundExprWouldBeStmt {
     pub suggestion: ExprParenthesesNeeded,
 }
 
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    "parentheses are required to parse this as an expression",
+    applicability = "machine-applicable"
+)]
+pub(crate) struct ExprParenthesesNeeded {
+    #[suggestion_part(code = "(")]
+    left: Span,
+    #[suggestion_part(code = ")")]
+    right: Span,
+}
+
+impl ExprParenthesesNeeded {
+    pub(crate) fn surrounding(s: Span) -> Self {
+        ExprParenthesesNeeded { left: s.shrink_to_lo(), right: s.shrink_to_hi() }
+    }
+}
+
 #[derive(Diagnostic)]
 #[diag("extra characters after frontmatter close are not allowed")]
 pub(crate) struct FrontmatterExtraCharactersAfterClose {
@@ -1099,6 +1116,27 @@ pub(crate) struct ArrayBracketsInsteadOfBracesSugg {
     pub left: Span,
     #[suggestion_part(code = "]")]
     pub right: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("attributes are not allowed inside imports")]
+pub(crate) struct AttrInUseTree {
+    #[primary_span]
+    pub attr_span: Span,
+    #[subdiagnostic]
+    pub sub: Option<AttrInUseTreeSugg>,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion("move the import to its own item", style = "verbose")]
+pub(crate) struct AttrInUseTreeSugg {
+    #[suggestion_part(code = "{code}")]
+    pub use_lo: Span,
+    #[suggestion_part(code = "")]
+    pub attr_span: Span,
+    #[suggestion_part(code = "")]
+    pub tree_span: Span,
+    pub code: String,
 }
 
 #[derive(Diagnostic)]
@@ -1789,61 +1827,7 @@ pub(crate) struct ParenthesesInMatchPatSugg {
 }
 
 #[derive(Diagnostic)]
-#[diag("documentation comments cannot be applied to a function parameter's type")]
-pub(crate) struct DocCommentOnParamType {
-    #[primary_span]
-    #[label("doc comments are not allowed here")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("attributes cannot be applied to a function parameter's type")]
-pub(crate) struct AttributeOnParamType {
-    #[primary_span]
-    #[label("attributes are not allowed here")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("attributes cannot be applied to types")]
-pub(crate) struct AttributeOnType {
-    #[primary_span]
-    #[label("attributes are not allowed here")]
-    pub span: Span,
-    #[suggestion(
-        "remove attribute from here",
-        code = "",
-        applicability = "machine-applicable",
-        style = "tool-only"
-    )]
-    pub fix_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("attributes cannot be applied to generic arguments")]
-pub(crate) struct AttributeOnGenericArg {
-    #[primary_span]
-    #[label("attributes are not allowed here")]
-    pub span: Span,
-    #[suggestion(
-        "remove attribute from here",
-        code = "",
-        applicability = "machine-applicable",
-        style = "tool-only"
-    )]
-    pub fix_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("attributes cannot be applied here")]
-pub(crate) struct AttributeOnEmptyType {
-    #[primary_span]
-    #[label("attributes are not allowed here")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("patterns aren't allowed in methods without bodies", code = E0642)]
+#[diag("patterns aren't allowed in {$target}", code = E0642)]
 pub(crate) struct PatternMethodParamWithoutBody {
     #[primary_span]
     #[suggestion(
@@ -1853,6 +1837,7 @@ pub(crate) struct PatternMethodParamWithoutBody {
         style = "verbose"
     )]
     pub span: Span,
+    pub target: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -2073,14 +2058,6 @@ pub(crate) struct ExpectedFnPathFoundFnKeyword {
         style = "verbose"
     )]
     pub fn_token_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("`Trait(...)` syntax does not support named parameters")]
-pub(crate) struct FnPathFoundNamedParams {
-    #[primary_span]
-    #[suggestion("remove the parameter name", applicability = "machine-applicable", code = "")]
-    pub named_param_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -3697,25 +3674,44 @@ impl HelpUseLatestEdition {
 }
 
 #[derive(Diagnostic)]
-#[diag("`box_syntax` has been removed")]
-pub(crate) struct BoxSyntaxRemoved {
+#[diag("`box` patterns have been removed (feature `box_patterns`)")]
+#[help("enable feature `deref_patterns` instead and...")]
+pub(crate) struct BoxPatsRemoved {
     #[primary_span]
     pub span: Span,
+    #[suggestion(
+        "...if possible just remove keyword `box`...",
+        code = "",
+        applicability = "maybe-incorrect",
+        style = "verbose"
+    )]
+    pub sugg_removal: Span,
     #[subdiagnostic]
-    pub sugg: AddBoxNew,
+    pub sugg_deref_macro_call: UseDerefMacro,
 }
 
-#[derive(Subdiagnostic)]
-#[multipart_suggestion(
-    "use `Box::new()` instead",
-    applicability = "machine-applicable",
-    style = "verbose"
-)]
-pub(crate) struct AddBoxNew {
-    #[suggestion_part(code = "Box::new(")]
-    pub box_kw_and_lo: Span,
-    #[suggestion_part(code = ")")]
-    pub hi: Span,
+pub(crate) struct UseDerefMacro {
+    pub field: Option<(Span, Ident)>,
+    pub before: Span,
+    pub after: Span,
+}
+
+impl Subdiagnostic for UseDerefMacro {
+    fn add_to_diag<G: EmissionGuarantee>(self, diag: &mut Diag<'_, G>) {
+        let Self { field, before, after } = self;
+
+        let mut parts = Vec::new();
+        if let Some((span, field)) = field {
+            parts.push((span, format!("{field}: ")));
+        }
+        parts.push((before, "deref!(".into()));
+        parts.push((after, ")".into()));
+        diag.multipart_suggestion(
+            "...otherwise replace it with an invocation of macro `deref`",
+            parts,
+            Applicability::MaybeIncorrect,
+        );
+    }
 }
 
 #[derive(Diagnostic)]
@@ -4547,19 +4543,6 @@ pub(crate) struct BreakWithLabelAndLoopSub {
 }
 
 #[derive(Diagnostic)]
-#[diag("prefix `'r` is reserved")]
-pub(crate) struct RawPrefix {
-    #[label("reserved prefix")]
-    pub label: Span,
-    #[suggestion(
-        "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
-        code = " ",
-        applicability = "machine-applicable"
-    )]
-    pub suggestion: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("unicode codepoint changing visible direction of text present in comment")]
 #[note(
     "these kind of unicode codepoints change the way text flows on applications that support them, but can cause confusion because they change the order of characters on the screen"
@@ -4600,40 +4583,18 @@ pub(crate) struct UnicodeTextFlowSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag("prefix `{$prefix}` is unknown")]
-pub(crate) struct ReservedPrefix {
-    #[label("unknown prefix")]
-    pub label: Span,
+#[diag("{$subject} is parsed as a {$kind} in Rust {$edition} and onward")]
+pub(crate) struct ReservedPrefixLint {
+    pub subject: String,
+    pub kind: &'static str,
+    pub edition: Edition,
     #[suggestion(
-        "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
+        "consider inserting whitespace here to avoid this",
         code = " ",
-        applicability = "machine-applicable"
+        applicability = "machine-applicable",
+        style = "verbose"
     )]
-    pub suggestion: Span,
-
-    pub prefix: String,
-}
-
-#[derive(Diagnostic)]
-#[diag("will be parsed as a guarded string in Rust 2024")]
-pub(crate) struct ReservedStringLint {
-    #[suggestion(
-        "insert whitespace here to avoid this being parsed as a guarded string in Rust 2024",
-        code = " ",
-        applicability = "machine-applicable"
-    )]
-    pub suggestion: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("reserved token in Rust 2024")]
-pub(crate) struct ReservedMultihashLint {
-    #[suggestion(
-        "insert whitespace here to avoid this being parsed as a forbidden token in Rust 2024",
-        code = " ",
-        applicability = "machine-applicable"
-    )]
-    pub suggestion: Span,
+    pub sugg: Span,
 }
 
 #[derive(Subdiagnostic)]

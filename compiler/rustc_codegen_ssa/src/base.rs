@@ -13,25 +13,26 @@ use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
 use rustc_data_structures::sync::{IntoDynSyncSend, par_map};
 use rustc_data_structures::unord::UnordMap;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::attrs::{DebuggerVisualizerType, EiiDecl, EiiImpl, OptimizeAttr};
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
-use rustc_hir::lang_items::LangItem;
 use rustc_hir::{ItemId, Target, find_attr};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::{Dependencies, Linkage};
 use rustc_middle::middle::exported_symbols::{self, SymbolExportKind};
 use rustc_middle::middle::lang_items;
-use rustc_middle::mir::BinOp;
-use rustc_middle::mir::interpret::ErrorHandled;
+use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, ErrorHandled, Scalar};
+use rustc_middle::mir::{BinOp, ConstValue};
 use rustc_middle::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem, MonoItemPartitions};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, Unnormalized};
+use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, UintTy, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_session::Session;
-use rustc_session::config::{self, CrateType, EntryFnType};
+use rustc_session::config::{self, EntryFnType};
 use rustc_span::{DUMMY_SP, Symbol};
+use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::{Arch, Os};
 use rustc_trait_selection::infer::{BoundRegionConversionTime, TyCtxtInferExt};
@@ -41,7 +42,7 @@ use tracing::{debug, info};
 use crate::assert_module_sources::CguReuse;
 use crate::back::link::are_upstream_rust_objects_already_included;
 use crate::back::write::{
-    ComputedLtoType, OngoingCodegen, compute_per_cgu_lto_type, start_async_codegen,
+    ComputedLtoType, ModuleConfig, OngoingCodegen, compute_per_cgu_lto_type, start_async_codegen,
     submit_codegened_module_to_llvm, submit_post_lto_module_to_llvm, submit_pre_lto_module_to_llvm,
 };
 use crate::common::{self, IntPredicate, RealPredicate, TypeKind};
@@ -51,7 +52,7 @@ use crate::mir::place::PlaceRef;
 use crate::traits::*;
 use crate::{
     CachedModuleCodegen, CodegenLintLevelSpecs, CrateInfo, EiiLinkageImplInfo, EiiLinkageInfo,
-    ModuleCodegen, errors, meth, mir,
+    ModuleCodegen, ModuleKind, diagnostics, meth, mir,
 };
 
 pub(crate) fn bin_op_to_icmp_predicate(op: BinOp, signed: bool) -> IntPredicate {
@@ -143,7 +144,7 @@ pub fn validate_trivial_unsize<'tcx>(
                 ) else {
                     return false;
                 };
-                if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+                if !ocx.evaluate_obligations_error_on_ambiguity().no_errors() {
                     return false;
                 }
                 infcx.leak_check(universe, None).is_ok()
@@ -419,20 +420,26 @@ where
                         Ok(const_value) => {
                             let ty =
                                 cx.tcx().typeck_body(anon_const.body).node_type(anon_const.hir_id);
-                            let string = common::asm_const_to_str(
-                                cx.tcx(),
-                                *op_sp,
-                                const_value,
-                                cx.layout_of(ty),
-                            );
-                            GlobalAsmOperandRef::Const { string }
+                            let ConstValue::Scalar(scalar) = const_value else {
+                                span_bug!(
+                                    *op_sp,
+                                    "expected Scalar for promoted asm const, but got {:#?}",
+                                    const_value
+                                )
+                            };
+                            GlobalAsmOperandRef::Const {
+                                value: common::asm_const_ptr_clean(cx.tcx(), scalar),
+                                ty,
+                            }
                         }
                         Err(ErrorHandled::Reported { .. }) => {
                             // An error has already been reported and
                             // compilation is guaranteed to fail if execution
-                            // hits this path. So an empty string instead of
-                            // a stringified constant value will suffice.
-                            GlobalAsmOperandRef::Const { string: String::new() }
+                            // hits this path. So anything will suffice.
+                            GlobalAsmOperandRef::Const {
+                                value: Scalar::from_u32(0),
+                                ty: Ty::new_uint(cx.tcx(), UintTy::U32),
+                            }
                         }
                         Err(ErrorHandled::TooGeneric(_)) => {
                             span_bug!(*op_sp, "asm const cannot be resolved; too generic")
@@ -452,10 +459,26 @@ where
                         _ => span_bug!(*op_sp, "asm sym is not a function"),
                     };
 
-                    GlobalAsmOperandRef::SymFn { instance }
+                    GlobalAsmOperandRef::Const {
+                        value: Scalar::from_pointer(
+                            cx.tcx().reserve_and_set_fn_alloc(instance, CTFE_ALLOC_SALT).into(),
+                            cx,
+                        ),
+                        ty: Ty::new_fn_ptr(cx.tcx(), ty.fn_sig(cx.tcx())),
+                    }
                 }
                 rustc_hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
-                    GlobalAsmOperandRef::SymStatic { def_id }
+                    if cx.tcx().is_thread_local_static(def_id) {
+                        GlobalAsmOperandRef::SymThreadLocalStatic { def_id }
+                    } else {
+                        GlobalAsmOperandRef::Const {
+                            value: Scalar::from_pointer(
+                                cx.tcx().reserve_and_set_static_alloc(def_id).into(),
+                                cx,
+                            ),
+                            ty: cx.tcx().static_ptr_ty(def_id, cx.typing_env()),
+                        }
+                    }
                 }
                 rustc_hir::InlineAsmOperand::In { .. }
                 | rustc_hir::InlineAsmOperand::Out { .. }
@@ -467,7 +490,7 @@ where
             })
             .collect();
 
-        cx.codegen_global_asm(asm.template, &operands, asm.options, asm.line_spans);
+        cx.codegen_global_asm(asm.template, &operands, asm.options, asm.line_spans, &[]);
     } else {
         span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
     }
@@ -494,7 +517,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         return None;
     }
 
-    let main_llfn = cx.get_fn_addr(instance, Some(PacMetadata::default()));
+    let main_llfn = cx.get_fn_addr(instance, cx.sess().pointer_authentication_functions());
 
     let entry_fn = create_entry_fn::<Bx>(cx, main_llfn, main_def_id, entry_type);
     return Some(entry_fn);
@@ -529,7 +552,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         let Some(llfn) = cx.declare_c_main(llfty) else {
             // FIXME: We should be smart and show a better diagnostic here.
             let span = cx.tcx().def_span(rust_main_def_id);
-            cx.tcx().dcx().emit_fatal(errors::MultipleMainFunctions { span });
+            cx.tcx().dcx().emit_fatal(diagnostics::MultipleMainFunctions { span });
         };
 
         // `main` should respect same config for frame pointer elimination as rest of code
@@ -555,7 +578,8 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 cx.tcx().mk_args(&[main_ret_ty.into()]),
                 DUMMY_SP,
             );
-            let start_fn = cx.get_fn_addr(start_instance, Some(PacMetadata::default()));
+            let start_fn =
+                cx.get_fn_addr(start_instance, cx.sess().pointer_authentication_functions());
 
             let i8_ty = cx.type_i8();
             let arg_sigpipe = bx.const_u8(sigpipe);
@@ -569,7 +593,8 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             )
         };
 
-        let result = bx.call(start_ty, None, None, start_fn, &args, None, instance);
+        let result =
+            bx.call(start_ty, None, None, start_fn, ReturnSlot::Direct, &args, None, instance);
         if cx.sess().target.os == Os::Uefi {
             bx.ret(result);
         } else {
@@ -697,14 +722,14 @@ pub fn codegen_crate<
 ) -> OngoingCodegen<B> {
     if tcx.sess.target.need_explicit_cpu && tcx.sess.opts.cg.target_cpu.is_none() {
         // The target has no default cpu, but none is set explicitly
-        tcx.dcx().emit_fatal(errors::CpuRequired);
+        tcx.dcx().emit_fatal(diagnostics::CpuRequired);
     }
 
     if let Some(target_cpu) = &tcx.sess.opts.cg.target_cpu
         && tcx.sess.target.unsupported_cpus.contains(&target_cpu.into())
     {
         // The target cpu is explicitly listed as an unsupported cpu
-        tcx.dcx().emit_fatal(errors::CpuUnsupported { target_cpu: target_cpu.clone() });
+        tcx.dcx().emit_fatal(diagnostics::CpuUnsupported { target_cpu: target_cpu.clone() });
     }
 
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(tcx);
@@ -738,7 +763,18 @@ pub fn codegen_crate<
         None
     };
 
-    let ongoing_codegen = start_async_codegen(backend.clone(), tcx, allocator_module);
+    let no_builtins = find_attr!(tcx, crate, NoBuiltins);
+    let regular_module_config = ModuleConfig::new(ModuleKind::Regular, tcx, no_builtins);
+    let bitcode_needed = regular_module_config.bitcode_needed();
+    let allocator_module_config = ModuleConfig::new(ModuleKind::Allocator, tcx, no_builtins);
+
+    let ongoing_codegen = start_async_codegen(
+        backend.clone(),
+        tcx,
+        Arc::new(regular_module_config),
+        Arc::new(allocator_module_config),
+        allocator_module,
+    );
 
     // For better throughput during parallel processing by LLVM, we used to sort
     // CGUs largest to smallest. This would lead to better thread utilization
@@ -784,21 +820,22 @@ pub fn codegen_crate<
     // This likely is a temporary measure. Once we don't have to support the
     // non-parallel compiler anymore, we can compile CGUs end-to-end in
     // parallel and get rid of the complicated scheduling logic.
-    let mut pre_compiled_cgus = if let Some(threads) = tcx.sess.threads() {
+    let mut pre_compiled_cgus = if let Some(threads) = tcx.sess.opts.jobs.frontend {
         tcx.sess.time("compile_first_CGU_batch", || {
             // Try to find one CGU to compile per thread.
             let cgus: Vec<_> = cgu_reuse
                 .iter()
                 .enumerate()
                 .filter(|&(_, reuse)| reuse == &CguReuse::No)
-                .take(threads)
+                .take(threads.get())
                 .collect();
 
             // Compile the found CGUs in parallel.
             let start_time = Instant::now();
 
             let pre_compiled_cgus = par_map(cgus, |(i, _)| {
-                let module = backend.compile_codegen_unit(tcx, codegen_units[i].name());
+                let module =
+                    backend.compile_codegen_unit(tcx, codegen_units[i].name(), bitcode_needed);
                 (i, IntoDynSyncSend(module))
             });
 
@@ -822,7 +859,7 @@ pub fn codegen_crate<
                     cgu.0
                 } else {
                     let start_time = Instant::now();
-                    let module = backend.compile_codegen_unit(tcx, cgu.name());
+                    let module = backend.compile_codegen_unit(tcx, cgu.name(), bitcode_needed);
                     total_codegen_time += start_time.elapsed();
                     module
                 };
@@ -892,12 +929,8 @@ pub fn is_call_from_compiler_builtins_to_upstream_monomorphization<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
 ) -> bool {
-    fn is_llvm_intrinsic(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-        if let Some(name) = tcx.codegen_fn_attrs(def_id).symbol_name {
-            name.as_str().starts_with("llvm.")
-        } else {
-            false
-        }
+    if let ty::InstanceKind::LlvmIntrinsic(_) = instance.def {
+        return false;
     }
 
     fn is_extern_call_to_local_crate<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
@@ -910,7 +943,6 @@ pub fn is_call_from_compiler_builtins_to_upstream_monomorphization<'tcx>(
     let def_id = instance.def_id();
     !def_id.is_local()
         && tcx.is_compiler_builtins(LOCAL_CRATE)
-        && !is_llvm_intrinsic(tcx, def_id)
         && !tcx.should_codegen_locally(instance)
         && !is_extern_call_to_local_crate(tcx, instance)
 }

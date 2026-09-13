@@ -4,11 +4,11 @@ use std::ops::ControlFlow;
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{self, Visitor, VisitorExt};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{self as hir, AmbigArg, GenericParamKind, HirId, Node};
+use rustc_lint_defs::builtin::INVALID_TYPE_PARAM_DEFAULT;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::lint;
 use rustc_span::{Span, kw, sym};
 use tracing::{debug, instrument};
 
@@ -138,9 +138,10 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     // the def id of the `{ N + 1 }` anon const
                     // struct Foo<const N: usize, const M: usize = { N + 1 }>;
                     //
-                    // This has some implications for how we get the predicates available to the anon const
-                    // see `explicit_predicates_of` for more information on this
-                    let generics = tcx.generics_of(parent_did);
+                    // This has some implications for how we get the clauses available to the anon const
+                    // see `explicit_clauses_of` for more information on this
+                    let parent_def_id = tcx.local_parent(param_id);
+                    let generics = tcx.generics_of(parent_def_id);
                     let param_def_idx = generics.param_def_id_to_index[&param_id.to_def_id()];
                     // In the above example this would be .params[..N#0]
                     let own_params = generics.params_to(param_def_idx as usize, tcx).to_owned();
@@ -218,7 +219,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
             "synthetic HIR should have its `generics_of` explicitly fed"
         ),
 
-        Node::ConstArg(..) => {
+        Node::ConstArg(..) | Node::Infer(hir::InferArg { kind: hir::InferArgKind::Const, .. }) => {
             // These can show up in mGCA when representing "direct" const arguments. The
             // DefCollector cannot know whether an anon const will be represented by an actual HIR
             // Node::AnonConst, or whether it will be represented directly, so it must generate a
@@ -296,7 +297,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                         ParamDefaultPolicy::Allowed => {}
                         ParamDefaultPolicy::FutureCompatForbidden => {
                             tcx.emit_node_span_lint(
-                                lint::builtin::INVALID_TYPE_PARAM_DEFAULT,
+                                INVALID_TYPE_PARAM_DEFAULT,
                                 param.hir_id,
                                 param.span,
                                 GenericParametersForbiddenHere { msg: MESSAGE },

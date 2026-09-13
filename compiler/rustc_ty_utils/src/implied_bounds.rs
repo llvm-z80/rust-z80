@@ -66,7 +66,7 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
                     //
                     // Side-note: We don't really need to do this remapping for early-bound
                     // lifetimes because they're already "linked" by the bidirectional outlives
-                    // predicates we insert in the `explicit_predicates_of` query for RPITITs.
+                    // clauses we insert in the `explicit_clauses_of` query for RPITITs.
                     let mut mapping = FxHashMap::default();
                     let generics = tcx.generics_of(def_id);
 
@@ -124,18 +124,17 @@ fn assumed_wf_types<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &'tcx [(Ty<'
                 }
             }
         }
-        DefKind::AssocConst { .. } | DefKind::AssocTy => {
-            tcx.assumed_wf_types(tcx.local_parent(def_id))
-        }
+        DefKind::AssocConst | DefKind::AssocTy => tcx.assumed_wf_types(tcx.local_parent(def_id)),
         DefKind::Static { .. }
-        | DefKind::Const { .. }
+        | DefKind::Const
         | DefKind::AnonConst
         | DefKind::Struct
         | DefKind::Union
         | DefKind::Enum
         | DefKind::Trait
         | DefKind::TraitAlias
-        | DefKind::TyAlias => ty::List::empty(),
+        | DefKind::TyAlias
+        | DefKind::TestBinderConstraints => ty::List::empty(),
         DefKind::OpaqueTy
         | DefKind::Mod
         | DefKind::Variant

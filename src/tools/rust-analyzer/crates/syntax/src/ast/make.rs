@@ -565,7 +565,17 @@ pub fn async_move_block_expr(
 }
 
 pub fn tail_only_block_expr(tail_expr: ast::Expr) -> ast::BlockExpr {
-    ast_from_text(&format!("fn f() {{ {tail_expr} }}"))
+    quote! {
+        BlockExpr {
+            StmtList {
+                ['{']
+                " "
+                #tail_expr
+                " "
+                ['}']
+            }
+        }
+    }
 }
 
 /// Ideally this function wouldn't exist since it involves manual indenting.
@@ -686,7 +696,12 @@ pub fn expr_prefix(op: SyntaxKind, expr: ast::Expr) -> ast::PrefixExpr {
     expr_from_text(&format!("{token}{expr}"))
 }
 pub fn expr_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::CallExpr {
-    expr_from_text(&format!("{f}{arg_list}"))
+    quote! {
+        CallExpr {
+            #f
+            #arg_list
+        }
+    }
 }
 pub fn expr_method_call(
     receiver: ast::Expr,
@@ -1038,7 +1053,14 @@ pub fn untyped_param(pat: ast::Pat) -> ast::Param {
 }
 
 pub fn param(pat: ast::Pat, ty: ast::Type) -> ast::Param {
-    ast_from_text(&format!("fn f({pat}: {ty}) {{ }}"))
+    quote! {
+        Param {
+            #pat
+            [:]
+            " "
+            #ty
+        }
+    }
 }
 
 pub fn self_param() -> ast::SelfParam {
@@ -1361,7 +1383,7 @@ fn expr_from_text_with_edition<E: Into<ast::Expr> + AstNode>(text: &str, edition
         Some(it) => it,
         None => {
             let node = std::any::type_name::<E>();
-            panic!("Failed to make ast node `{node}` from text {text}")
+            panic!("Failed to make expr node `{node}` from text `{text}`")
         }
     };
     let node = node.clone_subtree();
@@ -1381,7 +1403,7 @@ fn ast_from_text_with_edition<N: AstNode>(text: &str, edition: Edition) -> N {
         Some(it) => it,
         None => {
             let node = std::any::type_name::<N>();
-            panic!("Failed to make ast node `{node}` from text {text}")
+            panic!("Failed to make ast node `{node}` from text `{text}`")
         }
     };
     let node = node.clone_subtree();

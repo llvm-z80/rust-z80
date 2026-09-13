@@ -59,7 +59,7 @@ mod transmutability;
 pub use transmutability::{Assume, TransmuteFrom};
 
 mod drop_guard;
-#[unstable(feature = "drop_guard", issue = "144426")]
+#[stable(feature = "drop_guard", since = "CURRENT_RUSTC_VERSION")]
 pub use drop_guard::DropGuard;
 
 // This one has to be a re-export (rather than wrapping the underlying intrinsic) so that we can do
@@ -187,6 +187,7 @@ pub mod type_info;
 #[rustc_const_stable(feature = "const_forget", since = "1.46.0")]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "mem_forget"]
+#[rustc_no_writable]
 pub const fn forget<T>(t: T) {
     let _ = ManuallyDrop::new(t);
 }
@@ -419,12 +420,13 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 ///
 /// # Safety
 ///
-/// This function is only safe to call if the following conditions hold:
+/// This function is safe to call if the pointer is safe to reborrow as `&T`
+/// (in which case you could also call [`size_of_val`]).
+/// Otherwise, the following conditions must hold:
 ///
 /// - If `T` is `Sized`, this function is always safe to call.
-/// - If the unsized tail of `T` is:
-///     - a [slice], then the length of the slice tail must be an initialized
-///       integer, and the size of the *entire value*
+/// - If the *unsized tail* of `T` is:
+///     - a [slice] `[U]`, `str`, or a [trait object] `dyn Trait`, then the size of the *entire value*
 ///       (dynamic tail length + statically sized prefix) must fit in `isize`.
 ///       For the special case where the dynamic tail length is 0, this function
 ///       is safe to call.
@@ -432,15 +434,15 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 //        then we would stop compilation as even the "statically known" part of the type would
 //        already be too big (or the call may be in dead code and optimized away, but then it
 //        doesn't matter).
-///     - a [trait object], then the vtable part of the pointer must point
-///       to a valid vtable acquired by an unsizing coercion, and the size
-///       of the *entire value* (dynamic tail length + statically sized prefix)
-///       must fit in `isize`.
-///     - an (unstable) [extern type], then this function is always safe to
-///       call, but may panic or otherwise return the wrong value, as the
-///       extern type's layout is not known. This is the same behavior as
-///       [`size_of_val`] on a reference to a type with an extern type tail.
-///     - otherwise, it is conservatively not allowed to call this function.
+///     - No other kind of unsized tail currently exists that satisfies the trait bounds for this
+///       function. If more kinds of unsized tails get introduced in the future, the documentation
+///       of this function will have to be extended before it can be used for such types.
+///
+/// Here, *unsized tail* refers to the type obtained by recursively descending through the last
+/// field of a tuple or struct until we arrived at a built-in unsized type.
+///
+/// As a consequence of these rules, it is the case that whenever it is allowed to convert `val`
+/// into a shared reference, then it is also allowed to invoke this function.
 ///
 /// [`size_of::<T>()`]: size_of
 /// [trait object]: ../../book/ch17-02-trait-objects.html
@@ -449,7 +451,6 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 /// # Examples
 ///
 /// ```
-/// #![feature(layout_for_ptr)]
 /// use std::mem;
 ///
 /// assert_eq!(4, size_of_val(&5i32));
@@ -460,7 +461,8 @@ pub const fn size_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[must_use]
-#[unstable(feature = "layout_for_ptr", issue = "69835")]
+#[stable(feature = "layout_for_ptr", since = "1.99.0")]
+#[rustc_const_stable(feature = "layout_for_ptr", since = "1.99.0")]
 pub const unsafe fn size_of_val_raw<T: ?Sized>(val: *const T) -> usize {
     // SAFETY: the caller must provide a valid raw pointer
     unsafe { intrinsics::size_of_val(val) }
@@ -592,24 +594,29 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 ///
 /// # Safety
 ///
-/// This function is only safe to call if the following conditions hold:
+/// This function is safe to call if the pointer is safe to reborrow as `&T`
+/// (in which case you could also call [`align_of_val`]).
+/// Otherwise, the following conditions must hold:
 ///
 /// - If `T` is `Sized`, this function is always safe to call.
 /// - If the unsized tail of `T` is:
-///     - a [slice], then the length of the slice tail must be an initialized
-///       integer, and the size of the *entire value*
+///     - a [slice] `[U]`, `str`, or a [trait object] `dyn Trait`, then the size of the *entire value*
 ///       (dynamic tail length + statically sized prefix) must fit in `isize`.
 ///       For the special case where the dynamic tail length is 0, this function
 ///       is safe to call.
-///     - a [trait object], then the vtable part of the pointer must point
-///       to a valid vtable acquired by an unsizing coercion, and the size
-///       of the *entire value* (dynamic tail length + statically sized prefix)
-///       must fit in `isize`.
-///     - an (unstable) [extern type], then this function is always safe to
-///       call, but may panic or otherwise return the wrong value, as the
-///       extern type's layout is not known. This is the same behavior as
-///       [`align_of_val`] on a reference to a type with an extern type tail.
-///     - otherwise, it is conservatively not allowed to call this function.
+//        NOTE: the reason this is safe is that if an overflow were to occur already with size 0,
+//        then we would stop compilation as even the "statically known" part of the type would
+//        already be too big (or the call may be in dead code and optimized away, but then it
+//        doesn't matter).
+///     - No other kind of unsized tail currently exists that satisfies the trait bounds for this
+///       function. If more kinds of unsized tails get introduced in the future, the documentation
+///       of this function will have to be extended before it can be used for such types.
+///
+/// Here, *unsized tail* refers to the type obtained by recursively descending through the last
+/// field of a tuple or struct until we arrived at a built-in unsized type.
+///
+/// As a consequence of these rules, it is the case that whenever it is allowed to convert `val`
+/// into a shared reference, then it is also allowed to invoke this function.
 ///
 /// [trait object]: ../../book/ch17-02-trait-objects.html
 /// [extern type]: ../../unstable-book/language-features/extern-types.html
@@ -617,7 +624,6 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 /// # Examples
 ///
 /// ```
-/// #![feature(layout_for_ptr)]
 /// use std::mem;
 ///
 /// assert_eq!(4, unsafe { mem::align_of_val_raw(&5i32) });
@@ -629,7 +635,8 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 /// [type-layout]: ../../reference/type-layout.html#r-layout.primitive
 #[inline]
 #[must_use]
-#[unstable(feature = "layout_for_ptr", issue = "69835")]
+#[stable(feature = "layout_for_ptr", since = "1.99.0")]
+#[rustc_const_stable(feature = "layout_for_ptr", since = "1.99.0")]
 pub const unsafe fn align_of_val_raw<T: ?Sized>(val: *const T) -> usize {
     // SAFETY: the caller must provide a valid raw pointer
     unsafe { intrinsics::align_of_val(val) }
@@ -1204,6 +1211,7 @@ pub const unsafe fn transmute_copy<Src: ?Sized, Dst>(src: &Src) -> Dst {
 /// let _: std::mem::MaybeUninit<u16> = unsafe { transmute_prefix(123_u8) };
 /// ```
 #[unstable(feature = "transmute_prefix", issue = "155079")]
+#[rustc_no_writable]
 pub const unsafe fn transmute_prefix<Src, Dst>(src: Src) -> Dst {
     #[repr(C)]
     union Transmute<A, B> {
@@ -1253,6 +1261,7 @@ pub const unsafe fn transmute_prefix<Src, Dst>(src: Src) -> Dst {
 #[unstable(feature = "transmute_neo", issue = "155079")]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 #[inline]
+#[rustc_no_writable]
 pub const unsafe fn transmute_neo<Src, Dst>(src: Src) -> Dst {
     const { assert!(Src::SIZE == Dst::SIZE) };
 
@@ -1418,7 +1427,6 @@ pub const fn discriminant<T>(v: &T) -> Discriminant<T> {
 /// # Examples
 ///
 /// ```
-/// # #![feature(never_type)]
 /// # #![feature(variant_count)]
 ///
 /// use std::mem;
@@ -1648,9 +1656,9 @@ impl<T> SizedTypeProperties for T {}
 )]
 #[doc(alias = "memoffset")]
 #[allow_internal_unstable(builtin_syntax, core_intrinsics)]
+#[diagnostic::opaque]
 pub macro offset_of($Container:ty, $($fields:expr)+ $(,)?) {
-    // The `{}` is for better error messages
-    const {builtin # offset_of($Container, $($fields)+)}
+    const { builtin # offset_of($Container, $($fields)+) }
 }
 
 /// Create a fresh instance of the inhabited ZST type `T`.

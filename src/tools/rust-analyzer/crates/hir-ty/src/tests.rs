@@ -204,7 +204,7 @@ fn check_impl(
                     _ => None,
                 });
             for (expr_or_pat, expected, actual) in type_mismatches {
-                let Some(node) = (match expr_or_pat {
+                let Some(node) = (match expr_or_pat.unpack() {
                     hir_def::hir::ExprOrPatId::ExprId(expr) => {
                         expr_node(body_source_map, expr, &db)
                     }
@@ -324,7 +324,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
     crate::attach_db(&db, || {
         let mut buf = String::new();
 
-        let mut infer_def = |inference_result: &InferenceResult,
+        let mut infer_def = |inference_result: &InferenceResult<'_>,
                              store: &ExpressionStore,
                              source_map: &ExpressionStoreSourceMap,
                              self_param: Option<(
@@ -527,7 +527,7 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
             if store.expr_roots().next().is_none() {
                 continue;
             }
-            for &anon_const in AnonConstId::all_from_signature(&db, def).into_iter().flatten() {
+            for anon_const in AnonConstId::all_from_signature(&db, def) {
                 let infer = InferenceResult::of(&db, anon_const);
                 infer_def(infer, store, source_map, None, krate);
             }

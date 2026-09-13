@@ -5,6 +5,7 @@
 //! unexpanded macros in the fragment are visited and registered.
 //! Imports are also considered items and placed into modules here, but not resolved yet.
 
+use std::cell::RefMut;
 use std::sync::Arc;
 
 use rustc_ast::visit::{self, AssocCtxt, Visitor, WalkItemKind};
@@ -19,12 +20,13 @@ use rustc_expand::base::{ResolverExpand, SyntaxExtension, SyntaxExtensionKind};
 use rustc_hir::Attribute;
 use rustc_hir::attrs::{AttributeKind, MacroUseArgs};
 use rustc_hir::def::{self, *};
-use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_metadata::creader::LoadedMacro;
-use rustc_middle::metadata::{ModChild, Reexport};
+use rustc_middle::middle::resolve::{ModChild, PartialRes, Reexport};
 use rustc_middle::ty::{TyCtxtFeed, Visibility};
 use rustc_middle::{bug, span_bug};
+use rustc_span::def_id::{CRATE_MOD_ID, ModId};
 use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind};
 use rustc_span::{Ident, Span, Symbol, kw, sym};
 use thin_vec::ThinVec;
@@ -39,7 +41,8 @@ use crate::ref_mut::CmCell;
 use crate::{
     BindingKey, Decl, DeclData, DeclKind, DelayedVisResolutionError, ExternModule,
     ExternPreludeEntry, Finalize, IdentKey, LocalModule, Module, ModuleKind, ModuleOrUniformRoot,
-    ParentScope, PathResult, Res, Resolver, Segment, Used, VisResolutionError, diagnostics,
+    ParentScope, PathResult, Res, ResolutionTable, Resolver, Segment, Used, VisResolutionError,
+    diagnostics,
 };
 
 impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
@@ -71,7 +74,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         expn_id: LocalExpnId,
     ) {
         let decl =
-            self.arenas.new_def_decl(res, vis.to_def_id(), span, expn_id, Some(parent.to_module()));
+            self.arenas.new_def_decl(res, vis.to_mod_id(), span, expn_id, Some(parent.to_module()));
         let ident = IdentKey::new(orig_ident);
         self.plant_decl_into_local_module(ident, orig_ident.span, ns, decl);
     }
@@ -115,35 +118,57 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 if let module @ Some(..) = self.extern_module_map.borrow().get(&def_id) {
                     return module.map(|m| m.to_module());
                 }
-
-                // Query `def_kind` is not used because query system overhead is too expensive here.
-                let def_kind = self.cstore().def_kind_untracked(def_id);
-                if def_kind.is_module_like() {
-                    let parent = self.tcx.opt_parent(def_id).map(|parent_id| {
-                        self.get_nearest_non_block_module(parent_id).expect_extern()
-                    });
-                    // Query `expn_that_defined` is not used because
-                    // hashing spans in its result is expensive.
-                    let expn_id = self.cstore().expn_that_defined_untracked(self.tcx, def_id);
-                    let module = self.new_extern_module(
-                        parent,
-                        ModuleKind::Def(
-                            def_kind,
-                            def_id,
-                            DUMMY_NODE_ID,
-                            Some(self.tcx.item_name(def_id)),
-                        ),
-                        expn_id,
-                        self.def_span(def_id),
-                        // FIXME: Account for `#[no_implicit_prelude]` attributes.
-                        parent.is_some_and(|module| module.no_implicit_prelude),
-                    );
-                    return Some(module.to_module());
-                }
-
-                None
+                // We need the lock on the extern_module_map for the entire duration of this call.
+                // It is otherwise entirely possible 2 different threads will create and allocate
+                // the exact same module during speculative resolution.
+                // FIXME(parallel_import_resolution): We lock the entire map to make sure
+                // no 2+ threads try to create the exact same module. Could it be possible to
+                // only "lock on" `def_id`?
+                let mut lock = self.extern_module_map.borrow_mut();
+                // No reentrant locking possible, so do a recursive call with lock
+                // passed as argument.
+                self.get_extern_module_with_lock(def_id, &mut lock).map(ExternModule::to_module)
             }
         }
+    }
+
+    fn get_extern_module_with_lock(
+        &self,
+        def_id: DefId,
+        map_lock: &mut RefMut<'_, FxIndexMap<DefId, ExternModule<'ra>>>,
+    ) -> Option<ExternModule<'ra>> {
+        if let module @ Some(..) = map_lock.get(&def_id) {
+            return module.copied();
+        }
+        // Query `def_kind` is not used because query system overhead is too expensive here.
+        let def_kind = self.cstore().def_kind_untracked(def_id);
+        if def_kind.is_module_like() {
+            let parent = self.tcx.opt_parent(def_id).map(|mut parent_id| {
+                loop {
+                    match self.get_extern_module_with_lock(parent_id, map_lock) {
+                        Some(module) => break module,
+                        None => parent_id = self.tcx.parent(parent_id),
+                    }
+                }
+            });
+            // Query `expn_that_defined` is not used because
+            // hashing spans in its result is expensive.
+            let expn_id = self.cstore().expn_that_defined_untracked(self.tcx, def_id);
+            let module = ExternModule::new(
+                parent,
+                ModuleKind::Def(def_kind, def_id, DUMMY_NODE_ID, Some(self.tcx.item_name(def_id))),
+                self.tcx.visibility(def_id),
+                expn_id,
+                self.def_span(def_id),
+                // FIXME: Account for `#[no_implicit_prelude]` attributes.
+                parent.is_some_and(|module| module.no_implicit_prelude),
+                self.arenas,
+            );
+            map_lock.insert(def_id, module);
+            return Some(module);
+        }
+
+        None
     }
 
     pub(crate) fn expn_def_scope(&self, expn_id: ExpnId) -> Module<'ra> {
@@ -255,7 +280,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         res,
                     ))
                 };
-                match self.cm().resolve_path(
+                match self.cm_mut().resolve_path(
                     &segments,
                     None,
                     parent_scope,
@@ -274,7 +299,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                     Ok(Visibility::Public)
                                 }
                                 _ => {
-                                    let vis = Visibility::Restricted(res.def_id());
+                                    let vis =
+                                        Visibility::Restricted(ModId::new_unchecked(res.def_id()));
                                     if self.is_accessible_from(vis, parent_scope.module) {
                                         if finalize {
                                             self.record_partial_res(id, PartialRes::new(res));
@@ -293,14 +319,15 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     PathResult::NonModule(partial_res) => {
                         expected_found_error(partial_res.expect_full_res())
                     }
-                    PathResult::Failed { label, suggestion, message, segment, .. } => {
-                        Err(VisResolutionError::FailedToResolve(
-                            segment.span,
-                            segment.name,
+                    PathResult::Failed { label, suggestion, help, message, segment, .. } => {
+                        Err(VisResolutionError::FailedToResolve {
+                            span: segment.span,
+                            segment: segment.name,
                             label,
                             suggestion,
+                            help,
                             message,
-                        ))
+                        })
                     }
                     PathResult::Indeterminate => Err(VisResolutionError::Indeterminate(path.span)),
                 }
@@ -311,7 +338,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     pub(crate) fn build_reduced_graph_external(
         &self,
         module: ExternModule<'ra>,
-    ) -> FxIndexMap<BindingKey, NameResolutionRef<'ra>> {
+    ) -> ResolutionTable<'ra> {
         let mut resolutions = FxIndexMap::default();
         let def_id = module.def_id();
         let children = self.tcx.module_children(def_id);
@@ -415,8 +442,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 DefKind::Fn
                 | DefKind::AssocFn
                 | DefKind::Static { .. }
-                | DefKind::Const { .. }
-                | DefKind::AssocConst { .. }
+                | DefKind::Const
+                | DefKind::AssocConst
                 | DefKind::Ctor(..),
                 _,
             ) => define_extern(ValueNS),
@@ -433,7 +460,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 | DefKind::GlobalAsm
                 | DefKind::Closure
                 | DefKind::SyntheticCoroutineBody
-                | DefKind::Impl { .. },
+                | DefKind::Impl { .. }
+                | DefKind::TestBinderConstraints,
                 _,
             )
             | Res::Local(..)
@@ -485,7 +513,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         let defaults = fields
             .iter()
             .enumerate()
-            .filter_map(|(i, field)| field.default.as_ref().map(|_| field_name(i, field).name))
+            .filter_map(|(i, field)| field.default_value().map(|_| field_name(i, field).name))
             .collect();
         self.r.field_names.insert(def_id, field_names);
         self.r.field_defaults.insert(def_id, defaults);
@@ -535,13 +563,13 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             on_unknown_attr: OnUnknownData::from_attrs(self.r, &item.attrs),
         });
 
-        self.r.indeterminate_imports.push(import);
+        self.r.indeterminate_imports.push((import, None, 0));
         match import.kind {
             ImportKind::Single { target, .. } => {
                 // Don't add underscore imports to `single_imports`
                 // because they cannot define any usable names.
                 if target.name != kw::Underscore {
-                    self.r.per_ns(|this, ns| {
+                    self.r.per_ns_mut(|this, ns| {
                         let key = BindingKey::new(IdentKey::new(target), ns);
                         this.resolution_or_default(current_module.to_module(), key, target.span)
                             .borrow_mut(this)
@@ -904,7 +932,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                     let mut ctor_vis = if vis.is_public()
                         && ast::attr::contains_name(&item.attrs, sym::non_exhaustive)
                     {
-                        Visibility::Restricted(CRATE_DEF_ID)
+                        Visibility::Restricted(CRATE_MOD_ID)
                     } else {
                         vis
                     };
@@ -922,7 +950,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                         if ctor_vis.greater_than(field_vis, self.r.tcx) {
                             ctor_vis = field_vis;
                         }
-                        field_visibilities.push(field_vis.to_def_id());
+                        field_visibilities.push(field_vis.to_mod_id());
                     }
                     // If this is a unit or tuple-like struct, register the constructor.
                     let feed = self.create_def(
@@ -940,7 +968,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                     self.insert_field_visibilities_local(ctor_def_id.to_def_id(), vdata.fields());
 
                     let ctor =
-                        StructCtor { res: ctor_res, vis: ctor_vis.to_def_id(), field_visibilities };
+                        StructCtor { res: ctor_res, vis: ctor_vis.to_mod_id(), field_visibilities };
                     self.r.struct_ctors.insert(local_def_id, ctor);
                 }
                 self.r.struct_generics.insert(local_def_id, generics.clone());
@@ -961,7 +989,8 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             ItemKind::Impl { .. }
             | ItemKind::ForeignMod(..)
             | ItemKind::GlobalAsm(..)
-            | ItemKind::ConstBlock(..) => {}
+            | ItemKind::ConstBlock(..)
+            | ItemKind::TestBinderConstraints(..) => {}
 
             ItemKind::MacroDef(..) | ItemKind::MacCall(_) | ItemKind::DelegationMac(..) => {
                 unreachable!()
@@ -1123,7 +1152,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         let mut import_all = None;
         let mut single_imports = ThinVec::new();
         if let Some(Attribute::Parsed(AttributeKind::MacroUse { span, arguments })) =
-            AttributeParser::parse_limited(self.r.tcx.sess, &item.attrs, &[sym::macro_use])
+            AttributeParser::parse_limited_sym(self.r.tcx.sess, &item.attrs, &[sym::macro_use])
         {
             if self.parent_scope.module.expect_local().parent.is_some() {
                 self.r.dcx().emit_err(diagnostics::ExternCrateLoadingMacroNotAtCrateRoot {
@@ -1154,7 +1183,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
                 root_span: span,
                 span,
                 module_path: Vec::new(),
-                vis: Visibility::Restricted(CRATE_DEF_ID),
+                vis: Visibility::Restricted(CRATE_MOD_ID),
                 vis_span: item.vis.span,
                 on_unknown_attr: OnUnknownData::from_attrs(this.r, &item.attrs),
             })
@@ -1310,11 +1339,11 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
             let vis = if is_macro_export {
                 Visibility::Public
             } else {
-                Visibility::Restricted(CRATE_DEF_ID)
+                Visibility::Restricted(CRATE_MOD_ID)
             };
             let decl = self.r.arenas.new_def_decl(
                 res,
-                vis.to_def_id(),
+                vis.to_mod_id(),
                 span,
                 expansion,
                 Some(parent_scope.module),
@@ -1516,7 +1545,7 @@ impl<'a, 'ra, 'tcx> DefCollector<'a, 'ra, 'tcx> {
         // If the variant is marked as non_exhaustive then lower the visibility to within the crate.
         let ctor_vis =
             if vis.is_public() && ast::attr::contains_name(&variant.attrs, sym::non_exhaustive) {
-                Visibility::Restricted(CRATE_DEF_ID)
+                Visibility::Restricted(CRATE_MOD_ID)
             } else {
                 vis
             };

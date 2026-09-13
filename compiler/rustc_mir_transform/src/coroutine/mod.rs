@@ -64,9 +64,9 @@ pub(super) use layout::mir_coroutine_witnesses;
 use layout::{CoroutineSavedLocals, compute_layout, locals_live_across_suspend_points};
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_data_structures::thin_vec::ThinVec;
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::{self as hir, CoroutineDesugaring, CoroutineKind};
-use rustc_index::bit_set::{BitMatrix, DenseBitSet, GrowableBitSet};
+use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 use rustc_index::{Idx, IndexVec, indexvec};
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -80,7 +80,7 @@ use tracing::{debug, instrument};
 
 use crate::deref_separator::deref_finder;
 use crate::patch::MirPatch;
-use crate::{abort_unwinding_calls, pass_manager as pm, simplify};
+use crate::{PassPolicy, abort_unwinding_calls, pass_manager as pm, simplify};
 
 pub(super) struct StateTransform;
 
@@ -172,7 +172,7 @@ struct SuspensionPoint<'tcx> {
     /// Which block to jump to if the coroutine is dropped in this state.
     drop: Option<BasicBlock>,
     /// Set of locals that have live storage while at this suspension point.
-    storage_liveness: GrowableBitSet<Local>,
+    storage_liveness: DenseBitSet<Local>,
 }
 
 struct TransformVisitor<'tcx> {
@@ -454,7 +454,8 @@ impl<'tcx> MutVisitor<'tcx> for TransformVisitor<'tcx> {
             | PlaceElem::Deref
             | PlaceElem::ConstantIndex { .. }
             | PlaceElem::Subslice { .. }
-            | PlaceElem::Downcast(..) => None,
+            | PlaceElem::Downcast(..)
+            | PlaceElem::PhantomDeref => None,
         }
     }
 
@@ -509,8 +510,8 @@ impl<'tcx> MutVisitor<'tcx> for TransformVisitor<'tcx> {
                     replace_base(&mut resume_arg, self.make_field(variant, idx, ty), self.tcx);
                 }
 
-                let storage_liveness: GrowableBitSet<Local> =
-                    self.storage_liveness[block].clone().unwrap().into();
+                let storage_liveness: DenseBitSet<Local> =
+                    self.storage_liveness[block].clone().unwrap();
 
                 for i in 0..self.always_live_locals.domain_size() {
                     let l = Local::new(i);
@@ -990,7 +991,7 @@ fn create_cases<'tcx>(
 
                 // Create StorageLive instructions for locals with live storage
                 for l in body.local_decls.indices() {
-                    let needs_storage_live = point.storage_liveness.contains(l)
+                    let needs_storage_live = point.storage_liveness.contains_loose(l)
                         && !transform.remap.contains(l)
                         && !transform.always_live_locals.contains(l);
                     if needs_storage_live {
@@ -1219,8 +1220,9 @@ impl<'tcx> crate::MirPass<'tcx> for StateTransform {
         create_coroutine_resume_function(tcx, transform, body, can_return, can_unwind);
     }
 
-    fn is_required(&self) -> bool {
-        true
+    fn policy(&self, _ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        // Implements coroutine semantics by lowering the coroutine body to a state machine.
+        PassPolicy::Required
     }
 }
 

@@ -425,7 +425,6 @@ fn main() {
         check_diagnostics(
             r#"
 //- minicore: index, slice
-#![allow(unused_variables)]
 
 fn main() {
 
@@ -674,17 +673,6 @@ fn main() {
     #[test]
     fn orphan_unsafe_format_args() {
         // Checks that we don't place orphan arguments for formatting under an unsafe block.
-        check_diagnostics(
-            r#"
-//- minicore: fmt_before_1_89_0
-fn foo() {
-    let p = 0xDEADBEEF as *const i32;
-    format_args!("", *p);
-                  // ^^ error: dereference of raw pointer is unsafe and requires an unsafe function or block
-}
-        "#,
-        );
-
         check_diagnostics(
             r#"
 //- minicore: fmt
@@ -1072,6 +1060,17 @@ fn foo() {}
 #[target_feature(enable = "avx2", enable = "fma")]
 fn bar() {
     foo();
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn raw_ref_deref_raw_ref_deref() {
+        check_diagnostics(
+            r#"
+fn foo() {
+    &raw const *&raw const *&raw const *&2;
 }
         "#,
         );

@@ -34,7 +34,7 @@ impl_from!(
 );
 
 /// Salsa query. This will look for lang items in a specific crate.
-#[salsa_macros::tracked(returns(as_deref))]
+#[salsa::tracked(returns(as_deref))]
 pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
 
@@ -112,7 +112,7 @@ pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<Lan
 
 /// Salsa query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[salsa_macros::tracked(returns(ref))]
+#[salsa::tracked(returns(ref))]
 pub fn lang_items(db: &dyn SourceDatabase, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
@@ -462,8 +462,11 @@ language_item_table! { LangItems =>
 
     Freeze,                  sym::freeze,              TraitId;
 
+    NonNull,                 sym::non_null,            StructId;
+
     FnPtrTrait,              sym::fn_ptr_trait,        TraitId;
-    FnPtrAddr,               sym::fn_ptr_addr,         FunctionId;
+    FnPtrAsPtr,              sym::fn_ptr_as_ptr,       FunctionId;
+    FnPtrFromPtr,            sym::fn_ptr_from_ptr,     FunctionId;
 
     Drop,                    sym::drop,                TraitId;
     Destruct,                sym::destruct,            TraitId;
@@ -471,6 +474,8 @@ language_item_table! { LangItems =>
 
     CoerceUnsized,           sym::coerce_unsized,      TraitId;
     DispatchFromDyn,         sym::dispatch_from_dyn,   TraitId;
+    Reborrow,                sym::reborrow,            TraitId;
+    CoerceShared,            sym::coerce_shared,       TraitId;
 
     // language items relating to transmutability
     TransmuteOpts,           sym::transmute_opts,      StructId;
@@ -682,7 +687,9 @@ language_item_table! { LangItems =>
     core::cmp, PartialEq, PartialEqDerive;
     core::cmp, Eq, EqDerive;
     core::marker, CoercePointee, CoercePointeeDerive;
+    core::marker, CoerceShared, CoerceSharedDerive;
     core::marker, Copy, CopyDerive;
+    core::marker, Reborrow, ReborrowDerive;
     core::clone, Clone, CloneDerive;
 
     @resolve_manually:

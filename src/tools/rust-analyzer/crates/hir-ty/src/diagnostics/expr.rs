@@ -104,7 +104,7 @@ impl<'db> BodyValidationDiagnostic<'db> {
 struct ExprValidator<'db> {
     owner: DefWithBodyId,
     body: &'db Body,
-    infer: &'db InferenceResult,
+    infer: &'db InferenceResult<'db>,
     env: ParamEnv<'db>,
     diagnostics: Vec<BodyValidationDiagnostic<'db>>,
     validate_lints: bool,
@@ -151,22 +151,10 @@ impl<'db> ExprValidator<'db> {
                 Expr::If { .. } => {
                     self.check_for_unnecessary_else(id, expr);
                 }
-                Expr::Block { .. } | Expr::Unsafe { .. } => {
-                    self.validate_block(expr);
+                Expr::Block { statements, .. } => {
+                    self.validate_block(statements);
                 }
                 _ => {}
-            }
-        }
-
-        for (id, pat) in body.pats() {
-            if let Some((variant, missed_fields)) =
-                record_pattern_missing_fields(db, self.infer, id, pat)
-            {
-                self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
-                    record: Either::Right(id),
-                    variant,
-                    missed_fields,
-                });
             }
         }
     }
@@ -326,13 +314,10 @@ impl<'db> ExprValidator<'db> {
         }
     }
 
-    fn validate_block(&mut self, expr: &Expr) {
-        let (Expr::Block { statements, .. } | Expr::Unsafe { statements, .. }) = expr else {
-            return;
-        };
+    fn validate_block(&mut self, statements: &[Statement]) {
         let pattern_arena = Arena::new();
         let cx = MatchCheckCtx::new(self.owner.module(self.db()), &self.infcx, self.env);
-        for stmt in &**statements {
+        for stmt in statements {
             match *stmt {
                 Statement::Expr { expr: stmt_expr, has_semi: true } if self.validate_lints => {
                     let mut diags = Vec::new();
@@ -429,9 +414,7 @@ impl<'db> ExprValidator<'db> {
         // `expr`; branching containers (`if`/`match`) recurse on each arm.
         loop {
             match &self.body[expr] {
-                Expr::Block { tail: Some(tail), .. }
-                | Expr::Unsafe { tail: Some(tail), .. }
-                | Expr::Const(tail) => expr = *tail,
+                Expr::Block { tail: Some(tail), .. } | Expr::Const(tail) => expr = *tail,
                 Expr::If { then_branch, else_branch, .. } => {
                     self.check_unused_must_use(*then_branch, acc);
                     if let Some(else_branch) = else_branch {
@@ -633,9 +616,9 @@ impl<'db> FilterMapNextChecker<'db> {
     }
 }
 
-pub fn record_literal_missing_fields(
-    db: &dyn HirDatabase,
-    infer: &InferenceResult,
+pub fn record_literal_missing_fields<'db>(
+    db: &'db dyn HirDatabase,
+    infer: &InferenceResult<'db>,
     id: ExprId,
     expr: &Expr,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
@@ -676,9 +659,9 @@ pub fn record_literal_missing_fields(
     Some((variant_def, missed_fields))
 }
 
-pub fn record_pattern_missing_fields(
-    db: &dyn HirDatabase,
-    infer: &InferenceResult,
+pub fn record_pattern_missing_fields<'db>(
+    db: &'db dyn HirDatabase,
+    infer: &InferenceResult<'db>,
     id: PatId,
     pat: &Pat,
 ) -> Option<(VariantId, Vec<LocalFieldId>)> {
@@ -713,8 +696,8 @@ pub fn record_pattern_missing_fields(
     Some((variant_def, missed_fields))
 }
 
-fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResult) -> bool {
-    fn walk(pat: PatId, body: &Body, infer: &InferenceResult, has_type_mismatches: &mut bool) {
+fn types_of_subpatterns_do_match(pat: PatId, body: &Body, infer: &InferenceResult<'_>) -> bool {
+    fn walk(pat: PatId, body: &Body, infer: &InferenceResult<'_>, has_type_mismatches: &mut bool) {
         match infer.pat_has_type_mismatch(pat) {
             true => *has_type_mismatches = true,
             false if *has_type_mismatches => (),

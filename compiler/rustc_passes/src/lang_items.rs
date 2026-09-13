@@ -9,12 +9,13 @@
 
 use rustc_ast as ast;
 use rustc_ast::visit;
+use rustc_crate_store::ExternCrate;
+use rustc_hir::Target;
+use rustc_hir::attrs::lang_items::{GenericRequirement, LangItem, LanguageItems};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items::GenericRequirement;
-use rustc_hir::{LangItem, LanguageItems, Target};
+use rustc_middle::middle::resolve::ResolverAstLowering;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{ResolverAstLowering, TyCtxt};
-use rustc_session::cstore::ExternCrate;
+use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol, sym};
 
 use crate::diagnostics::{DuplicateLangItem, IncorrectCrateType, IncorrectTarget};
@@ -230,7 +231,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
             }
         }
 
-        if self.tcx.crate_types().contains(&rustc_session::config::CrateType::Sdylib) {
+        if self.tcx.crate_types().contains(&rustc_structures::CrateType::Sdylib) {
             self.tcx.dcx().emit_err(IncorrectCrateType { span: attr_span });
         }
 

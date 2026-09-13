@@ -21,8 +21,10 @@ pub(crate) mod diagnostic;
 pub(crate) mod enzyme_ffi;
 mod ffi;
 mod metadata_kind;
+pub(crate) mod offload_ffi;
 
 pub(crate) use self::enzyme_ffi::*;
+pub(crate) use self::offload_ffi::*;
 
 impl LLVMRustResult {
     pub(crate) fn into_result(self) -> Result<(), ()> {
@@ -472,11 +474,24 @@ pub(crate) fn set_dso_local<'ll>(v: &'ll Value) {
     }
 }
 
-/// Safe wrapper for `LLVMAppendModuleInlineAsm`, which delegates to
+/// Safe wrapper for `LLVMRustAppendModuleInlineAsm`, which delegates to
 /// `Module::appendModuleInlineAsm`.
-pub(crate) fn append_module_inline_asm<'ll>(llmod: &'ll Module, asm: &[u8]) {
+pub(crate) fn append_module_inline_asm<'ll>(
+    llmod: &'ll Module,
+    asm: &[u8],
+    target_features: &str,
+    target_cpu: &str,
+) {
     unsafe {
-        LLVMAppendModuleInlineAsm(llmod, asm.as_ptr(), asm.len());
+        LLVMRustAppendModuleInlineAsm(
+            llmod,
+            asm.as_ptr(),
+            asm.len(),
+            target_features.as_ptr(),
+            target_features.len(),
+            target_cpu.as_ptr(),
+            target_cpu.len(),
+        );
     }
 }
 
