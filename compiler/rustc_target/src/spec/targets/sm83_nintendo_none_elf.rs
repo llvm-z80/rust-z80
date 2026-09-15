@@ -12,9 +12,10 @@ pub(crate) fn target() -> Target {
             std: Some(false),
         },
         pointer_width: 16,
-        data_layout: "e-m:o-p:16:8-i16:8-i32:8-i64:8-i128:8-f32:8-f64:8-n8:16".into(),
+        data_layout: "e-m:o-p:16:8-i16:8-i32:8-i64:8-i128:8-f32:8-f64:8-ve-n8:16".into(),
         arch: Arch::Sm83,
         options: TargetOptions {
+            cpu: "sm83".into(),
             c_int_width: 16,
             exe_suffix: ".elf".into(),
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),

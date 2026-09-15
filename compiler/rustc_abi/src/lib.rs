@@ -622,6 +622,7 @@ impl TargetDataLayout {
                         dl.i128_align = a;
                     }
                 }
+                ["ve"] => {}
                 [s, a @ ..] if s.starts_with('v') => {
                     let v_size = parse_size(&s[1..], "v")?;
                     let a = parse_align_seq(a, s)?;
