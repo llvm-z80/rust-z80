@@ -18,7 +18,7 @@ and the `Z80` LLVM backend ship together.
 ### 1. Clone with the LLVM submodule
 
 ```sh
-git clone https://github.com/zlfn/rust rust-z80
+git clone https://github.com/llvm-z80/rust-z80
 cd rust-z80
 git submodule update --init --depth 1 src/llvm-project
 ```
