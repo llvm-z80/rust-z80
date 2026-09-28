@@ -1,5 +1,6 @@
 use crate::spec::{
-    Arch, Cc, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions,
+    Arch, Cc, LinkSelfContainedDefault, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target,
+    TargetMetadata, TargetOptions,
 };
 
 pub(crate) fn target() -> Target {
@@ -20,6 +21,11 @@ pub(crate) fn target() -> Target {
             exe_suffix: ".elf".into(),
             linker_flavor: LinkerFlavor::Gnu(Cc::No, Lld::Yes),
             linker: Some("ld.lld".into()),
+            link_self_contained: LinkSelfContainedDefault::True,
+            late_link_args: TargetOptions::link_args(
+                LinkerFlavor::Gnu(Cc::No, Lld::No),
+                &["-lsm83_rt"],
+            ),
             max_atomic_width: Some(8),
             atomic_cas: false,
             singlethread: true,

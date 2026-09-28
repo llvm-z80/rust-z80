@@ -459,6 +459,26 @@ fn copy_self_contained_objects(
                 DependencyType::TargetSelfContained,
             );
         }
+    } else if target.starts_with("z80") || target.starts_with("sm83") {
+        // Assembled by the LLVM build with llvm-mc, not by compiler-rt's pipeline.
+        let arch = if target.starts_with("sm83") { "sm83" } else { "z80" };
+        let llvm_out = builder.ensure(llvm::Llvm { target: builder.host_target });
+        let srcdir = llvm_out.root_dir().join("lib").join(arch);
+
+        let rt = libdir_self_contained.join(format!("lib{arch}_rt.a"));
+        builder.copy_link(&srcdir.join(format!("{arch}_rt.a")), &rt, FileType::NativeLibrary);
+        target_deps.push((rt, DependencyType::TargetSelfContained));
+
+        for name in [format!("{arch}_crt0.o"), format!("{arch}.ld")] {
+            copy_and_stamp(
+                builder,
+                &libdir_self_contained,
+                &srcdir,
+                &name,
+                &mut target_deps,
+                DependencyType::TargetSelfContained,
+            );
+        }
     } else if target.is_windows_gnu() || target.is_windows_gnullvm() {
         for obj in ["crt2.o", "dllcrt2.o"].iter() {
             let src = compiler_file(builder, &builder.cc(target), target, CLang::C, obj);
