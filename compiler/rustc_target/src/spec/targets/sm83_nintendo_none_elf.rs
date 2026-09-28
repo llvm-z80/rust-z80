@@ -1,6 +1,6 @@
 use crate::spec::{
     Arch, Cc, LinkSelfContainedDefault, LinkerFlavor, Lld, PanicStrategy, RelocModel, Target,
-    TargetMetadata, TargetOptions,
+    TargetMetadata, TargetOptions, cvs,
 };
 
 pub(crate) fn target() -> Target {
@@ -37,6 +37,11 @@ pub(crate) fn target() -> Target {
             eh_frame_header: false,
             generate_arange_section: false,
             features: "+inline-i16-runtime".into(),
+            // The same LLVM defaults the clang driver passes for these targets.
+            llvm_args: cvs![
+                "-two-entry-phi-node-folding-threshold=0",
+                "-enable-load-in-loop-pre=false"
+            ],
             ..Default::default()
         },
     }
